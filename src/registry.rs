@@ -1,0 +1,613 @@
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
+
+use reqwest::header::{ACCEPT, HeaderValue, RANGE, RETRY_AFTER, WWW_AUTHENTICATE};
+use reqwest::{Client, Method, Response, StatusCode};
+use serde::{Deserialize, Serialize};
+use tokio::sync::Mutex;
+use tokio::time::sleep;
+use tracing::{debug, warn};
+use url::Url;
+
+use crate::auth::{AuthResolver, Credentials};
+use crate::error::{DockerPullError, Result};
+use crate::platform::Platform;
+use crate::reference::ImageReference;
+
+const MANIFEST_ACCEPT: &str = concat!(
+    "application/vnd.oci.image.index.v1+json,",
+    "application/vnd.docker.distribution.manifest.list.v2+json,",
+    "application/vnd.oci.image.manifest.v1+json,",
+    "application/vnd.docker.distribution.manifest.v2+json"
+);
+const MAX_REQUEST_RETRIES: u32 = 5;
+const MAX_AUTH_RETRIES: u32 = 2;
+
+#[derive(Debug, Clone)]
+pub struct RegistryClient {
+    client: Client,
+    auth: Arc<AuthResolver>,
+    token_cache: Arc<Mutex<HashMap<String, String>>>,
+    plain_http: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Descriptor {
+    #[serde(rename = "mediaType", default)]
+    pub media_type: String,
+    pub digest: String,
+    pub size: i64,
+    #[serde(default)]
+    pub platform: Option<Platform>,
+    #[serde(default)]
+    pub annotations: Option<HashMap<String, String>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ManifestEnvelope {
+    #[serde(rename = "schemaVersion")]
+    schema_version: u32,
+    #[serde(rename = "mediaType", default)]
+    media_type: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ImageManifest {
+    #[serde(rename = "schemaVersion")]
+    _schema_version: u32,
+    #[serde(rename = "mediaType", default)]
+    media_type: String,
+    config: Descriptor,
+    layers: Vec<Descriptor>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ImageIndex {
+    #[serde(rename = "schemaVersion")]
+    _schema_version: u32,
+    #[serde(rename = "mediaType", default)]
+    _media_type: String,
+    manifests: Vec<Descriptor>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResolvedImage {
+    pub manifest: Descriptor,
+    pub manifest_bytes: Vec<u8>,
+    pub config: Descriptor,
+    pub layers: Vec<Descriptor>,
+}
+
+#[derive(Debug)]
+pub struct BlobMetadata {
+    pub size: Option<u64>,
+}
+
+impl RegistryClient {
+    pub fn new(client: Client, auth: Arc<AuthResolver>, plain_http: bool) -> Self {
+        Self {
+            client,
+            auth,
+            token_cache: Arc::new(Mutex::new(HashMap::new())),
+            plain_http,
+        }
+    }
+
+    pub async fn resolve_image(
+        &self,
+        reference: &ImageReference,
+        platform: &Platform,
+    ) -> Result<ResolvedImage> {
+        let url = self.manifest_url(reference)?;
+        let response = self
+            .send(
+                Method::GET,
+                url,
+                reference,
+                Some(MANIFEST_ACCEPT),
+                None,
+                true,
+            )
+            .await?;
+        if response.status() == StatusCode::NOT_FOUND {
+            return Err(DockerPullError::ManifestNotFound);
+        }
+        let digest = header_string(&response, "docker-content-digest")?;
+        let media_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(|value| value.split(';').next().unwrap_or(value).trim().to_string())
+            .unwrap_or_default();
+        let body = response.bytes().await?.to_vec();
+        let envelope: ManifestEnvelope = serde_json::from_slice(&body)?;
+        if envelope.schema_version != 2 {
+            return Err(DockerPullError::BadResponse(format!(
+                "unsupported schemaVersion {}",
+                envelope.schema_version
+            )));
+        }
+
+        let media_type = if media_type.is_empty() {
+            envelope.media_type
+        } else {
+            media_type
+        };
+
+        if is_image_manifest(&media_type) {
+            let manifest: ImageManifest = serde_json::from_slice(&body)?;
+            let manifest_descriptor = Descriptor {
+                media_type: manifest.media_type.clone(),
+                digest: digest.unwrap_or_else(|| digest_bytes(&body)),
+                size: body.len() as i64,
+                platform: Some(platform.clone()),
+                annotations: None,
+            };
+            return Ok(ResolvedImage {
+                manifest: manifest_descriptor,
+                manifest_bytes: body,
+                config: manifest.config,
+                layers: manifest.layers,
+            });
+        }
+
+        if is_image_index(&media_type) {
+            let index: ImageIndex = serde_json::from_slice(&body)?;
+            let descriptor = index
+                .manifests
+                .into_iter()
+                .find(|descriptor| {
+                    descriptor
+                        .platform
+                        .as_ref()
+                        .is_some_and(|candidate| platform.matches(candidate))
+                })
+                .ok_or_else(|| DockerPullError::PlatformNotFound(platform.as_string()))?;
+            let manifest_url = self.manifest_digest_url(reference, &descriptor.digest)?;
+            let response = self
+                .send(
+                    Method::GET,
+                    manifest_url,
+                    reference,
+                    Some(MANIFEST_ACCEPT),
+                    None,
+                    true,
+                )
+                .await?;
+            let body = response.bytes().await?.to_vec();
+            let manifest: ImageManifest = serde_json::from_slice(&body)?;
+            return Ok(ResolvedImage {
+                manifest: Descriptor {
+                    media_type: if descriptor.media_type.is_empty() {
+                        manifest.media_type.clone()
+                    } else {
+                        descriptor.media_type
+                    },
+                    digest: descriptor.digest,
+                    size: if descriptor.size == 0 {
+                        body.len() as i64
+                    } else {
+                        descriptor.size
+                    },
+                    platform: descriptor.platform.clone(),
+                    annotations: descriptor.annotations.clone(),
+                },
+                manifest_bytes: body,
+                config: manifest.config,
+                layers: manifest.layers,
+            });
+        }
+
+        Err(DockerPullError::UnsupportedMediaType(media_type))
+    }
+
+    pub async fn head_blob(
+        &self,
+        reference: &ImageReference,
+        digest: &str,
+    ) -> Result<BlobMetadata> {
+        let response = self
+            .send(
+                Method::HEAD,
+                self.blob_url(reference, digest)?,
+                reference,
+                None,
+                None,
+                true,
+            )
+            .await?;
+        if response.status() == StatusCode::NOT_FOUND {
+            return Err(DockerPullError::BlobNotFound(digest.to_string()));
+        }
+        let size = response
+            .headers()
+            .get(reqwest::header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok());
+        Ok(BlobMetadata { size })
+    }
+
+    pub async fn get_blob(
+        &self,
+        reference: &ImageReference,
+        digest: &str,
+        offset: u64,
+    ) -> Result<Response> {
+        let range = (offset > 0).then(|| format!("bytes={offset}-"));
+        self.send(
+            Method::GET,
+            self.blob_url(reference, digest)?,
+            reference,
+            None,
+            range.as_deref(),
+            true,
+        )
+        .await
+    }
+
+    pub async fn get_blob_bytes(
+        &self,
+        reference: &ImageReference,
+        digest: &str,
+    ) -> Result<Vec<u8>> {
+        let response = self.get_blob(reference, digest, 0).await?;
+        if response.status() == StatusCode::NOT_FOUND {
+            return Err(DockerPullError::BlobNotFound(digest.to_string()));
+        }
+        Ok(response.bytes().await?.to_vec())
+    }
+
+    fn manifest_url(&self, reference: &ImageReference) -> Result<Url> {
+        Url::parse(&format!(
+            "{}://{}/v2/{}/manifests/{}",
+            self.scheme(),
+            reference.registry,
+            reference.repository,
+            reference.manifest_reference()
+        ))
+        .map_err(Into::into)
+    }
+
+    fn manifest_digest_url(&self, reference: &ImageReference, digest: &str) -> Result<Url> {
+        Url::parse(&format!(
+            "{}://{}/v2/{}/manifests/{digest}",
+            self.scheme(),
+            reference.registry,
+            reference.repository
+        ))
+        .map_err(Into::into)
+    }
+
+    fn blob_url(&self, reference: &ImageReference, digest: &str) -> Result<Url> {
+        Url::parse(&format!(
+            "{}://{}/v2/{}/blobs/{digest}",
+            self.scheme(),
+            reference.registry,
+            reference.repository
+        ))
+        .map_err(Into::into)
+    }
+
+    fn scheme(&self) -> &'static str {
+        if self.plain_http { "http" } else { "https" }
+    }
+
+    async fn send(
+        &self,
+        method: Method,
+        url: Url,
+        reference: &ImageReference,
+        accept: Option<&str>,
+        range: Option<&str>,
+        allow_retry: bool,
+    ) -> Result<Response> {
+        let scope = reference.repository_scope();
+        let mut retries = 0_u32;
+        let mut auth_retries = 0_u32;
+        loop {
+            let token = self.token_cache.lock().await.get(&scope).cloned();
+            let credentials = self.auth.resolve(&reference.registry)?;
+            let mut request = self.client.request(method.clone(), url.clone());
+            if let Some(accept) = accept {
+                request = request.header(ACCEPT, accept);
+            }
+            if let Some(range) = range {
+                request = request.header(RANGE, range);
+            }
+            if let Some(token) = &token {
+                request = request.bearer_auth(token);
+            } else if let Some(Credentials::Basic { username, password }) = &credentials {
+                request = request.basic_auth(username, Some(password));
+            }
+
+            let response = match request.send().await {
+                Ok(response) => response,
+                Err(error) if allow_retry && is_retryable_http_error(&error) => {
+                    let detail = error.to_string();
+                    if retries >= MAX_REQUEST_RETRIES {
+                        return Err(retry_limit_exceeded("registry request", retries, detail));
+                    }
+                    let next_retry = retries + 1;
+                    let delay = backoff_delay(retries);
+                    warn!(
+                        "request failed before response, retrying in {:?} ({}/{})",
+                        delay, next_retry, MAX_REQUEST_RETRIES
+                    );
+                    sleep(delay).await;
+                    retries = next_retry;
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            };
+
+            if response.status() == StatusCode::UNAUTHORIZED {
+                if auth_retries >= MAX_AUTH_RETRIES {
+                    return Err(DockerPullError::Unauthorized(format!(
+                        "authentication retry limit exceeded for {}",
+                        reference.normalized()
+                    )));
+                }
+                let challenge = response
+                    .headers()
+                    .get(WWW_AUTHENTICATE)
+                    .cloned()
+                    .ok_or_else(|| DockerPullError::Unauthorized("missing challenge".into()))?;
+                if let Some(token) = self
+                    .refresh_token(challenge, reference, credentials.clone())
+                    .await?
+                {
+                    self.token_cache.lock().await.insert(scope.clone(), token);
+                    auth_retries += 1;
+                    continue;
+                }
+                return Err(DockerPullError::Unauthorized(reference.normalized()));
+            }
+
+            if allow_retry && is_retryable_status(response.status()) {
+                let status = response.status();
+                if retries >= MAX_REQUEST_RETRIES {
+                    return Err(retry_limit_exceeded(
+                        "registry request",
+                        retries,
+                        format!("registry returned {status}"),
+                    ));
+                }
+                let next_retry = retries + 1;
+                let delay = retry_after_delay(response.headers().get(RETRY_AFTER))
+                    .unwrap_or_else(|| backoff_delay(retries));
+                warn!(
+                    "registry returned {}, retrying in {:?} ({}/{})",
+                    status, delay, next_retry, MAX_REQUEST_RETRIES
+                );
+                sleep(delay).await;
+                retries = next_retry;
+                continue;
+            }
+
+            if response.status().is_server_error() {
+                return Err(DockerPullError::BadResponse(format!(
+                    "registry returned {}",
+                    response.status()
+                )));
+            }
+
+            debug!("registry {} {}", method, url);
+            return Ok(response);
+        }
+    }
+
+    async fn refresh_token(
+        &self,
+        header: HeaderValue,
+        reference: &ImageReference,
+        credentials: Option<Credentials>,
+    ) -> Result<Option<String>> {
+        let challenge = parse_www_authenticate(header.to_str()?)?;
+        if !challenge.scheme.eq_ignore_ascii_case("bearer") {
+            return Ok(None);
+        }
+
+        let mut request = self.client.get(&challenge.realm);
+        request = request.query(&[("service", challenge.service.as_deref().unwrap_or(""))]);
+        let scope = challenge
+            .scope
+            .unwrap_or_else(|| reference.repository_scope());
+        request = request.query(&[("scope", scope.as_str())]);
+        if let Some(Credentials::Basic { username, password }) = credentials {
+            request = request.basic_auth(username, Some(password));
+        }
+        let response = request.send().await?;
+        if !response.status().is_success() {
+            return Err(DockerPullError::Unauthorized(format!(
+                "token endpoint returned {}",
+                response.status()
+            )));
+        }
+        let body: TokenResponse = response.json().await?;
+        Ok(body.token.or(body.access_token))
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct TokenResponse {
+    token: Option<String>,
+    access_token: Option<String>,
+}
+
+#[derive(Debug)]
+struct WwwAuthenticateChallenge {
+    scheme: String,
+    realm: String,
+    service: Option<String>,
+    scope: Option<String>,
+}
+
+fn parse_www_authenticate(header: &str) -> Result<WwwAuthenticateChallenge> {
+    let (scheme, rest) = header
+        .split_once(' ')
+        .ok_or_else(|| DockerPullError::Unauthorized("invalid auth challenge".into()))?;
+    let mut realm = None;
+    let mut service = None;
+    let mut scope = None;
+
+    for item in rest.split(',') {
+        let (key, value) = item
+            .trim()
+            .split_once('=')
+            .ok_or_else(|| DockerPullError::Unauthorized("invalid auth attribute".into()))?;
+        let value = value.trim_matches('"');
+        match key {
+            "realm" => realm = Some(value.to_string()),
+            "service" => service = Some(value.to_string()),
+            "scope" => scope = Some(value.to_string()),
+            _ => {}
+        }
+    }
+
+    Ok(WwwAuthenticateChallenge {
+        scheme: scheme.to_string(),
+        realm: realm.ok_or_else(|| DockerPullError::Unauthorized("missing token realm".into()))?,
+        service,
+        scope,
+    })
+}
+
+fn is_image_manifest(media_type: &str) -> bool {
+    matches!(
+        media_type,
+        "application/vnd.oci.image.manifest.v1+json"
+            | "application/vnd.docker.distribution.manifest.v2+json"
+    )
+}
+
+fn is_image_index(media_type: &str) -> bool {
+    matches!(
+        media_type,
+        "application/vnd.oci.image.index.v1+json"
+            | "application/vnd.docker.distribution.manifest.list.v2+json"
+    )
+}
+
+fn is_retryable_status(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::REQUEST_TIMEOUT
+            | StatusCode::TOO_MANY_REQUESTS
+            | StatusCode::BAD_GATEWAY
+            | StatusCode::SERVICE_UNAVAILABLE
+            | StatusCode::GATEWAY_TIMEOUT
+            | StatusCode::INTERNAL_SERVER_ERROR
+    )
+}
+
+fn is_retryable_http_error(error: &reqwest::Error) -> bool {
+    error.is_timeout() || error.is_connect() || error.is_request() || error.is_body()
+}
+
+fn backoff_delay(attempt: u32) -> Duration {
+    let seconds = 2_u64.saturating_pow(attempt.min(5)) + 1;
+    Duration::from_secs(seconds)
+}
+
+fn retry_after_delay(value: Option<&HeaderValue>) -> Option<Duration> {
+    let raw = value?.to_str().ok()?;
+    if let Ok(seconds) = raw.parse::<u64>() {
+        return Some(Duration::from_secs(seconds));
+    }
+    let retry_at = httpdate::parse_http_date(raw).ok()?;
+    retry_at.duration_since(std::time::SystemTime::now()).ok()
+}
+
+fn header_string(response: &Response, name: &str) -> Result<Option<String>> {
+    Ok(response
+        .headers()
+        .get(name)
+        .map(|value| value.to_str().map(ToString::to_string))
+        .transpose()?)
+}
+
+fn digest_bytes(bytes: &[u8]) -> String {
+    use sha2::{Digest as _, Sha256};
+
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("sha256:{}", hex::encode(hasher.finalize()))
+}
+
+fn retry_limit_exceeded(
+    operation: &str,
+    retries: u32,
+    detail: impl Into<String>,
+) -> DockerPullError {
+    DockerPullError::RetryLimitExceeded {
+        operation: operation.to_string(),
+        retries,
+        detail: detail.into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    use super::{MAX_REQUEST_RETRIES, RegistryClient};
+    use crate::auth::AuthResolver;
+    use crate::error::DockerPullError;
+    use crate::reference::ImageReference;
+
+    #[tokio::test]
+    async fn resolve_image_stops_after_retry_budget_exhaustion() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let address = listener.local_addr().expect("listener address");
+
+        let server = tokio::spawn(async move {
+            for _ in 0..=MAX_REQUEST_RETRIES {
+                let (mut stream, _) = listener.accept().await.expect("connection should arrive");
+                let mut buffer = [0_u8; 2048];
+                let _ = stream.read(&mut buffer).await;
+                stream
+                    .write_all(
+                        b"HTTP/1.1 503 Service Unavailable\r\nRetry-After: 0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .await
+                    .expect("response should be written");
+            }
+        });
+
+        let client = RegistryClient::new(
+            reqwest::Client::builder()
+                .https_only(false)
+                .build()
+                .expect("client should build"),
+            Arc::new(AuthResolver::new(None).expect("auth resolver should build")),
+            true,
+        );
+        let reference = ImageReference::parse(&format!("{address}/sample:latest"))
+            .expect("reference should parse");
+
+        let error = client
+            .resolve_image(&reference, &crate::platform::Platform::host())
+            .await
+            .expect_err("request should fail after retries are exhausted");
+        match error {
+            DockerPullError::RetryLimitExceeded {
+                operation,
+                retries,
+                detail,
+            } => {
+                assert_eq!(operation, "registry request");
+                assert_eq!(retries, MAX_REQUEST_RETRIES);
+                assert!(detail.contains("503"));
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+
+        server.await.expect("server task should finish");
+    }
+}

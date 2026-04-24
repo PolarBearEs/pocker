@@ -1,0 +1,159 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+BIN="${1:-target/debug/pocker}"
+PUBLIC_REF="registry.k8s.io/pause:3.9"
+RESUME_REGISTRY_PORT="${RESUME_REGISTRY_PORT:-5002}"
+AUTH_REGISTRY_PORT="${AUTH_REGISTRY_PORT:-5003}"
+RESUME_REF="localhost:${RESUME_REGISTRY_PORT}/pocker/resume:latest"
+PRIVATE_REF="localhost:${AUTH_REGISTRY_PORT}/pocker/private:latest"
+AUTH_USER="smoke"
+AUTH_PASSWORD="smoke-password"
+WORKDIR="$(mktemp -d)"
+RESUME_REGISTRY_NAME="pocker-smoke-registry-${RESUME_REGISTRY_PORT}"
+AUTH_REGISTRY_NAME="pocker-smoke-registry-${AUTH_REGISTRY_PORT}"
+
+cleanup() {
+  docker rm -f "${RESUME_REGISTRY_NAME}" "${AUTH_REGISTRY_NAME}" >/dev/null 2>&1 || true
+  docker run --rm -v "${WORKDIR}:/work" alpine sh -c 'rm -rf /work/*' >/dev/null 2>&1 || true
+  rm -rf "${WORKDIR}" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+
+require_tool() {
+  command -v "$1" >/dev/null 2>&1 || {
+    echo "missing required tool: $1" >&2
+    exit 1
+  }
+}
+
+wait_for_registry() {
+  local port="$1"
+  for _ in $(seq 1 60); do
+    local status
+    status="$(curl -s -o /dev/null -w '%{http_code}' "http://localhost:${port}/v2/" || true)"
+    if [[ "${status}" == "200" || "${status}" == "401" ]]; then
+      return 0
+    fi
+    sleep 1
+  done
+  echo "registry on port ${port} did not become ready" >&2
+  return 1
+}
+
+run_pocker() {
+  "${BIN}" "$@"
+}
+
+require_tool docker
+require_tool curl
+require_tool python3
+
+mkdir -p "${WORKDIR}"
+
+echo "smoke: public pull into Docker"
+docker image rm -f "${PUBLIC_REF}" >/dev/null 2>&1 || true
+run_pocker --cache-dir "${WORKDIR}/cache-public" pull "${PUBLIC_REF}"
+docker image inspect "${PUBLIC_REF}" >/dev/null
+run_pocker image inspect "${PUBLIC_REF}" >/dev/null
+
+echo "smoke: multi-platform pull selects linux/arm64 config"
+run_pocker --cache-dir "${WORKDIR}/cache-platform" pull --no-load --platform linux/arm64 "${PUBLIC_REF}"
+python3 - "${WORKDIR}/cache-platform" <<'PY'
+import json
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1]) / "blobs" / "sha256"
+for path in root.glob("*"):
+    try:
+        data = json.loads(path.read_text())
+    except Exception:
+        continue
+    if data.get("architecture") == "arm64" and data.get("os") == "linux":
+        sys.exit(0)
+raise SystemExit("missing linux/arm64 image config in cache")
+PY
+
+echo "smoke: image save/load round-trip"
+ARCHIVE_PATH="${WORKDIR}/pause.tar"
+run_pocker image save "${PUBLIC_REF}" --output "${ARCHIVE_PATH}"
+docker image rm -f "${PUBLIC_REF}" >/dev/null
+run_pocker image load --input "${ARCHIVE_PATH}"
+docker image inspect "${PUBLIC_REF}" >/dev/null
+
+echo "smoke: resumable download resumes from partial cache"
+docker run -d --name "${RESUME_REGISTRY_NAME}" -p "${RESUME_REGISTRY_PORT}:5000" registry:2 >/dev/null
+wait_for_registry "${RESUME_REGISTRY_PORT}"
+mkdir -p "${WORKDIR}/resume-image"
+dd if=/dev/urandom of="${WORKDIR}/resume-image/payload.bin" bs=1M count=512 status=none
+cat > "${WORKDIR}/resume-image/Dockerfile" <<'EOF'
+FROM alpine:3.20
+COPY payload.bin /payload.bin
+EOF
+docker build -t "${RESUME_REF}" "${WORKDIR}/resume-image" >/dev/null
+docker push "${RESUME_REF}" >/dev/null
+docker image rm -f "${RESUME_REF}" >/dev/null 2>&1 || true
+
+set +e
+timeout --signal=KILL 5s "${BIN}" --cache-dir "${WORKDIR}/cache-resume" pull --no-load --plain-http --max-parallel-downloads 1 "${RESUME_REF}"
+STATUS=$?
+set -e
+if [[ "${STATUS}" -ne 124 && "${STATUS}" -ne 137 && "${STATUS}" -ne 1 ]]; then
+  echo "expected interrupted pull during resume smoke test, got status ${STATUS}" >&2
+  exit 1
+fi
+PARTIAL_PATH="$(find "${WORKDIR}/cache-resume/partials/sha256" -type f -name '*.part' -size +10485760c | head -n 1 || true)"
+if [[ -z "${PARTIAL_PATH}" ]]; then
+  echo "failed to observe a partial download before timeout interruption" >&2
+  exit 1
+fi
+if [[ ! -s "${PARTIAL_PATH}" ]]; then
+  echo "expected non-empty partial layer after interrupt" >&2
+  exit 1
+fi
+run_pocker --cache-dir "${WORKDIR}/cache-resume" pull --no-load --plain-http --max-parallel-downloads 1 "${RESUME_REF}"
+find "${WORKDIR}/cache-resume/blobs/sha256" -type f | grep -q .
+
+echo "smoke: private registry auth via stdin and Docker config"
+mkdir -p "${WORKDIR}/auth-registry-data"
+docker run -d \
+  --name "${AUTH_REGISTRY_NAME}" \
+  -p "${AUTH_REGISTRY_PORT}:5000" \
+  -v "${WORKDIR}/auth-registry-data:/var/lib/registry" \
+  registry:2 >/dev/null
+wait_for_registry "${AUTH_REGISTRY_PORT}"
+docker tag "${PUBLIC_REF}" "${PRIVATE_REF}"
+docker push "${PRIVATE_REF}" >/dev/null
+docker rm -f "${AUTH_REGISTRY_NAME}" >/dev/null
+
+docker run --rm --entrypoint htpasswd httpd:2 -Bbn "${AUTH_USER}" "${AUTH_PASSWORD}" > "${WORKDIR}/htpasswd"
+docker run -d \
+  --name "${AUTH_REGISTRY_NAME}" \
+  -p "${AUTH_REGISTRY_PORT}:5000" \
+  -v "${WORKDIR}/auth-registry-data:/var/lib/registry" \
+  -v "${WORKDIR}/htpasswd:/auth/htpasswd:ro" \
+  -e REGISTRY_AUTH=htpasswd \
+  -e REGISTRY_AUTH_HTPASSWD_REALM="Registry Realm" \
+  -e REGISTRY_AUTH_HTPASSWD_PATH=/auth/htpasswd \
+  registry:2 >/dev/null
+wait_for_registry "${AUTH_REGISTRY_PORT}"
+
+mkdir -p "${WORKDIR}/docker-config-auth"
+AUTH_B64="$(printf "%s:%s" "${AUTH_USER}" "${AUTH_PASSWORD}" | base64 | tr -d '\n')"
+cat > "${WORKDIR}/docker-config-auth/config.json" <<EOF
+{
+  "auths": {
+    "localhost:${AUTH_REGISTRY_PORT}": {
+      "auth": "${AUTH_B64}"
+    }
+  }
+}
+EOF
+
+printf "%s" "${AUTH_PASSWORD}" | \
+  run_pocker --cache-dir "${WORKDIR}/cache-private-stdin" pull --no-load --plain-http --username "${AUTH_USER}" --password-stdin "${PRIVATE_REF}"
+DOCKER_CONFIG="${WORKDIR}/docker-config-auth" \
+  run_pocker --cache-dir "${WORKDIR}/cache-private-config" pull --no-load --plain-http "${PRIVATE_REF}"
+
+echo "smoke: docker workflow checks passed"
