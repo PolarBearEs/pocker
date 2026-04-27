@@ -5,6 +5,7 @@ mod error;
 mod export;
 mod http;
 mod image;
+mod local_registry;
 mod platform;
 mod pull;
 mod reference;
@@ -22,6 +23,7 @@ use clap::Parser;
 use cli::{Cli, Commands, ImageCommands};
 use error::{DockerPullError, Result};
 use http::build_http_client;
+use local_registry::serve_cached_registry;
 use platform::Platform;
 use pull::{PullContext, PullOptions, Puller};
 use registry::RegistryClient;
@@ -93,6 +95,10 @@ async fn run() -> Result<()> {
                 ui,
             };
             Puller::new(context).pull(reference, options).await?;
+        }
+        Commands::Serve(args) => {
+            let store = Arc::new(Store::open(cli.global.cache_dir.clone()).await?);
+            serve_cached_registry(store, args.bind).await?;
         }
         Commands::Image(args) => match args.command {
             ImageCommands::Ls(_) => print_image_list().await?,

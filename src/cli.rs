@@ -1,3 +1,4 @@
+use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
@@ -27,6 +28,7 @@ pub struct GlobalArgs {
 #[derive(Debug, Subcommand)]
 pub enum Commands {
     Pull(PullArgs),
+    Serve(ServeArgs),
     Image(ImageArgs),
     Images(ImageLsArgs),
     Version,
@@ -94,6 +96,16 @@ pub struct PullArgs {
     pub password_stdin: bool,
     #[arg(long)]
     pub quiet: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct ServeArgs {
+    #[arg(
+        long,
+        default_value = "127.0.0.1:5100",
+        help = "Bind address for the local cache registry; use 127.0.0.1 for Docker pulls"
+    )]
+    pub bind: SocketAddr,
 }
 
 fn default_cache_dir() -> PathBuf {

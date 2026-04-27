@@ -73,9 +73,13 @@ impl Puller {
             .map(|layer| layer.descriptor.digest.clone())
             .collect::<Vec<_>>();
         self.context.ui.prepare_layers(&layer_digests);
-        let daemon_layers = docker::daemon_layer_coverage(&layers)
-            .await
-            .unwrap_or_default();
+        let daemon_layers = if options.no_load {
+            std::collections::HashMap::new()
+        } else {
+            docker::daemon_layer_coverage(&layers)
+                .await
+                .unwrap_or_default()
+        };
         let mut downloads = Vec::new();
 
         for layer in layers {
@@ -130,6 +134,9 @@ impl Puller {
         };
 
         if options.no_load {
+            self.context
+                .store
+                .save_cached_reference(&reference, &resolved.manifest)?;
             self.context.ui.finish_image(&normalized, "Pulled");
         } else {
             finalize_reference(&self.context, &reference, &stored_reference, &options).await?;

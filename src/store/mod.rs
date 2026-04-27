@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 use tokio::fs as tokio_fs;
 
 use crate::error::{DockerPullError, Result};
+use crate::platform::Platform;
+use crate::reference::{ImageReference, ReferenceTarget};
 use crate::registry::Descriptor;
 use fs::{
     atomic_write_bytes, atomic_write_json, digest_file, ensure_directory, read_json_if_exists,
@@ -22,6 +24,15 @@ pub struct StoredReference {
     pub reference: String,
     pub manifest: Descriptor,
     pub config_digest: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CachedReference {
+    pub local_repository: String,
+    pub manifest_digest: String,
+    pub manifest_media_type: String,
+    pub manifest_size: i64,
+    pub platform: Option<Platform>,
 }
 
 #[derive(Debug, Clone)]
@@ -45,6 +56,7 @@ impl Store {
         ensure_directory(&root.join("blobs").join("sha256"))?;
         ensure_directory(&root.join("partials"))?;
         ensure_directory(&root.join("partials").join("sha256"))?;
+        ensure_directory(&root.join("refs"))?;
         Ok(Self { root })
     }
 
@@ -220,8 +232,70 @@ impl Store {
         Ok(removed)
     }
 
+    pub fn save_cached_reference(
+        &self,
+        reference: &ImageReference,
+        manifest: &Descriptor,
+    ) -> Result<()> {
+        let record = CachedReference {
+            local_repository: reference.local_repository(),
+            manifest_digest: manifest.digest.clone(),
+            manifest_media_type: manifest.media_type.clone(),
+            manifest_size: manifest.size,
+            platform: manifest.platform.clone(),
+        };
+
+        if let ReferenceTarget::Tag(tag) = &reference.target {
+            let tag_path = self.cached_tag_path(&record.local_repository, tag)?;
+            atomic_write_json(&tag_path, &record)?;
+        }
+
+        let digest_path = self.cached_digest_path(&record.local_repository, &manifest.digest)?;
+        atomic_write_json(&digest_path, &record)?;
+        Ok(())
+    }
+
+    pub fn load_cached_tag(
+        &self,
+        local_repository: &str,
+        tag: &str,
+    ) -> Result<Option<CachedReference>> {
+        read_json_if_exists(&self.cached_tag_path(local_repository, tag)?)
+    }
+
+    pub fn load_cached_digest(
+        &self,
+        local_repository: &str,
+        digest: &str,
+    ) -> Result<Option<CachedReference>> {
+        read_json_if_exists(&self.cached_digest_path(local_repository, digest)?)
+    }
+
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    fn cached_tag_path(&self, local_repository: &str, tag: &str) -> Result<PathBuf> {
+        if tag.is_empty() || tag.contains('/') {
+            return Err(DockerPullError::InvalidInput(format!(
+                "invalid tag `{tag}`"
+            )));
+        }
+        let mut path = cached_repository_root(self.root.join("refs"), local_repository)?;
+        path.push("tags");
+        path.push(format!("{tag}.json"));
+        Ok(path)
+    }
+
+    fn cached_digest_path(&self, local_repository: &str, digest: &str) -> Result<PathBuf> {
+        let (algorithm, value) = digest.split_once(':').ok_or_else(|| {
+            DockerPullError::InvalidInput(format!("invalid digest format `{digest}`"))
+        })?;
+        let mut path = cached_repository_root(self.root.join("refs"), local_repository)?;
+        path.push("digests");
+        path.push(algorithm);
+        path.push(format!("{value}.json"));
+        Ok(path)
     }
 }
 
@@ -230,6 +304,19 @@ fn digest_path(root: PathBuf, digest: &str) -> Result<PathBuf> {
         DockerPullError::InvalidInput(format!("invalid digest format `{digest}`"))
     })?;
     Ok(root.join(algorithm).join(value))
+}
+
+fn cached_repository_root(root: PathBuf, local_repository: &str) -> Result<PathBuf> {
+    let mut path = root;
+    for segment in local_repository.split('/') {
+        if segment.is_empty() || matches!(segment, "." | "..") {
+            return Err(DockerPullError::InvalidInput(format!(
+                "invalid repository path `{local_repository}`"
+            )));
+        }
+        path.push(segment);
+    }
+    Ok(path)
 }
 
 fn digest_bytes(bytes: &[u8]) -> String {
@@ -244,7 +331,8 @@ fn digest_bytes(bytes: &[u8]) -> String {
 mod tests {
     use tempfile::tempdir;
 
-    use super::{Store, StoredReference};
+    use super::{CachedReference, Store, StoredReference};
+    use crate::reference::ImageReference;
     use crate::registry::Descriptor;
 
     #[tokio::test]
@@ -365,5 +453,62 @@ mod tests {
                 .exists(),
             "config blob should be retained"
         );
+    }
+
+    #[tokio::test]
+    async fn save_cached_reference_persists_tag_and_digest_lookups() {
+        let dir = tempdir().expect("tempdir should create");
+        let store = Store::open(dir.path().to_path_buf())
+            .await
+            .expect("store should open");
+        let reference =
+            ImageReference::parse("ghcr.io/acme/app:1.2.3").expect("reference should parse");
+        let manifest = Descriptor {
+            media_type: "application/vnd.oci.image.manifest.v1+json".into(),
+            digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .into(),
+            size: 456,
+            platform: Some(
+                crate::platform::Platform::parse("linux/amd64").expect("platform should parse"),
+            ),
+            annotations: None,
+        };
+
+        store
+            .save_cached_reference(&reference, &manifest)
+            .expect("reference should save");
+
+        let by_tag = store
+            .load_cached_tag("ghcr.io/acme/app", "1.2.3")
+            .expect("tag lookup should succeed")
+            .expect("tag record should exist");
+        let by_digest = store
+            .load_cached_digest(
+                "ghcr.io/acme/app",
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )
+            .expect("digest lookup should succeed")
+            .expect("digest record should exist");
+
+        assert_eq!(by_tag.manifest_digest, manifest.digest);
+        assert_eq!(by_tag.local_repository, "ghcr.io/acme/app");
+        assert_eq!(by_digest.platform, by_tag.platform);
+    }
+
+    #[test]
+    fn cached_reference_serializes_cleanly() {
+        let value = CachedReference {
+            local_repository: "registry-1.docker.io/library/alpine".into(),
+            manifest_digest:
+                "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+            manifest_media_type: "application/vnd.oci.image.manifest.v1+json".into(),
+            manifest_size: 123,
+            platform: None,
+        };
+
+        let encoded = serde_json::to_vec(&value).expect("json should serialize");
+        let decoded: CachedReference =
+            serde_json::from_slice(&encoded).expect("json should deserialize");
+        assert_eq!(decoded.manifest_digest, value.manifest_digest);
     }
 }

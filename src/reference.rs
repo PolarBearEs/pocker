@@ -76,6 +76,10 @@ impl ImageReference {
         format!("repository:{}:pull", self.repository)
     }
 
+    pub fn local_repository(&self) -> String {
+        format!("{}/{}", self.registry, self.repository)
+    }
+
     pub fn display_name(&self) -> String {
         if is_docker_hub(&self.registry) {
             let repository = self
