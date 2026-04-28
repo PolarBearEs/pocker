@@ -13,24 +13,28 @@ pub struct Ui {
 }
 
 struct UiInner {
+    animated: bool,
     multi: MultiProgress,
     image: ProgressBar,
     layers: Mutex<HashMap<String, ProgressBar>>,
 }
 
 impl Ui {
-    pub fn new(quiet: bool) -> Self {
+    pub fn new(quiet: bool, animated: bool) -> Self {
         if quiet || !should_render_progress() {
             return Self { inner: None };
         }
 
         let multi = MultiProgress::with_draw_target(ProgressDrawTarget::stderr());
         let image = multi.add(ProgressBar::new_spinner());
-        image.set_style(spinner_style());
-        image.enable_steady_tick(Duration::from_millis(100));
+        image.set_style(image_status_style(animated));
+        if animated {
+            image.enable_steady_tick(Duration::from_millis(100));
+        }
 
         Self {
             inner: Some(Arc::new(UiInner {
+                animated,
                 multi,
                 image,
                 layers: Mutex::new(HashMap::new()),
@@ -73,8 +77,10 @@ impl Ui {
         let mut layers = inner.layers.lock().expect("ui state poisoned");
         for digest in digests {
             let bar = inner.multi.add(ProgressBar::new_spinner());
-            bar.set_style(layer_status_style());
-            bar.enable_steady_tick(Duration::from_millis(120));
+            bar.set_style(layer_status_style(inner.animated));
+            if inner.animated {
+                bar.enable_steady_tick(Duration::from_millis(120));
+            }
             bar.set_message(format!("{} Pulling fs layer", short_digest(digest)));
             layers.insert(digest.clone(), bar);
         }
@@ -113,8 +119,10 @@ impl Ui {
         let Some(bar) = self.layer_bar(digest) else {
             return;
         };
-        bar.set_style(layer_status_style());
-        bar.enable_steady_tick(Duration::from_millis(120));
+        bar.set_style(layer_status_style(self.is_animated()));
+        if self.is_animated() {
+            bar.enable_steady_tick(Duration::from_millis(120));
+        }
         bar.set_message(format!("{} {status}", short_digest(digest)));
     }
 
@@ -129,7 +137,7 @@ impl Ui {
         let Some(bar) = self.layer_bar(digest) else {
             return;
         };
-        bar.set_style(layer_status_style());
+        bar.set_style(layer_status_style(self.is_animated()));
         bar.finish_with_message(format!("{} {status}", short_digest(digest)));
     }
 
@@ -141,6 +149,13 @@ impl Ui {
             .expect("ui state poisoned")
             .get(digest)
             .cloned()
+    }
+
+    fn is_animated(&self) -> bool {
+        self.inner
+            .as_ref()
+            .map(|inner| inner.animated)
+            .unwrap_or(false)
     }
 }
 
@@ -189,16 +204,24 @@ fn short_digest(digest: &str) -> String {
     value.chars().take(12).collect()
 }
 
-fn spinner_style() -> ProgressStyle {
-    ProgressStyle::with_template("{spinner:.cyan} {msg}")
-        .expect("valid spinner template")
-        .tick_strings(&["-", "\\", "|", "/"])
+fn image_status_style(animated: bool) -> ProgressStyle {
+    if animated {
+        ProgressStyle::with_template("{spinner:.cyan} {msg}")
+            .expect("valid spinner template")
+            .tick_strings(&["-", "\\", "|", "/"])
+    } else {
+        ProgressStyle::with_template("{msg}").expect("valid status template")
+    }
 }
 
-fn layer_status_style() -> ProgressStyle {
-    ProgressStyle::with_template(" {spinner:.cyan} {msg}")
-        .expect("valid layer status template")
-        .tick_strings(&[" ", ".", "o", "O", "o", "."])
+fn layer_status_style(animated: bool) -> ProgressStyle {
+    if animated {
+        ProgressStyle::with_template(" {spinner:.cyan} {msg}")
+            .expect("valid layer status template")
+            .tick_strings(&[" ", ".", "o", "O", "o", "."])
+    } else {
+        ProgressStyle::with_template(" {msg}").expect("valid layer status template")
+    }
 }
 
 fn layer_download_style() -> ProgressStyle {

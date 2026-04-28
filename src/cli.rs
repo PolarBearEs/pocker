@@ -94,10 +94,29 @@ pub struct PullArgs {
     pub password_stdin: bool,
     #[arg(long)]
     pub quiet: bool,
+    #[arg(long, help = "Disable animated progress output during pull")]
+    pub no_animations: bool,
 }
 
 fn default_cache_dir() -> PathBuf {
     directories::ProjectDirs::from("", "", "pocker")
         .map(|dirs| dirs.data_local_dir().to_path_buf())
         .unwrap_or_else(|| PathBuf::from(".pocker"))
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::{Cli, Commands};
+
+    #[test]
+    fn pull_accepts_no_animations_flag() {
+        let cli = Cli::parse_from(["pocker", "pull", "--no-animations", "alpine:latest"]);
+        let Commands::Pull(args) = cli.command else {
+            panic!("expected pull command");
+        };
+
+        assert!(args.no_animations);
+    }
 }
