@@ -78,6 +78,7 @@ async fn run() -> Result<()> {
                 )?,
                 auth,
                 args.plain_http,
+                args.request_retries,
             ));
             let stop = install_signal_handler();
             let options = PullOptions {
@@ -91,6 +92,7 @@ async fn run() -> Result<()> {
                 registry: client,
                 stop,
                 ui,
+                blob_retry_limit: args.blob_retries,
             };
             Puller::new(context).pull(reference, options).await?;
         }

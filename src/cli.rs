@@ -2,6 +2,9 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
 
+use crate::pull::DEFAULT_BLOB_RETRIES;
+use crate::registry::DEFAULT_REQUEST_RETRIES;
+
 #[derive(Debug, Parser)]
 #[command(name = "pocker")]
 #[command(about = "Resumable OCI registry image puller")]
@@ -78,6 +81,18 @@ pub struct PullArgs {
         default_value_t = 4
     )]
     pub concurrency: usize,
+    #[arg(
+        long = "blob-retries",
+        default_value_t = DEFAULT_BLOB_RETRIES,
+        help = "Maximum retries for interrupted blob downloads; use 0 for unlimited retries"
+    )]
+    pub blob_retries: u32,
+    #[arg(
+        long = "request-retries",
+        default_value_t = DEFAULT_REQUEST_RETRIES,
+        help = "Maximum retries for registry requests before any response or on retryable HTTP status; use 0 for unlimited retries"
+    )]
+    pub request_retries: u32,
     #[arg(long)]
     pub no_load: bool,
     #[arg(long)]
@@ -118,5 +133,45 @@ mod tests {
         };
 
         assert!(args.no_animations);
+    }
+
+    #[test]
+    fn pull_accepts_blob_retries_flag() {
+        let cli = Cli::parse_from(["pocker", "pull", "--blob-retries", "32", "alpine:latest"]);
+        let Commands::Pull(args) = cli.command else {
+            panic!("expected pull command");
+        };
+
+        assert_eq!(args.blob_retries, 32);
+    }
+
+    #[test]
+    fn pull_accepts_unlimited_blob_retries_with_zero() {
+        let cli = Cli::parse_from(["pocker", "pull", "--blob-retries", "0", "alpine:latest"]);
+        let Commands::Pull(args) = cli.command else {
+            panic!("expected pull command");
+        };
+
+        assert_eq!(args.blob_retries, 0);
+    }
+
+    #[test]
+    fn pull_accepts_request_retries_flag() {
+        let cli = Cli::parse_from(["pocker", "pull", "--request-retries", "12", "alpine:latest"]);
+        let Commands::Pull(args) = cli.command else {
+            panic!("expected pull command");
+        };
+
+        assert_eq!(args.request_retries, 12);
+    }
+
+    #[test]
+    fn pull_accepts_unlimited_request_retries_with_zero() {
+        let cli = Cli::parse_from(["pocker", "pull", "--request-retries", "0", "alpine:latest"]);
+        let Commands::Pull(args) = cli.command else {
+            panic!("expected pull command");
+        };
+
+        assert_eq!(args.request_retries, 0);
     }
 }

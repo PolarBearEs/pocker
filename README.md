@@ -9,7 +9,7 @@ It pulls images directly from registries, resumes interrupted downloads from a l
 - Resumable layer downloads
 - Docker credential helper and `config.json` auth support
 - Docker image list, inspect, save, and load commands
-- Bounded retry behavior for retryable registry failures
+- Configurable retry behavior for retryable registry failures
 
 ## Install
 
@@ -36,6 +36,24 @@ Pull a specific platform:
 
 ```bash
 pocker pull --platform linux/arm64 ghcr.io/example/app:latest
+```
+
+Increase blob retries on unstable links:
+
+```bash
+pocker pull --blob-retries 32 ghcr.io/example/app:latest
+```
+
+Retry indefinitely on unstable links:
+
+```bash
+pocker pull --blob-retries 0 ghcr.io/example/app:latest
+```
+
+Increase registry request retries for flaky pre-response failures:
+
+```bash
+pocker pull --request-retries 16 ghcr.io/example/app:latest
 ```
 
 Pull a private image:
@@ -70,7 +88,9 @@ pocker image --help
 - Docker access uses `DOCKER_HOST` if set, otherwise `/var/run/docker.sock`
 - Registry auth is reused from Docker config when available
 - Use `--cache-dir` to override the default local cache location
-- Registry retries are bounded; persistent retryable failures exit with a non-zero status
+- Use `--blob-retries` to raise the retry budget for unstable connections; `0` means unlimited retries
+- Use `--request-retries` to raise the retry budget for request/connect/503-style failures; `0` means unlimited retries
+- Registry retries are bounded by default; setting a retry flag to `0` makes that retry path unlimited
 
 ## Support Matrix
 
@@ -85,8 +105,3 @@ pocker image --help
 - Docker image workflows require access to a Docker daemon socket
 - Private registry pulls require either `--username` with `--password-stdin` or Docker config-based auth
 - Plain HTTP registries require `--plain-http`
-
-## Known Limitations
-
-- Release artifacts are built for Linux targets only
-- Registry retry warnings are surfaced through the CLI and tracing output, but the retry budget is fixed in 0.1.0

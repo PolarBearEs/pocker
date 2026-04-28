@@ -21,7 +21,7 @@ const MANIFEST_ACCEPT: &str = concat!(
     "application/vnd.oci.image.manifest.v1+json,",
     "application/vnd.docker.distribution.manifest.v2+json"
 );
-const MAX_REQUEST_RETRIES: u32 = 5;
+pub const DEFAULT_REQUEST_RETRIES: u32 = 5;
 const MAX_AUTH_RETRIES: u32 = 2;
 
 #[derive(Debug, Clone)]
@@ -30,6 +30,7 @@ pub struct RegistryClient {
     auth: Arc<AuthResolver>,
     token_cache: Arc<Mutex<HashMap<String, String>>>,
     plain_http: bool,
+    request_retry_limit: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -85,12 +86,18 @@ pub struct BlobMetadata {
 }
 
 impl RegistryClient {
-    pub fn new(client: Client, auth: Arc<AuthResolver>, plain_http: bool) -> Self {
+    pub fn new(
+        client: Client,
+        auth: Arc<AuthResolver>,
+        plain_http: bool,
+        request_retry_limit: u32,
+    ) -> Self {
         Self {
             client,
             auth,
             token_cache: Arc::new(Mutex::new(HashMap::new())),
             plain_http,
+            request_retry_limit,
         }
     }
 
@@ -325,14 +332,15 @@ impl RegistryClient {
                 Ok(response) => response,
                 Err(error) if allow_retry && is_retryable_http_error(&error) => {
                     let detail = error.to_string();
-                    if retries >= MAX_REQUEST_RETRIES {
+                    if request_retry_limit_exhausted(retries, self.request_retry_limit) {
                         return Err(retry_limit_exceeded("registry request", retries, detail));
                     }
                     let next_retry = retries + 1;
                     let delay = backoff_delay(retries);
+                    let retry_budget = format_retry_budget(next_retry, self.request_retry_limit);
                     warn!(
-                        "request failed before response, retrying in {:?} ({}/{})",
-                        delay, next_retry, MAX_REQUEST_RETRIES
+                        "request failed before response, retrying in {:?} ({})",
+                        delay, retry_budget
                     );
                     sleep(delay).await;
                     retries = next_retry;
@@ -366,7 +374,7 @@ impl RegistryClient {
 
             if allow_retry && is_retryable_status(response.status()) {
                 let status = response.status();
-                if retries >= MAX_REQUEST_RETRIES {
+                if request_retry_limit_exhausted(retries, self.request_retry_limit) {
                     return Err(retry_limit_exceeded(
                         "registry request",
                         retries,
@@ -376,9 +384,10 @@ impl RegistryClient {
                 let next_retry = retries + 1;
                 let delay = retry_after_delay(response.headers().get(RETRY_AFTER))
                     .unwrap_or_else(|| backoff_delay(retries));
+                let retry_budget = format_retry_budget(next_retry, self.request_retry_limit);
                 warn!(
-                    "registry returned {}, retrying in {:?} ({}/{})",
-                    status, delay, next_retry, MAX_REQUEST_RETRIES
+                    "registry returned {}, retrying in {:?} ({})",
+                    status, delay, retry_budget
                 );
                 sleep(delay).await;
                 retries = next_retry;
@@ -519,6 +528,18 @@ fn retry_after_delay(value: Option<&HeaderValue>) -> Option<Duration> {
     retry_at.duration_since(std::time::SystemTime::now()).ok()
 }
 
+fn request_retry_limit_exhausted(retries: u32, retry_limit: u32) -> bool {
+    retry_limit != 0 && retries >= retry_limit
+}
+
+fn format_retry_budget(next_retry: u32, retry_limit: u32) -> String {
+    if retry_limit == 0 {
+        format!("{next_retry}/unlimited")
+    } else {
+        format!("{next_retry}/{retry_limit}")
+    }
+}
+
 fn header_string(response: &Response, name: &str) -> Result<Option<String>> {
     Ok(response
         .headers()
@@ -554,7 +575,7 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
-    use super::{MAX_REQUEST_RETRIES, RegistryClient};
+    use super::{DEFAULT_REQUEST_RETRIES, RegistryClient};
     use crate::auth::AuthResolver;
     use crate::error::DockerPullError;
     use crate::reference::ImageReference;
@@ -567,7 +588,7 @@ mod tests {
         let address = listener.local_addr().expect("listener address");
 
         let server = tokio::spawn(async move {
-            for _ in 0..=MAX_REQUEST_RETRIES {
+            for _ in 0..=DEFAULT_REQUEST_RETRIES {
                 let (mut stream, _) = listener.accept().await.expect("connection should arrive");
                 let mut buffer = [0_u8; 2048];
                 let _ = stream.read(&mut buffer).await;
@@ -587,6 +608,7 @@ mod tests {
                 .expect("client should build"),
             Arc::new(AuthResolver::new(None).expect("auth resolver should build")),
             true,
+            DEFAULT_REQUEST_RETRIES,
         );
         let reference = ImageReference::parse(&format!("{address}/sample:latest"))
             .expect("reference should parse");
@@ -602,7 +624,7 @@ mod tests {
                 detail,
             } => {
                 assert_eq!(operation, "registry request");
-                assert_eq!(retries, MAX_REQUEST_RETRIES);
+                assert_eq!(retries, DEFAULT_REQUEST_RETRIES);
                 assert!(detail.contains("503"));
             }
             other => panic!("unexpected error: {other}"),

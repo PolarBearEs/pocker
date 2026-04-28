@@ -12,7 +12,6 @@ use crate::registry::Descriptor;
 
 const CHECKPOINT_BYTES: u64 = 8 * 1024 * 1024;
 const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(2);
-const MAX_BLOB_RETRIES: u32 = 8;
 
 pub async fn download_blob(
     context: &PullContext,
@@ -201,7 +200,7 @@ fn register_retry(
 ) -> Result<u32> {
     let detail = detail.into();
     let next_retry = retries + 1;
-    if next_retry > MAX_BLOB_RETRIES {
+    if context.blob_retry_limit != 0 && next_retry > context.blob_retry_limit {
         return Err(DockerPullError::RetryLimitExceeded {
             operation: format!("blob download {digest}"),
             retries,
@@ -209,9 +208,14 @@ fn register_retry(
         });
     }
 
+    let retry_budget = if context.blob_retry_limit == 0 {
+        format!("{next_retry}/unlimited")
+    } else {
+        format!("{next_retry}/{}", context.blob_retry_limit)
+    };
     context.ui.warn(format!(
-        "{detail} for {digest}; retrying in {:?} ({}/{})",
-        delay, next_retry, MAX_BLOB_RETRIES
+        "{detail} for {digest}; retrying in {:?} ({retry_budget})",
+        delay
     ));
     Ok(next_retry)
 }

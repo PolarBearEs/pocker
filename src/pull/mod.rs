@@ -14,12 +14,15 @@ use crate::registry::RegistryClient;
 use crate::store::{Store, StoredReference};
 use crate::ui::Ui;
 
+pub const DEFAULT_BLOB_RETRIES: u32 = 8;
+
 #[derive(Clone)]
 pub struct PullContext {
     pub store: Arc<Store>,
     pub registry: Arc<RegistryClient>,
     pub stop: Arc<AtomicBool>,
     pub ui: Arc<Ui>,
+    pub blob_retry_limit: u32,
 }
 
 #[derive(Debug, Clone)]
