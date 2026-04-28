@@ -98,6 +98,12 @@ pub struct PullArgs {
     pub no_animations: bool,
 }
 
+fn default_cache_dir() -> PathBuf {
+    directories::ProjectDirs::from("", "", "pocker")
+        .map(|dirs| dirs.data_local_dir().to_path_buf())
+        .unwrap_or_else(|| PathBuf::from(".pocker"))
+}
+
 #[cfg(test)]
 mod tests {
     use clap::Parser;
@@ -113,10 +119,4 @@ mod tests {
 
         assert!(args.no_animations);
     }
-}
-
-fn default_cache_dir() -> PathBuf {
-    directories::ProjectDirs::from("", "", "pocker")
-        .map(|dirs| dirs.data_local_dir().to_path_buf())
-        .unwrap_or_else(|| PathBuf::from(".pocker"))
 }
