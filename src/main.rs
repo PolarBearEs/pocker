@@ -54,7 +54,7 @@ async fn run() -> Result<()> {
                 .map(Platform::parse)
                 .transpose()?
                 .unwrap_or_else(Platform::host);
-            let ui = Arc::new(Ui::new(quiet));
+            let ui = Arc::new(Ui::new(quiet, !args.no_animations));
             let password = if args.password_stdin {
                 Some(read_password_stdin()?)
             } else {
