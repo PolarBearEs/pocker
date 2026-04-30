@@ -30,10 +30,25 @@ pub struct GlobalArgs {
 #[derive(Debug, Subcommand)]
 pub enum Commands {
     Pull(PullArgs),
+    Cache(CacheArgs),
     Image(ImageArgs),
     Images(ImageLsArgs),
     Version,
 }
+
+#[derive(Debug, Clone, Args)]
+pub struct CacheArgs {
+    #[command(subcommand)]
+    pub command: CacheCommands,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum CacheCommands {
+    Clean(CacheCleanArgs),
+}
+
+#[derive(Debug, Clone, Args, Default)]
+pub struct CacheCleanArgs {}
 
 #[derive(Debug, Clone, Args)]
 pub struct ImageArgs {
@@ -123,7 +138,7 @@ fn default_cache_dir() -> PathBuf {
 mod tests {
     use clap::Parser;
 
-    use super::{Cli, Commands};
+    use super::{CacheCommands, Cli, Commands};
 
     #[test]
     fn pull_accepts_no_animations_flag() {
@@ -173,5 +188,15 @@ mod tests {
         };
 
         assert_eq!(args.request_retries, 0);
+    }
+
+    #[test]
+    fn cache_clean_parses() {
+        let cli = Cli::parse_from(["pocker", "cache", "clean"]);
+        let Commands::Cache(args) = cli.command else {
+            panic!("expected cache command");
+        };
+
+        assert!(matches!(args.command, CacheCommands::Clean(_)));
     }
 }

@@ -69,6 +69,7 @@ printf '%s' "$REGISTRY_PASSWORD" | \
 Docker image helpers:
 
 ```bash
+pocker cache clean
 pocker image ls
 pocker image inspect alpine:latest
 pocker image save alpine:latest --output alpine.tar
@@ -79,6 +80,7 @@ See full help:
 
 ```bash
 pocker --help
+pocker cache --help
 pocker pull --help
 pocker image --help
 ```
@@ -88,6 +90,7 @@ pocker image --help
 - Docker access uses `DOCKER_HOST` if set, otherwise `/var/run/docker.sock`
 - Registry auth is reused from Docker config when available
 - Use `--cache-dir` to override the default local cache location
+- Use `pocker cache clean` to wipe and recreate the local cache directory
 - Use `--blob-retries` to raise the retry budget for unstable connections; `0` means unlimited retries
 - Use `--request-retries` to raise the retry budget for request/connect/503-style failures; `0` means unlimited retries
 - Registry retries are bounded by default; setting a retry flag to `0` makes that retry path unlimited

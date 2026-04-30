@@ -220,6 +220,15 @@ impl Store {
         Ok(removed)
     }
 
+    pub async fn clear(&self) -> Result<()> {
+        if self.root.exists() {
+            tokio_fs::remove_dir_all(&self.root).await?;
+        }
+
+        Self::open(self.root.clone()).await?;
+        Ok(())
+    }
+
     pub fn root(&self) -> &Path {
         &self.root
     }
@@ -364,6 +373,45 @@ mod tests {
                 .expect("config path")
                 .exists(),
             "config blob should be retained"
+        );
+    }
+
+    #[tokio::test]
+    async fn clear_removes_cached_files_and_recreates_layout() {
+        let dir = tempdir().expect("tempdir should create");
+        let store = Store::open(dir.path().to_path_buf())
+            .await
+            .expect("store should open");
+        let blob = store
+            .blob_path("sha256:4444444444444444444444444444444444444444444444444444444444444444")
+            .expect("blob path");
+        let partial = store
+            .partial_path("sha256:5555555555555555555555555555555555555555555555555555555555555555")
+            .expect("partial path");
+        std::fs::create_dir_all(blob.parent().expect("blob parent"))
+            .expect("blob parent should exist");
+        std::fs::create_dir_all(partial.parent().expect("partial parent"))
+            .expect("partial parent should exist");
+        std::fs::write(&blob, b"blob").expect("blob should be written");
+        std::fs::write(&partial, b"partial").expect("partial should be written");
+
+        store.clear().await.expect("clear should succeed");
+
+        assert!(
+            !blob.exists(),
+            "blob should be removed when clearing the cache"
+        );
+        assert!(
+            !partial.exists(),
+            "partial should be removed when clearing the cache"
+        );
+        assert!(
+            store.root().join("blobs").join("sha256").exists(),
+            "blob cache layout should be recreated"
+        );
+        assert!(
+            store.root().join("partials").join("sha256").exists(),
+            "partial cache layout should be recreated"
         );
     }
 }
