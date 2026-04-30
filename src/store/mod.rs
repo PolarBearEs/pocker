@@ -30,6 +30,18 @@ pub struct DownloadPlan {
     pub partial_path: PathBuf,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClearedCache {
+    pub files: Vec<ClearedCacheFile>,
+    pub reclaimed_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClearedCacheFile {
+    pub path: PathBuf,
+    pub size: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DownloadCheckpoint {
     reference: String,
@@ -220,13 +232,21 @@ impl Store {
         Ok(removed)
     }
 
-    pub async fn clear(&self) -> Result<()> {
+    pub async fn clear(&self) -> Result<ClearedCache> {
+        let files = collect_cache_files(&self.root)?;
+        let reclaimed_bytes = files
+            .iter()
+            .fold(0_u64, |total, file| total.saturating_add(file.size));
+
         if self.root.exists() {
             tokio_fs::remove_dir_all(&self.root).await?;
         }
 
         Self::open(self.root.clone()).await?;
-        Ok(())
+        Ok(ClearedCache {
+            files,
+            reclaimed_bytes,
+        })
     }
 
     pub fn root(&self) -> &Path {
@@ -249,11 +269,51 @@ fn digest_bytes(bytes: &[u8]) -> String {
     format!("sha256:{}", hex::encode(hasher.finalize()))
 }
 
+fn collect_cache_files(root: &Path) -> Result<Vec<ClearedCacheFile>> {
+    let mut files = Vec::new();
+    collect_cache_files_recursive(root, root, &mut files)?;
+    files.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(files)
+}
+
+fn collect_cache_files_recursive(
+    root: &Path,
+    current: &Path,
+    files: &mut Vec<ClearedCacheFile>,
+) -> Result<()> {
+    if !current.exists() {
+        return Ok(());
+    }
+
+    for entry in std::fs::read_dir(current)? {
+        let entry = entry?;
+        let path = entry.path();
+        let metadata = entry.metadata()?;
+        if metadata.is_dir() {
+            collect_cache_files_recursive(root, &path, files)?;
+            continue;
+        }
+
+        if metadata.is_file() {
+            let relative = path
+                .strip_prefix(root)
+                .unwrap_or(path.as_path())
+                .to_path_buf();
+            files.push(ClearedCacheFile {
+                path: relative,
+                size: metadata.len(),
+            });
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use tempfile::tempdir;
 
-    use super::{Store, StoredReference};
+    use super::{ClearedCacheFile, Store, StoredReference};
     use crate::registry::Descriptor;
 
     #[tokio::test]
@@ -395,7 +455,7 @@ mod tests {
         std::fs::write(&blob, b"blob").expect("blob should be written");
         std::fs::write(&partial, b"partial").expect("partial should be written");
 
-        store.clear().await.expect("clear should succeed");
+        let cleared = store.clear().await.expect("clear should succeed");
 
         assert!(
             !blob.exists(),
@@ -412,6 +472,22 @@ mod tests {
         assert!(
             store.root().join("partials").join("sha256").exists(),
             "partial cache layout should be recreated"
+        );
+        assert_eq!(cleared.reclaimed_bytes, 11);
+        assert_eq!(
+            cleared.files,
+            vec![
+                ClearedCacheFile {
+                    path: "blobs/sha256/4444444444444444444444444444444444444444444444444444444444444444"
+                        .into(),
+                    size: 4,
+                },
+                ClearedCacheFile {
+                    path: "partials/sha256/5555555555555555555555555555555555555555555555555555555555555555.part"
+                        .into(),
+                    size: 7,
+                },
+            ]
         );
     }
 }

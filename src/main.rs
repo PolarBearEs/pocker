@@ -235,9 +235,25 @@ async fn print_image_inspect(reference: &str) -> Result<()> {
 }
 
 async fn clean_cache(store: &Store, quiet: bool) -> Result<()> {
-    store.clear().await?;
+    let cleared = store.clear().await?;
     if !quiet {
         println!("Cleared cache at {}", store.root().display());
+        if cleared.files.is_empty() {
+            println!("Deleted: nothing");
+        } else {
+            println!("Deleted:");
+            for file in cleared.files {
+                println!(
+                    "  {} ({})",
+                    file.path.display(),
+                    format_size(Some(file.size))
+                );
+            }
+        }
+        println!(
+            "Reclaimed space: {}",
+            format_size(Some(cleared.reclaimed_bytes))
+        );
     }
     Ok(())
 }
