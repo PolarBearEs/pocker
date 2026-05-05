@@ -81,11 +81,11 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install cross
-        uses: taiki-e/install-action@cross
-
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@v2
+
+      - name: Install cross
+        uses: taiki-e/install-action@cross
 
       - name: Build release binary
         run: cross build --locked --release --target armv7-unknown-linux-gnueabihf
