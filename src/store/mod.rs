@@ -293,13 +293,17 @@ fn collect_cache_files_recursive(
     for entry in std::fs::read_dir(current)? {
         let entry = entry?;
         let path = entry.path();
-        let metadata = entry.metadata()?;
-        if metadata.is_dir() {
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            continue;
+        }
+        if file_type.is_dir() {
             collect_cache_files_recursive(root, &path, files)?;
             continue;
         }
 
-        if metadata.is_file() {
+        if file_type.is_file() {
+            let metadata = entry.metadata()?;
             let relative = path
                 .strip_prefix(root)
                 .unwrap_or(path.as_path())
