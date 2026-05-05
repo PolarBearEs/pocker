@@ -11,6 +11,6 @@ Before committing changes in this repo:
 
 Notes:
 
-- CI also runs Docker smoke tests, but they are not part of the default local pre-commit checklist unless your change affects that behavior directly.
+- CI also runs Docker and registry-behavior smoke tests, but they are not part of the default local pre-commit checklist unless your change affects that behavior directly.
 - If `cargo build --locked` fails because `Cargo.lock` is stale, regenerate it before committing.
 - If you changed the crate version in `Cargo.toml`, make sure the root package version in `Cargo.lock` is updated too.
