@@ -24,6 +24,7 @@ use crate::reference::{ImageReference, ReferenceTarget};
 use crate::store::{Store, StoredReference};
 
 const DEFAULT_DOCKER_HOST: &str = "unix:///var/run/docker.sock";
+#[cfg(unix)]
 const DEFAULT_DOCKER_BASE_URL: &str = "http://docker";
 const PATH_SEGMENT_ENCODE_SET: &AsciiSet = &CONTROLS
     .add(b' ')
@@ -573,11 +574,12 @@ fn encode_path_segment(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use std::path::Path;
 
-    use super::{
-        DEFAULT_DOCKER_HOST, daemon_inspect_target, docker_endpoint_from_host, encode_path_segment,
-    };
+    #[cfg(unix)]
+    use super::DEFAULT_DOCKER_HOST;
+    use super::{daemon_inspect_target, docker_endpoint_from_host, encode_path_segment};
     use crate::reference::ImageReference;
 
     #[test]
