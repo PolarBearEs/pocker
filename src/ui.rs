@@ -329,8 +329,10 @@ fn layer_download_style() -> ProgressStyle {
 
 #[cfg(test)]
 mod tests {
+    use super::plain_layer_download_message;
+
     #[cfg(target_os = "linux")]
-    use super::{linux_process_is_foreground_tty_job_from_stat, plain_layer_download_message};
+    use super::linux_process_is_foreground_tty_job_from_stat;
 
     #[cfg(target_os = "linux")]
     #[test]
