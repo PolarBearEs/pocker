@@ -233,7 +233,12 @@ impl Store {
     }
 
     pub async fn clear(&self) -> Result<ClearedCache> {
-        let files = collect_cache_files(&self.root)?;
+        let root = self.root.clone();
+        let files = tokio::task::spawn_blocking(move || collect_cache_files(&root))
+            .await
+            .map_err(|e| {
+                DockerPullError::InvalidInput(format!("cache scan task panicked: {e}"))
+            })??;
         let reclaimed_bytes = files
             .iter()
             .fold(0_u64, |total, file| total.saturating_add(file.size));
