@@ -10,8 +10,44 @@ permissions:
   contents: read
 
 jobs:
-  verify:
+  fmt:
     runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+  verify-native:
+    name: Verify (${{ matrix.name }})
+    runs-on: ${{ matrix.runs_on }}
+    needs: fmt
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86_64
+            runs_on: ubuntu-latest
+          - name: Linux arm64
+            runs_on: ubuntu-24.04-arm
+          - name: macOS
+            runs_on: macos-latest
+          - name: macOS Intel
+            runs_on: macos-15-intel
+          - name: Windows x64
+            runs_on: windows-latest
+          - name: Windows arm64
+            runs_on: windows-11-arm
 
     steps:
       - name: Check out repository
@@ -25,18 +61,47 @@ jobs:
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@v2
 
-      - name: Check formatting
-        run: cargo fmt --check
-
       - name: Run Clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 
       - name: Run tests
         run: cargo test --all-targets --all-features
 
-  smoke-docker:
+      - name: Build binary
+        run: cargo build --locked
+
+  build-armv7:
     runs-on: ubuntu-latest
-    needs: verify
+    needs: fmt
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cross
+        run: cargo install cross --locked
+
+      - name: Build armv7 binary with cross
+        run: cross build --locked --target armv7-unknown-linux-gnueabihf
+
+  smoke:
+    name: Smoke (${{ matrix.name }})
+    runs-on: ${{ matrix.runs_on }}
+    needs: verify-native
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86_64
+            runs_on: ubuntu-latest
+          - name: Linux arm64
+            runs_on: ubuntu-24.04-arm
 
     steps:
       - name: Check out repository

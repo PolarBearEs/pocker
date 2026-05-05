@@ -9,19 +9,70 @@ permissions:
   contents: write
 
 jobs:
-  build:
-    name: Build ${{ matrix.target }}
-    runs-on: ubuntu-latest
+  build-native:
+    name: Build ${{ matrix.name }}
+    runs-on: ${{ matrix.runs_on }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - target: x86_64-unknown-linux-gnu
-            asset: pocker-x86_64-unknown-linux-gnu
-          - target: aarch64-unknown-linux-gnu
-            asset: pocker-aarch64-unknown-linux-gnu
-          - target: armv7-unknown-linux-gnueabihf
-            asset: pocker-armv7-unknown-linux-gnueabihf
+          - name: Linux x86_64
+            runs_on: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            asset: pocker-linux-x86_64
+            binary: pocker
+          - name: Linux arm64
+            runs_on: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            asset: pocker-linux-arm64
+            binary: pocker
+          - name: macOS arm64
+            runs_on: macos-latest
+            target: aarch64-apple-darwin
+            asset: pocker-macos-arm64
+            binary: pocker
+          - name: macOS x86_64
+            runs_on: macos-15-intel
+            target: x86_64-apple-darwin
+            asset: pocker-macos-x86_64
+            binary: pocker
+          - name: Windows x64
+            runs_on: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset: pocker-windows-x86_64.exe
+            binary: pocker.exe
+          - name: Windows arm64
+            runs_on: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            asset: pocker-windows-arm64.exe
+            binary: pocker.exe
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --locked --release --target ${{ matrix.target }}
+
+      - name: Prepare release asset
+        shell: bash
+        run: |
+          cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" "${{ matrix.asset }}"
+
+      - name: Upload release asset
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.asset }}
+
+  build-armv7:
+    name: Build Linux armv7
+    runs-on: ubuntu-latest
 
     steps:
       - name: Check out repository
@@ -37,13 +88,15 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Build release binary
-        run: cross build --locked --release --target ${{ matrix.target }}
+        run: cross build --locked --release --target armv7-unknown-linux-gnueabihf
 
       - name: Prepare release asset
+        shell: bash
         run: |
-          cp target/${{ matrix.target }}/release/pocker ${{ matrix.asset }}
+          cp target/armv7-unknown-linux-gnueabihf/release/pocker \
+            pocker-linux-armv7
 
       - name: Upload release asset
         uses: softprops/action-gh-release@v2
         with:
-          files: ${{ matrix.asset }}
+          files: pocker-linux-armv7
