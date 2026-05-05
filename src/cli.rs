@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
 
+use crate::platform::Platform;
 use crate::pull::DEFAULT_BLOB_RETRIES;
 use crate::registry::DEFAULT_REQUEST_RETRIES;
 
@@ -29,14 +30,20 @@ pub struct GlobalArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum Commands {
+    #[command(about = "Pull an OCI image directly from a registry")]
     Pull(PullArgs),
+    #[command(about = "Manage the local blob and partial-download cache")]
     Cache(CacheArgs),
+    #[command(about = "Run Docker image helper commands")]
     Image(ImageArgs),
+    #[command(about = "List Docker images")]
     Images(ImageLsArgs),
+    #[command(about = "Print version information")]
     Version,
 }
 
 #[derive(Debug, Clone, Args)]
+#[command(about = "Manage the local blob and partial-download cache")]
 pub struct CacheArgs {
     #[command(subcommand)]
     pub command: CacheCommands,
@@ -44,13 +51,16 @@ pub struct CacheArgs {
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum CacheCommands {
+    #[command(about = "Delete cached blobs and partial downloads")]
     Clean(CacheCleanArgs),
 }
 
 #[derive(Debug, Clone, Args, Default)]
+#[command(about = "Delete cached blobs and partial downloads")]
 pub struct CacheCleanArgs {}
 
 #[derive(Debug, Clone, Args)]
+#[command(about = "Run Docker image helper commands")]
 pub struct ImageArgs {
     #[command(subcommand)]
     pub command: ImageCommands,
@@ -58,42 +68,51 @@ pub struct ImageArgs {
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum ImageCommands {
+    #[command(about = "List Docker images")]
     Ls(ImageLsArgs),
+    #[command(about = "Print detailed metadata for a Docker image")]
     Inspect(ImageInspectArgs),
+    #[command(about = "Export a Docker image to a tar archive")]
     Save(ImageSaveArgs),
+    #[command(about = "Import a Docker image tar archive into Docker")]
     Load(ImageLoadArgs),
 }
 
 #[derive(Debug, Clone, Args, Default)]
+#[command(about = "List Docker images")]
 pub struct ImageLsArgs {}
 
 #[derive(Debug, Clone, Args)]
 pub struct ImageInspectArgs {
+    #[arg(help = "Image reference to inspect")]
     pub reference: String,
 }
 
 #[derive(Debug, Clone, Args)]
 pub struct ImageSaveArgs {
+    #[arg(help = "Image reference to export")]
     pub reference: String,
-    #[arg(long, short = 'o')]
+    #[arg(long, short = 'o', help = "Destination tar archive path")]
     pub output: PathBuf,
 }
 
 #[derive(Debug, Clone, Args)]
 pub struct ImageLoadArgs {
-    #[arg(long, short = 'i')]
+    #[arg(long, short = 'i', help = "Source tar archive path")]
     pub input: PathBuf,
 }
 
 #[derive(Debug, Clone, Args)]
 pub struct PullArgs {
+    #[arg(help = "Image reference to pull")]
     pub reference: String,
-    #[arg(long)]
+    #[arg(long, help = platform_help())]
     pub platform: Option<String>,
     #[arg(
         long = "max-parallel-downloads",
         visible_alias = "concurrency",
-        default_value_t = 4
+        default_value_t = 4,
+        help = "Maximum concurrent layer downloads"
     )]
     pub concurrency: usize,
     #[arg(
@@ -108,21 +127,30 @@ pub struct PullArgs {
         help = "Maximum retries for registry requests before any response or on retryable HTTP status; use 0 for unlimited retries"
     )]
     pub request_retries: u32,
-    #[arg(long)]
+    #[arg(
+        long,
+        help = "Download into the local cache without importing into Docker"
+    )]
     pub no_load: bool,
-    #[arg(long)]
+    #[arg(
+        long,
+        help = "Keep downloaded layer blobs in the cache after packaging/loading"
+    )]
     pub keep_layer_blobs: bool,
-    #[arg(long)]
+    #[arg(long, help = "Use plain HTTP instead of HTTPS for registry requests")]
     pub plain_http: bool,
-    #[arg(long)]
+    #[arg(
+        long,
+        help = "Disable TLS certificate verification for registry requests"
+    )]
     pub insecure_skip_tls_verify: bool,
-    #[arg(long)]
+    #[arg(long, help = "Additional CA certificate bundle in PEM format")]
     pub ca_file: Option<PathBuf>,
-    #[arg(long)]
+    #[arg(long, help = "Registry username; requires --password-stdin")]
     pub username: Option<String>,
-    #[arg(long)]
+    #[arg(long, help = "Read the registry password from stdin")]
     pub password_stdin: bool,
-    #[arg(long)]
+    #[arg(long, help = "Suppress progress and status output")]
     pub quiet: bool,
     #[arg(long, help = "Disable animated progress output during pull")]
     pub no_animations: bool,
@@ -134,11 +162,18 @@ fn default_cache_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(".pocker"))
 }
 
+fn platform_help() -> String {
+    format!(
+        "Target platform in os/arch[/variant] form, for example {}",
+        Platform::host().as_string()
+    )
+}
+
 #[cfg(test)]
 mod tests {
-    use clap::Parser;
+    use clap::{CommandFactory, Parser};
 
-    use super::{CacheCommands, Cli, Commands};
+    use super::{CacheCommands, Cli, Commands, platform_help};
 
     #[test]
     fn pull_accepts_no_animations_flag() {
@@ -198,5 +233,19 @@ mod tests {
         };
 
         assert!(matches!(args.command, CacheCommands::Clean(_)));
+    }
+
+    #[test]
+    fn pull_help_shows_host_platform_example() {
+        let mut help = Vec::new();
+        Cli::command()
+            .find_subcommand("pull")
+            .expect("pull command should exist")
+            .clone()
+            .write_long_help(&mut help)
+            .expect("help should render");
+        let help = String::from_utf8(help).expect("help should be utf8");
+
+        assert!(help.contains(&platform_help()));
     }
 }
