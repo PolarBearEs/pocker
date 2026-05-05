@@ -23,7 +23,11 @@ use crate::image::LayerSpec;
 use crate::reference::{ImageReference, ReferenceTarget};
 use crate::store::{Store, StoredReference};
 
+#[cfg(windows)]
+const DEFAULT_DOCKER_HOST: &str = "npipe:////./pipe/docker_engine";
+#[cfg(not(windows))]
 const DEFAULT_DOCKER_HOST: &str = "unix:///var/run/docker.sock";
+#[cfg(unix)]
 const DEFAULT_DOCKER_BASE_URL: &str = "http://docker";
 const PATH_SEGMENT_ENCODE_SET: &AsciiSet = &CONTROLS
     .add(b' ')
@@ -551,6 +555,13 @@ fn docker_endpoint_from_host(host: &str) -> Result<DockerEndpoint> {
         return Ok(DockerEndpoint::Unix(PathBuf::from(path)));
     }
 
+    #[cfg(windows)]
+    if host.starts_with("npipe://") {
+        return Err(DockerPullError::InvalidInput(
+            "docker named pipes are not supported; set DOCKER_HOST to a tcp://, http://, or https:// endpoint".into(),
+        ));
+    }
+
     if let Some(address) = host.strip_prefix("tcp://") {
         return Ok(DockerEndpoint::Http(format!(
             "http://{}",
@@ -573,11 +584,12 @@ fn encode_path_segment(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use std::path::Path;
 
-    use super::{
-        DEFAULT_DOCKER_HOST, daemon_inspect_target, docker_endpoint_from_host, encode_path_segment,
-    };
+    #[cfg(any(unix, windows))]
+    use super::DEFAULT_DOCKER_HOST;
+    use super::{daemon_inspect_target, docker_endpoint_from_host, encode_path_segment};
     use crate::reference::ImageReference;
 
     #[test]
@@ -615,6 +627,17 @@ mod tests {
             .expect("tcp docker host should parse");
         assert!(
             matches!(endpoint, super::DockerEndpoint::Http(base) if base == "http://127.0.0.1:2375")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn docker_host_default_named_pipe_reports_actionable_error() {
+        let error = docker_endpoint_from_host(DEFAULT_DOCKER_HOST)
+            .expect_err("windows named pipe host should be rejected explicitly");
+        assert_eq!(
+            error.to_string(),
+            "docker named pipes are not supported; set DOCKER_HOST to a tcp://, http://, or https:// endpoint"
         );
     }
 

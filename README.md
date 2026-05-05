@@ -24,6 +24,8 @@ cargo build --release
 ./target/release/pocker version
 ```
 
+Prebuilt release binaries are published for the targets in the support matrix.
+
 ## Usage
 
 Pull an image into Docker:
@@ -99,9 +101,13 @@ pocker image --help
 
 | Environment | Status | Notes |
 | --- | --- | --- |
-| Linux + Docker | Supported | Validated in CI with end-to-end smoke tests |
-| macOS | Not validated | No release claim for 0.1.0 |
-| Windows | Not validated | No release claim for 0.1.0 |
+| Linux x86_64 + Docker | Supported | Built, unit-tested, and smoke-tested in CI |
+| Linux arm64 + Docker | Supported | Built, unit-tested, and smoke-tested in CI |
+| Linux armv7 | Build-checked | Built in CI with `cross`, but not native runtime-validated |
+| macOS arm64 | CI-checked | Built and unit-tested in CI, but not runtime-validated |
+| macOS x86_64 | CI-checked | Built and unit-tested in CI, but not runtime-validated |
+| Windows x64 | CI-checked | Built and unit-tested in CI, but not runtime-validated |
+| Windows arm64 | CI-checked | Built and unit-tested in CI, but not runtime-validated |
 
 ## Runtime Requirements
 
