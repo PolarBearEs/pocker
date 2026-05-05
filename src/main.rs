@@ -19,7 +19,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use auth::{AuthResolver, Credentials};
 use clap::Parser;
-use cli::{Cli, Commands, ImageCommands};
+use cli::{CacheCommands, Cli, Commands, ImageCommands};
 use error::{DockerPullError, Result};
 use http::build_http_client;
 use platform::Platform;
@@ -95,6 +95,12 @@ async fn run() -> Result<()> {
                 blob_retry_limit: args.blob_retries,
             };
             Puller::new(context).pull(reference, options).await?;
+        }
+        Commands::Cache(args) => {
+            let store = Store::open(cli.global.cache_dir.clone()).await?;
+            match args.command {
+                CacheCommands::Clean(_) => clean_cache(&store, cli.global.quiet).await?,
+            }
         }
         Commands::Image(args) => match args.command {
             ImageCommands::Ls(_) => print_image_list().await?,
@@ -225,6 +231,30 @@ async fn print_image_inspect(reference: &str) -> Result<()> {
         )));
     };
     println!("{}", serde_json::to_string_pretty(&image)?);
+    Ok(())
+}
+
+async fn clean_cache(store: &Store, quiet: bool) -> Result<()> {
+    let cleared = store.clear().await?;
+    if !quiet {
+        println!("Cleared cache at {}", store.root().display());
+        if cleared.files.is_empty() {
+            println!("Deleted: nothing");
+        } else {
+            println!("Deleted:");
+            for file in cleared.files {
+                println!(
+                    "  {} ({})",
+                    file.path.display(),
+                    format_size(Some(file.size))
+                );
+            }
+        }
+        println!(
+            "Reclaimed space: {}",
+            format_size(Some(cleared.reclaimed_bytes))
+        );
+    }
     Ok(())
 }
 

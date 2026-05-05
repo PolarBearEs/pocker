@@ -30,6 +30,18 @@ pub struct DownloadPlan {
     pub partial_path: PathBuf,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClearedCache {
+    pub files: Vec<ClearedCacheFile>,
+    pub reclaimed_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClearedCacheFile {
+    pub path: PathBuf,
+    pub size: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DownloadCheckpoint {
     reference: String,
@@ -220,6 +232,28 @@ impl Store {
         Ok(removed)
     }
 
+    pub async fn clear(&self) -> Result<ClearedCache> {
+        let root = self.root.clone();
+        let files = tokio::task::spawn_blocking(move || collect_cache_files(&root))
+            .await
+            .map_err(|e| {
+                DockerPullError::InvalidInput(format!("cache scan task panicked: {e}"))
+            })??;
+        let reclaimed_bytes = files
+            .iter()
+            .fold(0_u64, |total, file| total.saturating_add(file.size));
+
+        if self.root.exists() {
+            tokio_fs::remove_dir_all(&self.root).await?;
+        }
+
+        Self::open(self.root.clone()).await?;
+        Ok(ClearedCache {
+            files,
+            reclaimed_bytes,
+        })
+    }
+
     pub fn root(&self) -> &Path {
         &self.root
     }
@@ -240,12 +274,68 @@ fn digest_bytes(bytes: &[u8]) -> String {
     format!("sha256:{}", hex::encode(hasher.finalize()))
 }
 
+fn collect_cache_files(root: &Path) -> Result<Vec<ClearedCacheFile>> {
+    let mut files = Vec::new();
+    collect_cache_files_recursive(root, root, &mut files)?;
+    files.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(files)
+}
+
+fn collect_cache_files_recursive(
+    root: &Path,
+    current: &Path,
+    files: &mut Vec<ClearedCacheFile>,
+) -> Result<()> {
+    if !current.exists() {
+        return Ok(());
+    }
+
+    for entry in std::fs::read_dir(current)? {
+        let entry = entry?;
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            continue;
+        }
+        if file_type.is_dir() {
+            collect_cache_files_recursive(root, &path, files)?;
+            continue;
+        }
+
+        if file_type.is_file() {
+            let metadata = entry.metadata()?;
+            let relative = path
+                .strip_prefix(root)
+                .unwrap_or(path.as_path())
+                .to_path_buf();
+            files.push(ClearedCacheFile {
+                path: relative,
+                size: metadata.len(),
+            });
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use tempfile::tempdir;
 
-    use super::{Store, StoredReference};
+    use super::{ClearedCacheFile, Store, StoredReference};
     use crate::registry::Descriptor;
+
+    #[cfg(unix)]
+    fn symlink_dir(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::unix::fs::symlink(target, link)
+    }
+
+    #[cfg(windows)]
+    fn symlink_dir(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::windows::fs::symlink_dir(target, link)
+    }
 
     #[tokio::test]
     async fn prepare_download_clamps_to_existing_partial_size() {
@@ -364,6 +454,86 @@ mod tests {
                 .expect("config path")
                 .exists(),
             "config blob should be retained"
+        );
+    }
+
+    #[tokio::test]
+    async fn clear_removes_cached_files_and_recreates_layout() {
+        let dir = tempdir().expect("tempdir should create");
+        let store = Store::open(dir.path().to_path_buf())
+            .await
+            .expect("store should open");
+        let blob = store
+            .blob_path("sha256:4444444444444444444444444444444444444444444444444444444444444444")
+            .expect("blob path");
+        let partial = store
+            .partial_path("sha256:5555555555555555555555555555555555555555555555555555555555555555")
+            .expect("partial path");
+        std::fs::create_dir_all(blob.parent().expect("blob parent"))
+            .expect("blob parent should exist");
+        std::fs::create_dir_all(partial.parent().expect("partial parent"))
+            .expect("partial parent should exist");
+        std::fs::write(&blob, b"blob").expect("blob should be written");
+        std::fs::write(&partial, b"partial").expect("partial should be written");
+
+        let cleared = store.clear().await.expect("clear should succeed");
+
+        assert!(
+            !blob.exists(),
+            "blob should be removed when clearing the cache"
+        );
+        assert!(
+            !partial.exists(),
+            "partial should be removed when clearing the cache"
+        );
+        assert!(
+            store.root().join("blobs").join("sha256").exists(),
+            "blob cache layout should be recreated"
+        );
+        assert!(
+            store.root().join("partials").join("sha256").exists(),
+            "partial cache layout should be recreated"
+        );
+        assert_eq!(cleared.reclaimed_bytes, 11);
+        assert_eq!(
+            cleared.files,
+            vec![
+                ClearedCacheFile {
+                    path: "blobs/sha256/4444444444444444444444444444444444444444444444444444444444444444"
+                        .into(),
+                    size: 4,
+                },
+                ClearedCacheFile {
+                    path: "partials/sha256/5555555555555555555555555555555555555555555555555555555555555555.part"
+                        .into(),
+                    size: 7,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn collect_cache_files_skips_symlinked_directories() {
+        let dir = tempdir().expect("tempdir should create");
+        let root = dir.path();
+        let real_file = root.join("blobs").join("sha256").join("real-blob");
+        std::fs::create_dir_all(real_file.parent().expect("real file parent"))
+            .expect("real file parent should exist");
+        std::fs::write(&real_file, b"blob").expect("real file should be written");
+
+        let loop_link = root.join("partials").join("loop");
+        std::fs::create_dir_all(loop_link.parent().expect("symlink parent"))
+            .expect("symlink parent should exist");
+        symlink_dir(root, &loop_link).expect("symlink should be created");
+
+        let files = super::collect_cache_files(root).expect("cache files should be collected");
+
+        assert_eq!(
+            files,
+            vec![ClearedCacheFile {
+                path: "blobs/sha256/real-blob".into(),
+                size: 4,
+            }]
         );
     }
 }
