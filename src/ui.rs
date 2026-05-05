@@ -9,10 +9,17 @@ use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 
 #[derive(Clone)]
 pub struct Ui {
-    inner: Option<Arc<UiInner>>,
+    mode: UiMode,
 }
 
-struct UiInner {
+#[derive(Clone)]
+enum UiMode {
+    Quiet,
+    Progress(Arc<ProgressUiInner>),
+    Plain,
+}
+
+struct ProgressUiInner {
     animated: bool,
     multi: MultiProgress,
     image: ProgressBar,
@@ -21,8 +28,16 @@ struct UiInner {
 
 impl Ui {
     pub fn new(quiet: bool, animated: bool) -> Self {
-        if quiet || !should_render_progress() {
-            return Self { inner: None };
+        if quiet {
+            return Self {
+                mode: UiMode::Quiet,
+            };
+        }
+
+        if !should_render_progress() {
+            return Self {
+                mode: UiMode::Plain,
+            };
         }
 
         let multi = MultiProgress::with_draw_target(ProgressDrawTarget::stderr());
@@ -33,7 +48,7 @@ impl Ui {
         }
 
         Self {
-            inner: Some(Arc::new(UiInner {
+            mode: UiMode::Progress(Arc::new(ProgressUiInner {
                 animated,
                 multi,
                 image,
@@ -43,35 +58,39 @@ impl Ui {
     }
 
     pub fn begin_image(&self, image: &str) {
-        let Some(inner) = &self.inner else {
-            return;
-        };
-        inner.image.set_message(format!("{image} Pulling"));
+        if let Some(inner) = self.progress() {
+            inner.image.set_message(format!("{image} Pulling"));
+        } else if self.is_plain() {
+            eprintln!("image {image}: Pulling");
+        }
     }
 
     pub fn begin_load(&self, image: &str) {
-        let Some(inner) = &self.inner else {
-            return;
-        };
-        inner.image.set_message(format!("{image} Loading"));
+        if let Some(inner) = self.progress() {
+            inner.image.set_message(format!("{image} Loading"));
+        } else if self.is_plain() {
+            eprintln!("image {image}: Loading");
+        }
     }
 
     pub fn set_image_status(&self, image: &str, status: &str) {
-        let Some(inner) = &self.inner else {
-            return;
-        };
-        inner.image.set_message(format!("{image} {status}"));
+        if let Some(inner) = self.progress() {
+            inner.image.set_message(format!("{image} {status}"));
+        } else if self.is_plain() {
+            eprintln!("image {image}: {status}");
+        }
     }
 
     pub fn finish_image(&self, image: &str, status: &str) {
-        let Some(inner) = &self.inner else {
-            return;
-        };
-        inner.image.finish_with_message(format!("{image} {status}"));
+        if let Some(inner) = self.progress() {
+            inner.image.finish_with_message(format!("{image} {status}"));
+        } else if self.is_plain() {
+            eprintln!("image {image}: {status}");
+        }
     }
 
     pub fn prepare_layers(&self, digests: &[String]) {
-        let Some(inner) = &self.inner else {
+        let Some(inner) = self.progress() else {
             return;
         };
         let mut layers = inner.layers.lock().expect("ui state poisoned");
@@ -87,15 +106,21 @@ impl Ui {
     }
 
     pub fn mark_layer_cached(&self, digest: &str) {
-        self.finish_layer_status(digest, "Already exists");
+        self.finish_layer_status(digest, "Already exists", "Already exists in cache");
     }
 
     pub fn mark_layer_daemon(&self, digest: &str) {
-        self.finish_layer_status(digest, "Already exists");
+        self.finish_layer_status(digest, "Already exists", "Already exists in Docker daemon");
     }
 
     pub fn start_layer_download(&self, digest: &str, total_bytes: u64, starting_offset: u64) {
         let Some(bar) = self.layer_bar(digest) else {
+            if self.is_plain() {
+                eprintln!(
+                    "{}",
+                    plain_layer_download_message(digest, total_bytes, starting_offset)
+                );
+            }
             return;
         };
         bar.set_style(layer_download_style());
@@ -112,11 +137,14 @@ impl Ui {
     }
 
     pub fn finish_layer_download(&self, digest: &str) {
-        self.finish_layer_status(digest, "Pull complete");
+        self.finish_layer_status(digest, "Pull complete", "Pull complete");
     }
 
     pub fn set_layer_status(&self, digest: &str, status: &str) {
         let Some(bar) = self.layer_bar(digest) else {
+            if self.is_plain() {
+                eprintln!("layer {}: {status}", short_digest(digest));
+            }
             return;
         };
         bar.set_style(layer_status_style(self.is_animated()));
@@ -127,22 +155,29 @@ impl Ui {
     }
 
     pub fn warn(&self, message: impl Into<String>) {
-        let Some(inner) = &self.inner else {
-            return;
-        };
-        inner.image.println(format!("warning: {}", message.into()));
+        let message = format!("warning: {}", message.into());
+        if let Some(inner) = self.progress() {
+            inner.image.println(message);
+        } else if self.is_plain() {
+            eprintln!("{message}");
+        }
     }
 
-    fn finish_layer_status(&self, digest: &str, status: &str) {
+    fn finish_layer_status(&self, digest: &str, progress_status: &str, plain_status: &str) {
         let Some(bar) = self.layer_bar(digest) else {
+            if self.is_plain() {
+                eprintln!("layer {}: {plain_status}", short_digest(digest));
+            }
             return;
         };
         bar.set_style(layer_status_style(self.is_animated()));
-        bar.finish_with_message(format!("{} {status}", short_digest(digest)));
+        bar.finish_with_message(format!("{} {progress_status}", short_digest(digest)));
     }
 
     fn layer_bar(&self, digest: &str) -> Option<ProgressBar> {
-        let inner = self.inner.as_ref()?;
+        let UiMode::Progress(inner) = &self.mode else {
+            return None;
+        };
         inner
             .layers
             .lock()
@@ -151,11 +186,19 @@ impl Ui {
             .cloned()
     }
 
+    fn progress(&self) -> Option<&Arc<ProgressUiInner>> {
+        match &self.mode {
+            UiMode::Progress(inner) => Some(inner),
+            UiMode::Quiet | UiMode::Plain => None,
+        }
+    }
+
     fn is_animated(&self) -> bool {
-        self.inner
-            .as_ref()
-            .map(|inner| inner.animated)
-            .unwrap_or(false)
+        self.progress().map(|inner| inner.animated).unwrap_or(false)
+    }
+
+    fn is_plain(&self) -> bool {
+        matches!(self.mode, UiMode::Plain)
     }
 }
 
@@ -204,6 +247,41 @@ fn short_digest(digest: &str) -> String {
     value.chars().take(12).collect()
 }
 
+fn plain_layer_download_message(digest: &str, total_bytes: u64, starting_offset: u64) -> String {
+    if starting_offset == 0 {
+        return format!(
+            "layer {}: Downloading {}",
+            short_digest(digest),
+            format_bytes(total_bytes)
+        );
+    }
+
+    format!(
+        "layer {}: Resuming {}/{}",
+        short_digest(digest),
+        format_bytes(starting_offset),
+        format_bytes(total_bytes)
+    )
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0usize;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+
+    if unit == 0 {
+        format!("{bytes} {}", UNITS[unit])
+    } else if value >= 10.0 {
+        format!("{value:.0} {}", UNITS[unit])
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
 fn image_status_style(animated: bool) -> ProgressStyle {
     if animated {
         ProgressStyle::with_template("{spinner:.cyan} {msg}")
@@ -234,6 +312,8 @@ fn layer_download_style() -> ProgressStyle {
 
 #[cfg(test)]
 mod tests {
+    use super::plain_layer_download_message;
+
     #[cfg(target_os = "linux")]
     use super::linux_process_is_foreground_tty_job_from_stat;
 
@@ -254,6 +334,22 @@ mod tests {
         assert_eq!(
             linux_process_is_foreground_tty_job_from_stat(stat),
             Some(false)
+        );
+    }
+
+    #[test]
+    fn plain_download_message_describes_new_download() {
+        assert_eq!(
+            plain_layer_download_message("sha256:abcdef0123456789", 1_536, 0),
+            "layer abcdef012345: Downloading 1.5 KiB"
+        );
+    }
+
+    #[test]
+    fn plain_download_message_describes_resume_offset() {
+        assert_eq!(
+            plain_layer_download_message("sha256:abcdef0123456789", 2_048, 512),
+            "layer abcdef012345: Resuming 512 B/2.0 KiB"
         );
     }
 }
