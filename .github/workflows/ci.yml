@@ -85,7 +85,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Install cross
-        run: cargo install cross --locked
+        uses: taiki-e/install-action@cross
 
       - name: Build armv7 binary with cross
         run: cross build --locked --target armv7-unknown-linux-gnueabihf
