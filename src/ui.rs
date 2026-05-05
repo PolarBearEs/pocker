@@ -16,7 +16,7 @@ pub struct Ui {
 enum UiMode {
     Quiet,
     Progress(Arc<ProgressUiInner>),
-    Plain(Arc<PlainUiInner>),
+    Plain,
 }
 
 struct ProgressUiInner {
@@ -24,10 +24,6 @@ struct ProgressUiInner {
     multi: MultiProgress,
     image: ProgressBar,
     layers: Mutex<HashMap<String, ProgressBar>>,
-}
-
-struct PlainUiInner {
-    output: Mutex<()>,
 }
 
 impl Ui {
@@ -40,9 +36,7 @@ impl Ui {
 
         if !should_render_progress() {
             return Self {
-                mode: UiMode::Plain(Arc::new(PlainUiInner {
-                    output: Mutex::new(()),
-                })),
+                mode: UiMode::Plain,
             };
         }
 
@@ -66,32 +60,32 @@ impl Ui {
     pub fn begin_image(&self, image: &str) {
         if let Some(inner) = self.progress() {
             inner.image.set_message(format!("{image} Pulling"));
-        } else if let Some(inner) = self.plain() {
-            inner.println(format!("image {image}: Pulling"));
+        } else if self.is_plain() {
+            eprintln!("image {image}: Pulling");
         }
     }
 
     pub fn begin_load(&self, image: &str) {
         if let Some(inner) = self.progress() {
             inner.image.set_message(format!("{image} Loading"));
-        } else if let Some(inner) = self.plain() {
-            inner.println(format!("image {image}: Loading"));
+        } else if self.is_plain() {
+            eprintln!("image {image}: Loading");
         }
     }
 
     pub fn set_image_status(&self, image: &str, status: &str) {
         if let Some(inner) = self.progress() {
             inner.image.set_message(format!("{image} {status}"));
-        } else if let Some(inner) = self.plain() {
-            inner.println(format!("image {image}: {status}"));
+        } else if self.is_plain() {
+            eprintln!("image {image}: {status}");
         }
     }
 
     pub fn finish_image(&self, image: &str, status: &str) {
         if let Some(inner) = self.progress() {
             inner.image.finish_with_message(format!("{image} {status}"));
-        } else if let Some(inner) = self.plain() {
-            inner.println(format!("image {image}: {status}"));
+        } else if self.is_plain() {
+            eprintln!("image {image}: {status}");
         }
     }
 
@@ -121,12 +115,11 @@ impl Ui {
 
     pub fn start_layer_download(&self, digest: &str, total_bytes: u64, starting_offset: u64) {
         let Some(bar) = self.layer_bar(digest) else {
-            if let Some(inner) = self.plain() {
-                inner.println(plain_layer_download_message(
-                    digest,
-                    total_bytes,
-                    starting_offset,
-                ));
+            if self.is_plain() {
+                eprintln!(
+                    "{}",
+                    plain_layer_download_message(digest, total_bytes, starting_offset)
+                );
             }
             return;
         };
@@ -149,8 +142,8 @@ impl Ui {
 
     pub fn set_layer_status(&self, digest: &str, status: &str) {
         let Some(bar) = self.layer_bar(digest) else {
-            if let Some(inner) = self.plain() {
-                inner.println(format!("layer {}: {status}", short_digest(digest)));
+            if self.is_plain() {
+                eprintln!("layer {}: {status}", short_digest(digest));
             }
             return;
         };
@@ -165,15 +158,15 @@ impl Ui {
         let message = format!("warning: {}", message.into());
         if let Some(inner) = self.progress() {
             inner.image.println(message);
-        } else if let Some(inner) = self.plain() {
-            inner.println(message);
+        } else if self.is_plain() {
+            eprintln!("{message}");
         }
     }
 
     fn finish_layer_status(&self, digest: &str, progress_status: &str, plain_status: &str) {
         let Some(bar) = self.layer_bar(digest) else {
-            if let Some(inner) = self.plain() {
-                inner.println(format!("layer {}: {plain_status}", short_digest(digest)));
+            if self.is_plain() {
+                eprintln!("layer {}: {plain_status}", short_digest(digest));
             }
             return;
         };
@@ -196,26 +189,16 @@ impl Ui {
     fn progress(&self) -> Option<&Arc<ProgressUiInner>> {
         match &self.mode {
             UiMode::Progress(inner) => Some(inner),
-            UiMode::Quiet | UiMode::Plain(_) => None,
-        }
-    }
-
-    fn plain(&self) -> Option<&Arc<PlainUiInner>> {
-        match &self.mode {
-            UiMode::Plain(inner) => Some(inner),
-            UiMode::Quiet | UiMode::Progress(_) => None,
+            UiMode::Quiet | UiMode::Plain => None,
         }
     }
 
     fn is_animated(&self) -> bool {
         self.progress().map(|inner| inner.animated).unwrap_or(false)
     }
-}
 
-impl PlainUiInner {
-    fn println(&self, message: impl AsRef<str>) {
-        let _output = self.output.lock().expect("ui state poisoned");
-        eprintln!("{}", message.as_ref());
+    fn is_plain(&self) -> bool {
+        matches!(self.mode, UiMode::Plain)
     }
 }
 
