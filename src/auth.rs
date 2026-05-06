@@ -264,7 +264,9 @@ fn docker_hub_aliases(registry: &str) -> impl Iterator<Item = &'static str> {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsString;
     use std::fs;
+    use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
     #[cfg(unix)]
     use std::process::Command;
     use std::sync::{Mutex, OnceLock};
@@ -281,15 +283,7 @@ mod tests {
         LOCK.get_or_init(|| Mutex::new(()))
     }
 
-    fn with_docker_config_env<T>(path: &std::path::Path, run: impl FnOnce() -> T) -> T {
-        let _guard = docker_config_env_lock()
-            .lock()
-            .expect("docker config env lock should not be poisoned");
-        let previous = std::env::var_os("DOCKER_CONFIG");
-        unsafe {
-            std::env::set_var("DOCKER_CONFIG", path);
-        }
-        let result = run();
+    fn restore_docker_config_env(previous: Option<OsString>) {
         unsafe {
             if let Some(previous) = previous {
                 std::env::set_var("DOCKER_CONFIG", previous);
@@ -297,7 +291,23 @@ mod tests {
                 std::env::remove_var("DOCKER_CONFIG");
             }
         }
-        result
+    }
+
+    fn with_docker_config_env<T>(path: &std::path::Path, run: impl FnOnce() -> T) -> T {
+        let lock = docker_config_env_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = std::env::var_os("DOCKER_CONFIG");
+        unsafe {
+            std::env::set_var("DOCKER_CONFIG", path);
+        }
+        let result = catch_unwind(AssertUnwindSafe(run));
+        restore_docker_config_env(previous);
+        drop(lock);
+        match result {
+            Ok(value) => value,
+            Err(payload) => resume_unwind(payload),
+        }
     }
 
     #[cfg(unix)]
@@ -372,5 +382,22 @@ mod tests {
             Some(Credentials::Basic { username, password })
                 if username == "demo-user" && password == "demo-pass"
         ));
+    }
+
+    #[test]
+    fn docker_config_env_is_restored_after_panic() {
+        let dir = tempdir().expect("tempdir should create");
+        let previous = std::env::var_os("DOCKER_CONFIG");
+
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            with_docker_config_env(dir.path(), || panic!("boom"));
+        }));
+
+        assert!(result.is_err(), "closure panic should propagate");
+        assert_eq!(
+            std::env::var_os("DOCKER_CONFIG"),
+            previous,
+            "DOCKER_CONFIG should be restored after panic"
+        );
     }
 }
