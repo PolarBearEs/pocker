@@ -6,7 +6,6 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use futures_util::StreamExt;
-use futures_util::stream::FuturesUnordered;
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use reqwest::{Client, Response, StatusCode};
 use serde::Deserialize;
@@ -16,6 +15,7 @@ use sha2::{Digest as _, Sha256};
 use tar::Archive;
 use tempfile::{NamedTempFile, TempDir};
 use tokio::io::AsyncWriteExt;
+use tokio::task::JoinSet;
 use tokio_util::io::ReaderStream;
 
 use crate::error::{DockerPullError, Result};
@@ -343,7 +343,7 @@ async fn list_daemon_images(daemon: &DockerDaemon) -> Result<Vec<DaemonImage>> {
         return Ok(Vec::new());
     }
 
-    let mut queue = FuturesUnordered::new();
+    let mut queue = JoinSet::new();
     let mut pending = ids.into_iter().enumerate();
     let mut images = vec![None; pending.len()];
 
@@ -351,27 +351,40 @@ async fn list_daemon_images(daemon: &DockerDaemon) -> Result<Vec<DaemonImage>> {
         let Some((index, id)) = pending.next() else {
             break;
         };
-        let daemon = daemon.clone();
-        queue.push(tokio::spawn(async move {
-            Ok::<_, DockerPullError>((index, daemon.inspect_image(&id).await?))
-        }));
+        spawn_inspect_task(&mut queue, daemon.clone(), index, id);
     }
 
-    while let Some(result) = queue.next().await {
-        let (index, image) = result.map_err(|error| {
-            DockerPullError::InvalidInput(format!("docker inspect task failed: {error}"))
-        })??;
+    while let Some(result) = queue.join_next().await {
+        let (index, image) = match result {
+            Ok(Ok(result)) => result,
+            Ok(Err(error)) => {
+                queue.abort_all();
+                return Err(error);
+            }
+            Err(error) => {
+                queue.abort_all();
+                return Err(DockerPullError::CommandFailed(format!(
+                    "docker image inspect task failed: {error}"
+                )));
+            }
+        };
         images[index] = image;
 
         if let Some((index, id)) = pending.next() {
-            let daemon = daemon.clone();
-            queue.push(tokio::spawn(async move {
-                Ok::<_, DockerPullError>((index, daemon.inspect_image(&id).await?))
-            }));
+            spawn_inspect_task(&mut queue, daemon.clone(), index, id);
         }
     }
 
     Ok(images.into_iter().flatten().collect())
+}
+
+fn spawn_inspect_task(
+    queue: &mut JoinSet<Result<(usize, Option<DaemonImage>)>>,
+    daemon: DockerDaemon,
+    index: usize,
+    id: String,
+) {
+    queue.spawn(async move { Ok((index, daemon.inspect_image(&id).await?)) });
 }
 
 fn ordered_unique_image_ids(summaries: Vec<DaemonImageSummary>) -> Vec<String> {
