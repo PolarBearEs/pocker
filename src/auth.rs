@@ -238,8 +238,10 @@ fn docker_hub_aliases(registry: &str) -> impl Iterator<Item = &'static str> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use std::process::Command;
 
+    #[cfg(unix)]
     use super::invoke_helper_command;
 
     #[cfg(unix)]
