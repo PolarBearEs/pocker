@@ -150,9 +150,11 @@ fn invoke_helper_command(
         }
     };
 
-    if let Some(stdin) = child.stdin.as_mut()
+    if let Some(mut stdin) = child.stdin.take()
         && let Err(error) = stdin.write_all(registry.as_bytes())
     {
+        drop(stdin);
+        let _ = child.wait();
         warn!(
             "failed to write registry to docker credential helper `{}` for `{}`: {}",
             helper_binary, registry, error
