@@ -1,6 +1,7 @@
 use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
+use reqwest::StatusCode;
 use tokio::fs::{self, OpenOptions};
 use tokio::io::AsyncWriteExt;
 use tracing::warn;
@@ -57,13 +58,14 @@ pub async fn download_blob(
             .get_blob(reference, &descriptor.digest, offset)
             .await?;
         let status = response.status();
-        if status == reqwest::StatusCode::OK && offset > 0 {
+        if status == StatusCode::OK && offset > 0 {
+            let delay = retry_delay(offset);
             retries = register_retry(
                 context,
                 &descriptor.digest,
                 retries,
                 "registry ignored ranged resume",
-                retry_delay(offset),
+                delay,
             )?;
             warn!(
                 "registry ignored range request for {}, restarting blob",
@@ -81,9 +83,12 @@ pub async fn download_blob(
             context
                 .ui
                 .start_layer_download(&descriptor.digest, expected_size, offset);
-            tokio::time::sleep(retry_delay(offset)).await;
+            bytes_since_checkpoint = 0;
+            last_checkpoint = Instant::now();
+            tokio::time::sleep(delay).await;
+            continue;
         }
-        if status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
+        if status == StatusCode::RANGE_NOT_SATISFIABLE {
             let delay = retry_delay(offset);
             retries = register_retry(
                 context,
@@ -100,9 +105,12 @@ pub async fn download_blob(
             context
                 .ui
                 .start_layer_download(&descriptor.digest, expected_size, offset);
+            bytes_since_checkpoint = 0;
+            last_checkpoint = Instant::now();
             tokio::time::sleep(delay).await;
             continue;
         }
+        validate_blob_response_status(status, offset, &descriptor.digest)?;
 
         let mut file = OpenOptions::new()
             .create(true)
@@ -183,6 +191,24 @@ pub async fn download_blob(
     Ok(())
 }
 
+fn validate_blob_response_status(status: StatusCode, offset: u64, digest: &str) -> Result<()> {
+    if status == StatusCode::NOT_FOUND {
+        return Err(DockerPullError::BlobNotFound(digest.to_string()));
+    }
+
+    if offset == 0 && status == StatusCode::OK {
+        return Ok(());
+    }
+
+    if offset > 0 && status == StatusCode::PARTIAL_CONTENT {
+        return Ok(());
+    }
+
+    Err(DockerPullError::BadResponse(format!(
+        "unexpected blob response status {status} for {digest} at offset {offset}"
+    )))
+}
+
 fn retry_delay(offset: u64) -> Duration {
     if offset == 0 {
         Duration::from_secs(2)
@@ -218,4 +244,42 @@ fn register_retry(
         delay
     ));
     Ok(next_retry)
+}
+
+#[cfg(test)]
+mod tests {
+    use reqwest::StatusCode;
+
+    use super::validate_blob_response_status;
+    use crate::error::DockerPullError;
+
+    #[test]
+    fn missing_blob_status_maps_to_not_found() {
+        let error = validate_blob_response_status(StatusCode::NOT_FOUND, 0, "sha256:deadbeef")
+            .expect_err("404 should not be treated as a streamable blob response");
+
+        assert!(
+            matches!(error, DockerPullError::BlobNotFound(digest) if digest == "sha256:deadbeef")
+        );
+    }
+
+    #[test]
+    fn resumed_blob_download_requires_partial_content() {
+        let error = validate_blob_response_status(StatusCode::OK, 42, "sha256:deadbeef")
+            .expect_err("resumed downloads must not accept 200 responses without reset handling");
+
+        assert!(matches!(error, DockerPullError::BadResponse(_)));
+    }
+
+    #[test]
+    fn fresh_blob_download_accepts_ok_response() {
+        validate_blob_response_status(StatusCode::OK, 0, "sha256:deadbeef")
+            .expect("fresh downloads should accept 200 responses");
+    }
+
+    #[test]
+    fn resumed_blob_download_accepts_partial_content() {
+        validate_blob_response_status(StatusCode::PARTIAL_CONTENT, 42, "sha256:deadbeef")
+            .expect("resumed downloads should accept 206 responses");
+    }
 }

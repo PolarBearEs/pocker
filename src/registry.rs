@@ -309,11 +309,11 @@ impl RegistryClient {
         range: Option<&str>,
         allow_retry: bool,
     ) -> Result<Response> {
-        let scope = reference.repository_scope();
+        let cache_key = token_cache_key(reference);
         let mut retries = 0_u32;
         let mut auth_retries = 0_u32;
         loop {
-            let token = self.token_cache.lock().await.get(&scope).cloned();
+            let token = self.token_cache.lock().await.get(&cache_key).cloned();
             let credentials = self.auth.resolve(&reference.registry)?;
             let mut request = self.client.request(method.clone(), url.clone());
             if let Some(accept) = accept {
@@ -365,7 +365,10 @@ impl RegistryClient {
                     .refresh_token(challenge, reference, credentials.clone())
                     .await?
                 {
-                    self.token_cache.lock().await.insert(scope.clone(), token);
+                    self.token_cache
+                        .lock()
+                        .await
+                        .insert(cache_key.clone(), token);
                     auth_retries += 1;
                     continue;
                 }
@@ -436,6 +439,10 @@ impl RegistryClient {
         let body: TokenResponse = response.json().await?;
         Ok(body.token.or(body.access_token))
     }
+}
+
+fn token_cache_key(reference: &ImageReference) -> String {
+    format!("{}|{}", reference.registry, reference.repository_scope())
 }
 
 #[derive(Debug, Deserialize)]
@@ -575,7 +582,7 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
-    use super::{DEFAULT_REQUEST_RETRIES, RegistryClient};
+    use super::{DEFAULT_REQUEST_RETRIES, RegistryClient, token_cache_key};
     use crate::auth::AuthResolver;
     use crate::error::DockerPullError;
     use crate::reference::ImageReference;
@@ -631,5 +638,15 @@ mod tests {
         }
 
         server.await.expect("server task should finish");
+    }
+
+    #[test]
+    fn token_cache_key_includes_registry_host() {
+        let left =
+            ImageReference::parse("ghcr.io/acme/app:latest").expect("reference should parse");
+        let right =
+            ImageReference::parse("docker.io/acme/app:latest").expect("reference should parse");
+
+        assert_ne!(token_cache_key(&left), token_cache_key(&right));
     }
 }
