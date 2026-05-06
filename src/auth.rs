@@ -289,6 +289,38 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    struct DockerConfigEnvGuard {
+        _lock: MutexGuard<'static, ()>,
+        previous: Option<OsString>,
+    }
+
+    impl DockerConfigEnvGuard {
+        fn new(path: &std::path::Path) -> Self {
+            Self::new_with_lock(lock_docker_config_env(), path)
+        }
+
+        fn new_with_lock(lock: MutexGuard<'static, ()>, path: &std::path::Path) -> Self {
+            let previous = std::env::var_os("DOCKER_CONFIG");
+            unsafe {
+                std::env::set_var("DOCKER_CONFIG", path);
+            }
+            Self {
+                _lock: lock,
+                previous,
+            }
+        }
+
+        fn restore(&mut self) {
+            restore_docker_config_env(self.previous.take());
+        }
+    }
+
+    impl Drop for DockerConfigEnvGuard {
+        fn drop(&mut self) {
+            self.restore();
+        }
+    }
+
     fn restore_docker_config_env(previous: Option<OsString>) {
         unsafe {
             if let Some(previous) = previous {
@@ -299,26 +331,14 @@ mod tests {
         }
     }
 
-    fn with_docker_config_env_under_lock<T>(
-        _lock: &MutexGuard<'_, ()>,
-        path: &std::path::Path,
-        run: impl FnOnce() -> T,
-    ) -> T {
-        let previous = std::env::var_os("DOCKER_CONFIG");
-        unsafe {
-            std::env::set_var("DOCKER_CONFIG", path);
-        }
+    fn with_docker_config_env<T>(path: &std::path::Path, run: impl FnOnce() -> T) -> T {
+        let mut guard = DockerConfigEnvGuard::new(path);
         let result = catch_unwind(AssertUnwindSafe(run));
-        restore_docker_config_env(previous);
+        guard.restore();
         match result {
             Ok(value) => value,
             Err(payload) => resume_unwind(payload),
         }
-    }
-
-    fn with_docker_config_env<T>(path: &std::path::Path, run: impl FnOnce() -> T) -> T {
-        let lock = lock_docker_config_env();
-        with_docker_config_env_under_lock(&lock, path, run)
     }
 
     #[cfg(unix)]
@@ -400,10 +420,10 @@ mod tests {
         let dir = tempdir().expect("tempdir should create");
         let lock = lock_docker_config_env();
         let previous = std::env::var_os("DOCKER_CONFIG");
+        let mut guard = DockerConfigEnvGuard::new_with_lock(lock, dir.path());
 
-        let result = catch_unwind(AssertUnwindSafe(|| {
-            with_docker_config_env_under_lock(&lock, dir.path(), || panic!("boom"));
-        }));
+        let result = catch_unwind(AssertUnwindSafe(|| panic!("boom")));
+        guard.restore();
 
         assert!(result.is_err(), "closure panic should propagate");
         assert_eq!(
