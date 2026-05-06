@@ -190,16 +190,15 @@ fn invoke_helper_command(
     let response: HelperResponse = match serde_json::from_slice(&output.stdout) {
         Ok(response) => response,
         Err(error) => {
-            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if stdout.is_empty() {
+            if output.stdout.iter().all(|byte| byte.is_ascii_whitespace()) {
                 warn!(
                     "docker credential helper `{}` returned invalid JSON for `{}`: {}",
                     helper_binary, registry, error
                 );
             } else {
                 warn!(
-                    "docker credential helper `{}` returned invalid JSON for `{}`: {} (stdout: {})",
-                    helper_binary, registry, error, stdout
+                    "docker credential helper `{}` returned invalid JSON for `{}`: {} (non-empty stdout omitted)",
+                    helper_binary, registry, error
                 );
             }
             return Ok(None);
