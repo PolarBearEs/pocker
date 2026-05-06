@@ -1,8 +1,9 @@
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tar::{Builder, Header};
 
 use crate::docker;
@@ -36,6 +37,16 @@ struct DockerManifestEntry {
     layers: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct OciManifest {
+    #[serde(rename = "schemaVersion")]
+    schema_version: u32,
+    #[serde(rename = "mediaType", default)]
+    media_type: String,
+    config: Descriptor,
+    layers: Vec<Descriptor>,
+}
+
 pub async fn write_oci_archive(
     path: &Path,
     store: &Store,
@@ -50,6 +61,28 @@ pub async fn write_oci_archive_to_writer<W: Write>(
     store: &Store,
     reference: &StoredReference,
 ) -> Result<()> {
+    let missing_diff_ids = missing_diff_ids(store, reference)?;
+    let daemon_layers = if missing_diff_ids.is_empty() {
+        None
+    } else {
+        Some(docker::materialize_daemon_layers(store, &missing_diff_ids).await?)
+    };
+    write_oci_archive_to_writer_with_fallbacks(
+        writer,
+        store,
+        reference,
+        daemon_layers
+            .as_ref()
+            .map(docker::MaterializedDaemonLayers::paths),
+    )
+}
+
+fn write_oci_archive_to_writer_with_fallbacks<W: Write>(
+    writer: W,
+    store: &Store,
+    reference: &StoredReference,
+    fallback_paths: Option<&HashMap<String, PathBuf>>,
+) -> Result<()> {
     let mut builder = Builder::new(writer);
     append_json(
         &mut builder,
@@ -59,14 +92,44 @@ pub async fn write_oci_archive_to_writer<W: Write>(
         },
     )?;
 
-    let mut manifest_descriptor = reference.manifest.clone();
-    if let Some(ref_name) = oci_ref_name(&reference.reference)? {
-        manifest_descriptor.annotations = Some(
-            [("org.opencontainers.image.ref.name".to_string(), ref_name)]
-                .into_iter()
-                .collect(),
-        );
+    let manifest_path = store.blob_path(&reference.manifest.digest)?;
+    let manifest_bytes = std::fs::read(manifest_path)?;
+    let config_blob_path = store.blob_path(&reference.config_digest)?;
+    let config_bytes = std::fs::read(config_blob_path)?;
+    let manifest: OciManifest = serde_json::from_slice(&manifest_bytes)?;
+    let diff_ids = parse_diff_ids(&config_bytes)?;
+    if diff_ids.len() != manifest.layers.len() {
+        return Err(DockerPullError::BadResponse(format!(
+            "config diff_ids count {} does not match manifest layers count {}",
+            diff_ids.len(),
+            manifest.layers.len()
+        )));
     }
+    let config_path = blob_tar_path(&reference.config_digest)?;
+    let layer_descriptors = manifest
+        .layers
+        .iter()
+        .cloned()
+        .zip(diff_ids.iter().cloned())
+        .collect::<Vec<_>>();
+    let layer_sources = layer_descriptors
+        .iter()
+        .map(|(layer, diff_id)| layer_archive_source(store, fallback_paths, layer, diff_id))
+        .collect::<Result<Vec<_>>>()?;
+    let archive_manifest = archive_manifest(&manifest, &layer_sources, &reference.manifest);
+    let archive_manifest_bytes = serde_json::to_vec(&archive_manifest)?;
+    let mut manifest_descriptor = reference.manifest.clone();
+    manifest_descriptor.digest = digest_bytes(&archive_manifest_bytes);
+    manifest_descriptor.size = archive_manifest_bytes.len() as i64;
+    if manifest_descriptor.media_type.is_empty() {
+        manifest_descriptor.media_type = archive_manifest.media_type.clone();
+    }
+    if let Some(ref_name) = oci_ref_name(&reference.reference)? {
+        let mut annotations = manifest_descriptor.annotations.unwrap_or_default();
+        annotations.insert("org.opencontainers.image.ref.name".to_string(), ref_name);
+        manifest_descriptor.annotations = Some(annotations);
+    }
+
     append_json(
         &mut builder,
         "index.json",
@@ -75,56 +138,12 @@ pub async fn write_oci_archive_to_writer<W: Write>(
             manifests: vec![manifest_descriptor.clone()],
         },
     )?;
-
-    append_blob(&mut builder, store, &manifest_descriptor.digest)?;
+    append_blob_bytes(
+        &mut builder,
+        &manifest_descriptor.digest,
+        &archive_manifest_bytes,
+    )?;
     append_blob(&mut builder, store, &reference.config_digest)?;
-
-    let manifest_path = store.blob_path(&manifest_descriptor.digest)?;
-    let manifest_bytes = std::fs::read(manifest_path)?;
-    let config_path = store.blob_path(&reference.config_digest)?;
-    let config_bytes = std::fs::read(config_path)?;
-    let manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes)?;
-    let diff_ids = parse_diff_ids(&config_bytes)?;
-    let layers = manifest
-        .get("layers")
-        .and_then(|layers| layers.as_array())
-        .ok_or_else(|| DockerPullError::BadResponse("manifest layers missing".into()))?;
-    if diff_ids.len() != layers.len() {
-        return Err(DockerPullError::BadResponse(format!(
-            "config diff_ids count {} does not match manifest layers count {}",
-            diff_ids.len(),
-            layers.len()
-        )));
-    }
-    let config_path = blob_tar_path(&reference.config_digest)?;
-    let layer_descriptors = layers
-        .iter()
-        .zip(diff_ids.iter())
-        .map(|(layer, diff_id)| {
-            let digest = layer
-                .get("digest")
-                .and_then(|value| value.as_str())
-                .ok_or_else(|| DockerPullError::BadResponse("layer digest missing".into()))?;
-            Ok((digest.to_string(), diff_id.clone()))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let mut missing_diff_ids = Vec::new();
-    for (digest, diff_id) in &layer_descriptors {
-        if !store.blob_path(digest)?.exists() {
-            missing_diff_ids.push(diff_id.clone());
-        }
-    }
-    let daemon_layers = if missing_diff_ids.is_empty() {
-        None
-    } else {
-        Some(docker::materialize_daemon_layers(store, &missing_diff_ids).await?)
-    };
-    let layer_sources = layer_descriptors
-        .iter()
-        .map(|(digest, diff_id)| {
-            layer_archive_source(store, daemon_layers.as_ref(), digest, diff_id)
-        })
-        .collect::<Result<Vec<_>>>()?;
 
     append_json(
         &mut builder,
@@ -152,8 +171,33 @@ pub async fn write_oci_archive_to_writer<W: Write>(
     Ok(())
 }
 
+fn missing_diff_ids(store: &Store, reference: &StoredReference) -> Result<Vec<String>> {
+    let manifest_path = store.blob_path(&reference.manifest.digest)?;
+    let manifest_bytes = std::fs::read(manifest_path)?;
+    let config_blob_path = store.blob_path(&reference.config_digest)?;
+    let config_bytes = std::fs::read(config_blob_path)?;
+    let manifest: OciManifest = serde_json::from_slice(&manifest_bytes)?;
+    let diff_ids = parse_diff_ids(&config_bytes)?;
+    if diff_ids.len() != manifest.layers.len() {
+        return Err(DockerPullError::BadResponse(format!(
+            "config diff_ids count {} does not match manifest layers count {}",
+            diff_ids.len(),
+            manifest.layers.len()
+        )));
+    }
+
+    let mut missing = Vec::new();
+    for (layer, diff_id) in manifest.layers.iter().zip(diff_ids) {
+        if !store.blob_path(&layer.digest)?.exists() {
+            missing.push(diff_id);
+        }
+    }
+    Ok(missing)
+}
+
 struct LayerArchiveSource {
-    source_path: std::path::PathBuf,
+    descriptor: Descriptor,
+    source_path: PathBuf,
     archive_path: String,
 }
 
@@ -181,31 +225,69 @@ fn append_blob<W: Write>(builder: &mut Builder<W>, store: &Store, digest: &str) 
     Ok(())
 }
 
+fn append_blob_bytes<W: Write>(builder: &mut Builder<W>, digest: &str, bytes: &[u8]) -> Result<()> {
+    let target = blob_tar_path(digest)?;
+    let mut header = Header::new_gnu();
+    header.set_size(bytes.len() as u64);
+    header.set_mode(0o644);
+    header.set_cksum();
+    builder.append_data(&mut header, target, bytes)?;
+    Ok(())
+}
+
 fn layer_archive_source(
     store: &Store,
-    daemon_layers: Option<&docker::MaterializedDaemonLayers>,
-    digest: &str,
+    fallback_paths: Option<&HashMap<String, PathBuf>>,
+    descriptor: &Descriptor,
     diff_id: &str,
 ) -> Result<LayerArchiveSource> {
-    let blob_path = store.blob_path(digest)?;
+    let blob_path = store.blob_path(&descriptor.digest)?;
     if blob_path.exists() {
         return Ok(LayerArchiveSource {
+            descriptor: descriptor.clone(),
             source_path: blob_path,
-            archive_path: blob_tar_path(digest)?,
+            archive_path: blob_tar_path(&descriptor.digest)?,
         });
     }
 
-    if let Some(local_path) = daemon_layers.and_then(|layers| layers.path_for(diff_id)) {
+    if let Some(local_path) = fallback_paths.and_then(|paths| paths.get(diff_id)) {
         return Ok(LayerArchiveSource {
+            descriptor: Descriptor {
+                media_type: "application/vnd.oci.image.layer.v1.tar".into(),
+                digest: diff_id.to_string(),
+                size: std::fs::metadata(local_path)?.len() as i64,
+                platform: None,
+                annotations: None,
+            },
             source_path: local_path.clone(),
             archive_path: blob_tar_path(diff_id)?,
         });
     }
 
     Err(DockerPullError::MissingBlobFile(
-        digest.to_string(),
+        descriptor.digest.to_string(),
         blob_path,
     ))
+}
+
+fn archive_manifest(
+    manifest: &OciManifest,
+    layer_sources: &[LayerArchiveSource],
+    manifest_descriptor: &Descriptor,
+) -> OciManifest {
+    OciManifest {
+        schema_version: manifest.schema_version,
+        media_type: if manifest.media_type.is_empty() {
+            manifest_descriptor.media_type.clone()
+        } else {
+            manifest.media_type.clone()
+        },
+        config: manifest.config.clone(),
+        layers: layer_sources
+            .iter()
+            .map(|source| source.descriptor.clone())
+            .collect(),
+    }
 }
 
 fn blob_tar_path(digest: &str) -> Result<String> {
@@ -213,6 +295,14 @@ fn blob_tar_path(digest: &str) -> Result<String> {
         .split_once(':')
         .ok_or_else(|| DockerPullError::InvalidInput(format!("invalid digest `{digest}`")))?;
     Ok(format!("blobs/{algorithm}/{value}"))
+}
+
+fn digest_bytes(bytes: &[u8]) -> String {
+    use sha2::{Digest as _, Sha256};
+
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("sha256:{}", hex::encode(hasher.finalize()))
 }
 
 fn docker_repo_tags(reference: &str) -> Result<Vec<String>> {
@@ -265,7 +355,10 @@ mod tests {
     use sha2::{Digest as _, Sha256};
     use tempfile::tempdir;
 
-    use super::{oci_ref_name, write_oci_archive_to_writer};
+    use super::{
+        blob_tar_path, oci_ref_name, write_oci_archive_to_writer,
+        write_oci_archive_to_writer_with_fallbacks,
+    };
     use crate::platform::Platform;
     use crate::registry::Descriptor;
     use crate::store::{Store, StoredReference};
@@ -356,6 +449,111 @@ mod tests {
         assert!(
             !archive.entries.contains_key("repositories"),
             "digest references should not write repositories metadata"
+        );
+    }
+
+    #[tokio::test]
+    async fn daemon_layer_fallback_rewrites_oci_manifest_to_materialized_digest() {
+        let dir = tempdir().expect("tempdir should create");
+        let store = Store::open(dir.path().to_path_buf())
+            .await
+            .expect("store should open");
+
+        let materialized_layer_bytes = b"materialized-layer-bytes";
+        let diff_id = digest_bytes(materialized_layer_bytes);
+        let config_bytes = format!(r#"{{"rootfs":{{"diff_ids":["{diff_id}"]}}}}"#).into_bytes();
+        let config = Descriptor {
+            media_type: "application/vnd.oci.image.config.v1+json".into(),
+            digest: digest_bytes(&config_bytes),
+            size: config_bytes.len() as i64,
+            platform: None,
+            annotations: None,
+        };
+        let original_layer = Descriptor {
+            media_type: "application/vnd.oci.image.layer.v1.tar+gzip".into(),
+            digest: digest_bytes(b"compressed-layer-bytes"),
+            size: 22,
+            platform: None,
+            annotations: None,
+        };
+        let manifest_bytes = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {
+                "mediaType": config.media_type,
+                "digest": config.digest,
+                "size": config.size
+            },
+            "layers": [{
+                "mediaType": original_layer.media_type,
+                "digest": original_layer.digest,
+                "size": original_layer.size
+            }]
+        }))
+        .expect("manifest bytes should serialize");
+        let manifest = Descriptor {
+            media_type: "application/vnd.oci.image.manifest.v1+json".into(),
+            digest: digest_bytes(&manifest_bytes),
+            size: manifest_bytes.len() as i64,
+            platform: Some(Platform::parse("linux/amd64").expect("platform should parse")),
+            annotations: None,
+        };
+
+        store
+            .save_blob_bytes(&config, &config_bytes)
+            .await
+            .expect("config should be saved");
+        store
+            .save_blob_bytes(&manifest, &manifest_bytes)
+            .await
+            .expect("manifest should be saved");
+
+        let fallback_path = dir.path().join("materialized-layer.tar");
+        std::fs::write(&fallback_path, materialized_layer_bytes)
+            .expect("materialized layer should be written");
+        let fallback_paths = HashMap::from([(diff_id.clone(), fallback_path)]);
+
+        let mut archive = Vec::new();
+        write_oci_archive_to_writer_with_fallbacks(
+            &mut archive,
+            &store,
+            &StoredReference {
+                reference: "ghcr.io/acme/app:1.2.3".to_string(),
+                manifest,
+                config_digest: config.digest.clone(),
+            },
+            Some(&fallback_paths),
+        )
+        .expect("archive should be written");
+
+        let entries = read_archive_entries(&archive);
+        let index: Value =
+            serde_json::from_slice(entries.get("index.json").expect("index.json should exist"))
+                .expect("index.json should parse");
+        let rewritten_manifest_digest = index["manifests"][0]["digest"]
+            .as_str()
+            .expect("index manifest digest should be a string");
+        let rewritten_manifest_path =
+            blob_tar_path(rewritten_manifest_digest).expect("manifest path should build");
+        let rewritten_manifest: Value = serde_json::from_slice(
+            entries
+                .get(&rewritten_manifest_path)
+                .expect("rewritten manifest blob should exist"),
+        )
+        .expect("rewritten manifest should parse");
+
+        assert_eq!(rewritten_manifest["layers"][0]["digest"], diff_id);
+        assert_eq!(
+            rewritten_manifest["layers"][0]["mediaType"],
+            "application/vnd.oci.image.layer.v1.tar"
+        );
+        assert_eq!(
+            rewritten_manifest["layers"][0]["size"],
+            materialized_layer_bytes.len() as i64
+        );
+        assert!(
+            entries.contains_key(&blob_tar_path(&diff_id).expect("layer path should build")),
+            "materialized layer should be archived at its content digest path"
         );
     }
 

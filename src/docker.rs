@@ -286,8 +286,8 @@ pub struct MaterializedDaemonLayers {
 }
 
 impl MaterializedDaemonLayers {
-    pub fn path_for(&self, diff_id: &str) -> Option<&PathBuf> {
-        self.paths.get(diff_id)
+    pub(crate) fn paths(&self) -> &HashMap<String, PathBuf> {
+        &self.paths
     }
 }
 

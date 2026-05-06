@@ -477,7 +477,7 @@ fn parse_www_authenticate(header: &str) -> Result<WwwAuthenticateChallenge> {
     let mut service = None;
     let mut scope = None;
 
-    for item in rest.split(',') {
+    for item in split_auth_attributes(rest) {
         let (key, value) = item
             .trim()
             .split_once('=')
@@ -497,6 +497,33 @@ fn parse_www_authenticate(header: &str) -> Result<WwwAuthenticateChallenge> {
         service,
         scope,
     })
+}
+
+fn split_auth_attributes(value: &str) -> Vec<&str> {
+    let mut attributes = Vec::new();
+    let mut start = 0usize;
+    let mut in_quotes = false;
+    let mut escaped = false;
+
+    for (index, ch) in value.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+
+        match ch {
+            '\\' if in_quotes => escaped = true,
+            '"' => in_quotes = !in_quotes,
+            ',' if !in_quotes => {
+                attributes.push(value[start..index].trim());
+                start = index + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+
+    attributes.push(value[start..].trim());
+    attributes
 }
 
 fn is_image_manifest(media_type: &str) -> bool {
@@ -592,7 +619,7 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
-    use super::{DEFAULT_REQUEST_RETRIES, RegistryClient, token_cache_key};
+    use super::{DEFAULT_REQUEST_RETRIES, RegistryClient, parse_www_authenticate, token_cache_key};
     use crate::auth::AuthResolver;
     use crate::error::DockerPullError;
     use crate::platform::Platform;
@@ -659,6 +686,22 @@ mod tests {
             ImageReference::parse("docker.io/acme/app:latest").expect("reference should parse");
 
         assert_ne!(token_cache_key(&left), token_cache_key(&right));
+    }
+
+    #[test]
+    fn parse_www_authenticate_keeps_commas_inside_quoted_values() {
+        let challenge = parse_www_authenticate(
+            r#"Bearer realm="https://auth.example/token",service="registry.example",scope="repository:acme/app:pull,push""#,
+        )
+        .expect("challenge should parse");
+
+        assert_eq!(challenge.scheme, "Bearer");
+        assert_eq!(challenge.realm, "https://auth.example/token");
+        assert_eq!(challenge.service.as_deref(), Some("registry.example"));
+        assert_eq!(
+            challenge.scope.as_deref(),
+            Some("repository:acme/app:pull,push")
+        );
     }
 
     #[tokio::test]
