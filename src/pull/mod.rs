@@ -10,7 +10,7 @@ use crate::error::{DockerPullError, Result};
 use crate::image::pair_layers;
 use crate::platform::Platform;
 use crate::reference::ImageReference;
-use crate::registry::RegistryClient;
+use crate::registry::{Descriptor, RegistryClient};
 use crate::store::{Store, StoredReference};
 use crate::ui::Ui;
 
@@ -60,15 +60,7 @@ impl Puller {
             .store
             .save_blob_bytes(&resolved.manifest, &resolved.manifest_bytes)
             .await?;
-        let config_bytes = self
-            .context
-            .registry
-            .get_blob_bytes(&reference, &resolved.config.digest)
-            .await?;
-        self.context
-            .store
-            .save_blob_bytes(&resolved.config, &config_bytes)
-            .await?;
+        let config_bytes = load_blob_bytes(&self.context, &reference, &resolved.config).await?;
 
         let layers = pair_layers(resolved.layers.clone(), &config_bytes)?;
         let layer_digests = layers
@@ -140,6 +132,27 @@ impl Puller {
 
         Ok(())
     }
+}
+
+async fn load_blob_bytes(
+    context: &PullContext,
+    reference: &ImageReference,
+    descriptor: &Descriptor,
+) -> Result<Vec<u8>> {
+    if let Some(bytes) = context
+        .store
+        .read_blob_bytes_if_complete(descriptor)
+        .await?
+    {
+        return Ok(bytes);
+    }
+
+    let bytes = context
+        .registry
+        .get_blob_bytes(reference, &descriptor.digest)
+        .await?;
+    context.store.save_blob_bytes(descriptor, &bytes).await?;
+    Ok(bytes)
 }
 
 async fn finalize_reference(
