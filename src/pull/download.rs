@@ -59,12 +59,13 @@ pub async fn download_blob(
             .await?;
         let status = response.status();
         if status == StatusCode::OK && offset > 0 {
+            let delay = retry_delay(offset);
             retries = register_retry(
                 context,
                 &descriptor.digest,
                 retries,
                 "registry ignored ranged resume",
-                retry_delay(offset),
+                delay,
             )?;
             warn!(
                 "registry ignored range request for {}, restarting blob",
@@ -82,7 +83,10 @@ pub async fn download_blob(
             context
                 .ui
                 .start_layer_download(&descriptor.digest, expected_size, offset);
-            tokio::time::sleep(retry_delay(offset)).await;
+            bytes_since_checkpoint = 0;
+            last_checkpoint = Instant::now();
+            tokio::time::sleep(delay).await;
+            continue;
         }
         if status == StatusCode::RANGE_NOT_SATISFIABLE {
             let delay = retry_delay(offset);
@@ -101,6 +105,8 @@ pub async fn download_blob(
             context
                 .ui
                 .start_layer_download(&descriptor.digest, expected_size, offset);
+            bytes_since_checkpoint = 0;
+            last_checkpoint = Instant::now();
             tokio::time::sleep(delay).await;
             continue;
         }
@@ -269,5 +275,11 @@ mod tests {
     fn fresh_blob_download_accepts_ok_response() {
         validate_blob_response_status(StatusCode::OK, 0, "sha256:deadbeef")
             .expect("fresh downloads should accept 200 responses");
+    }
+
+    #[test]
+    fn resumed_blob_download_accepts_partial_content() {
+        validate_blob_response_status(StatusCode::PARTIAL_CONTENT, 42, "sha256:deadbeef")
+            .expect("resumed downloads should accept 206 responses");
     }
 }
