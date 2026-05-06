@@ -292,6 +292,7 @@ mod tests {
     struct DockerConfigEnvGuard {
         _lock: MutexGuard<'static, ()>,
         previous: Option<OsString>,
+        restored: bool,
     }
 
     impl DockerConfigEnvGuard {
@@ -307,11 +308,16 @@ mod tests {
             Self {
                 _lock: lock,
                 previous,
+                restored: false,
             }
         }
 
         fn restore(&mut self) {
-            restore_docker_config_env(self.previous.take());
+            if self.restored {
+                return;
+            }
+            restore_docker_config_env(self.previous.as_deref());
+            self.restored = true;
         }
     }
 
@@ -321,7 +327,7 @@ mod tests {
         }
     }
 
-    fn restore_docker_config_env(previous: Option<OsString>) {
+    fn restore_docker_config_env(previous: Option<&std::ffi::OsStr>) {
         unsafe {
             if let Some(previous) = previous {
                 std::env::set_var("DOCKER_CONFIG", previous);
@@ -332,9 +338,9 @@ mod tests {
     }
 
     fn with_docker_config_env<T>(path: &std::path::Path, run: impl FnOnce() -> T) -> T {
-        let mut guard = DockerConfigEnvGuard::new(path);
+        let guard = DockerConfigEnvGuard::new(path);
         let result = catch_unwind(AssertUnwindSafe(run));
-        guard.restore();
+        drop(guard);
         match result {
             Ok(value) => value,
             Err(payload) => resume_unwind(payload),
@@ -420,10 +426,12 @@ mod tests {
         let dir = tempdir().expect("tempdir should create");
         let lock = lock_docker_config_env();
         let previous = std::env::var_os("DOCKER_CONFIG");
-        let mut guard = DockerConfigEnvGuard::new_with_lock(lock, dir.path());
-
-        let result = catch_unwind(AssertUnwindSafe(|| panic!("boom")));
-        guard.restore();
+        let result = {
+            let guard = DockerConfigEnvGuard::new_with_lock(lock, dir.path());
+            let result = catch_unwind(AssertUnwindSafe(|| panic!("boom")));
+            drop(guard);
+            result
+        };
 
         assert!(result.is_err(), "closure panic should propagate");
         assert_eq!(
