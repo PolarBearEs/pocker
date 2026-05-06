@@ -60,21 +60,24 @@ impl AuthResolver {
             return Ok(None);
         };
 
-        if let Some(helper) = config.cred_helpers.get(registry).or_else(|| {
-            docker_hub_aliases(registry).find_map(|alias| config.cred_helpers.get(alias))
-        }) && let Some(credentials) = invoke_helper(helper, registry)?
-        {
-            return Ok(Some(credentials));
+        for key in registry_keys(registry) {
+            if let Some(helper) = config.cred_helpers.get(key)
+                && let Some(credentials) = invoke_helper(helper, key)?
+            {
+                return Ok(Some(credentials));
+            }
         }
 
-        if let Some(helper) = &config.creds_store
-            && let Some(credentials) = invoke_helper(helper, registry)?
-        {
-            return Ok(Some(credentials));
+        if let Some(helper) = &config.creds_store {
+            for key in registry_keys(registry) {
+                if let Some(credentials) = invoke_helper(helper, key)? {
+                    return Ok(Some(credentials));
+                }
+            }
         }
 
         for key in registry_keys(registry) {
-            if let Some(entry) = config.auths.get(&key)
+            if let Some(entry) = config.auths.get(key)
                 && let Some(auth) = &entry.auth
             {
                 let decoded = base64::engine::general_purpose::STANDARD.decode(auth)?;
@@ -210,11 +213,13 @@ fn invoke_helper_command(
     }))
 }
 
-fn registry_keys(registry: &str) -> Vec<String> {
-    let mut keys = docker_hub_aliases(registry)
-        .map(ToString::to_string)
-        .collect::<Vec<_>>();
-    keys.push(registry.to_string());
+fn registry_keys(registry: &str) -> Vec<&str> {
+    let mut keys = vec![registry];
+    for alias in docker_hub_aliases(registry) {
+        if alias != registry {
+            keys.push(alias);
+        }
+    }
     keys
 }
 
@@ -244,6 +249,7 @@ mod tests {
 
     #[cfg(unix)]
     use super::invoke_helper_command;
+    use super::registry_keys;
 
     #[cfg(unix)]
     #[test]
@@ -258,6 +264,20 @@ mod tests {
         assert!(
             result.is_none(),
             "failed helper should not return credentials"
+        );
+    }
+
+    #[test]
+    fn docker_hub_registry_keys_include_aliases_without_duplicates() {
+        assert_eq!(
+            registry_keys("registry-1.docker.io"),
+            vec![
+                "registry-1.docker.io",
+                "https://registry-1.docker.io",
+                "index.docker.io",
+                "https://index.docker.io/v1/",
+                "docker.io",
+            ]
         );
     }
 }
