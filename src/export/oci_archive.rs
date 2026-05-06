@@ -60,19 +60,13 @@ pub async fn write_oci_archive_to_writer<W: Write>(
     )?;
 
     let mut manifest_descriptor = reference.manifest.clone();
-    let ref_name = reference
-        .reference
-        .rsplit_once('/')
-        .map(|(_, tail)| tail)
-        .unwrap_or(&reference.reference);
-    manifest_descriptor.annotations = Some(
-        [(
-            "org.opencontainers.image.ref.name".to_string(),
-            ref_name.to_string(),
-        )]
-        .into_iter()
-        .collect(),
-    );
+    if let Some(ref_name) = oci_ref_name(&reference.reference)? {
+        manifest_descriptor.annotations = Some(
+            [("org.opencontainers.image.ref.name".to_string(), ref_name)]
+                .into_iter()
+                .collect(),
+        );
+    }
     append_json(
         &mut builder,
         "index.json",
@@ -229,6 +223,14 @@ fn docker_repo_tags(reference: &str) -> Result<Vec<String>> {
     }
 }
 
+fn oci_ref_name(reference: &str) -> Result<Option<String>> {
+    let parsed = ImageReference::parse(reference)?;
+    match parsed.target {
+        ReferenceTarget::Tag(tag) => Ok(Some(tag)),
+        ReferenceTarget::Digest(_) => Ok(None),
+    }
+}
+
 fn docker_repositories(reference: &str, config_digest: &str) -> Result<Option<serde_json::Value>> {
     let parsed = ImageReference::parse(reference)?;
     let ReferenceTarget::Tag(_) = &parsed.target else {
@@ -252,4 +254,22 @@ fn docker_repositories(reference: &str, config_digest: &str) -> Result<Option<se
     let mut repositories = serde_json::Map::new();
     repositories.insert(image_name.to_string(), serde_json::Value::Object(tags));
     Ok(Some(serde_json::Value::Object(repositories)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::oci_ref_name;
+
+    #[test]
+    fn oci_ref_name_uses_tag_only() {
+        let ref_name = oci_ref_name("ghcr.io/acme/app:1.2.3").expect("reference should parse");
+        assert_eq!(ref_name.as_deref(), Some("1.2.3"));
+    }
+
+    #[test]
+    fn oci_ref_name_is_omitted_for_digest_references() {
+        let ref_name =
+            oci_ref_name("ghcr.io/acme/app@sha256:deadbeef").expect("reference should parse");
+        assert!(ref_name.is_none());
+    }
 }
