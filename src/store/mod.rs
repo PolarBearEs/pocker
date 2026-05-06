@@ -117,14 +117,21 @@ impl Store {
         &self,
         descriptor: &Descriptor,
     ) -> Result<Option<Vec<u8>>> {
-        if !self
-            .ensure_blob_complete(&descriptor.digest, descriptor.size)
-            .await?
-        {
+        let path = self.blob_path(&descriptor.digest)?;
+        if !path.exists() {
             return Ok(None);
         }
-        let path = self.blob_path(&descriptor.digest)?;
-        Ok(Some(tokio_fs::read(path).await?))
+        let bytes = tokio_fs::read(&path).await?;
+        if bytes.len() != descriptor.size as usize {
+            tokio_fs::remove_file(&path).await?;
+            return Ok(None);
+        }
+        let actual_digest = digest_bytes(&bytes);
+        if actual_digest != descriptor.digest {
+            tokio_fs::remove_file(&path).await?;
+            return Ok(None);
+        }
+        Ok(Some(bytes))
     }
 
     pub async fn prepare_download(
