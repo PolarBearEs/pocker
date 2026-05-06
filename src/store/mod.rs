@@ -113,6 +113,27 @@ impl Store {
         Ok(())
     }
 
+    pub async fn read_blob_bytes_if_complete(
+        &self,
+        descriptor: &Descriptor,
+    ) -> Result<Option<Vec<u8>>> {
+        let path = self.blob_path(&descriptor.digest)?;
+        if !path.exists() {
+            return Ok(None);
+        }
+        let bytes = tokio_fs::read(&path).await?;
+        if bytes.len() != descriptor.size as usize {
+            tokio_fs::remove_file(&path).await?;
+            return Ok(None);
+        }
+        let actual_digest = digest_bytes(&bytes);
+        if actual_digest != descriptor.digest {
+            tokio_fs::remove_file(&path).await?;
+            return Ok(None);
+        }
+        Ok(Some(bytes))
+    }
+
     pub async fn prepare_download(
         &self,
         reference: &str,
@@ -455,6 +476,35 @@ mod tests {
                 .exists(),
             "config blob should be retained"
         );
+    }
+
+    #[tokio::test]
+    async fn read_blob_bytes_if_complete_returns_cached_bytes() {
+        let dir = tempdir().expect("tempdir should create");
+        let store = Store::open(dir.path().to_path_buf())
+            .await
+            .expect("store should open");
+        let bytes = br#"{"rootfs":{"diff_ids":[]}}"#;
+        let descriptor = Descriptor {
+            media_type: "application/vnd.oci.image.config.v1+json".into(),
+            digest: "sha256:1af042414ee4ede82dfd34a3741d6a3de03264be0511e5fec59a7b15ad6cf625"
+                .into(),
+            size: bytes.len() as i64,
+            platform: None,
+            annotations: None,
+        };
+
+        store
+            .save_blob_bytes(&descriptor, bytes)
+            .await
+            .expect("config blob should be saved");
+
+        let cached = store
+            .read_blob_bytes_if_complete(&descriptor)
+            .await
+            .expect("cached config blob should be readable");
+
+        assert_eq!(cached.as_deref(), Some(bytes.as_slice()));
     }
 
     #[tokio::test]
