@@ -15,6 +15,7 @@ use sha2::{Digest as _, Sha256};
 use tar::Archive;
 use tempfile::{NamedTempFile, TempDir};
 use tokio::io::AsyncWriteExt;
+use tokio::task::JoinSet;
 use tokio_util::io::ReaderStream;
 
 use crate::error::{DockerPullError, Result};
@@ -48,6 +49,7 @@ const PATH_SEGMENT_ENCODE_SET: &AsciiSet = &CONTROLS
     .add(b'{')
     .add(b'|')
     .add(b'}');
+const DAEMON_INSPECT_CONCURRENCY: usize = 8;
 
 #[derive(Debug, Clone)]
 enum DockerEndpoint {
@@ -336,23 +338,64 @@ pub async fn save_image(reference: &str, path: &Path) -> Result<()> {
 }
 
 async fn list_daemon_images(daemon: &DockerDaemon) -> Result<Vec<DaemonImage>> {
-    let ids = daemon
-        .list_image_summaries()
-        .await?
-        .into_iter()
-        .map(|image| image.id)
-        .collect::<HashSet<_>>();
+    let ids = ordered_unique_image_ids(daemon.list_image_summaries().await?);
     if ids.is_empty() {
         return Ok(Vec::new());
     }
 
-    let mut images = Vec::with_capacity(ids.len());
-    for id in ids {
-        if let Some(image) = daemon.inspect_image(&id).await? {
-            images.push(image);
+    let mut queue = JoinSet::new();
+    let mut pending = ids.into_iter().enumerate();
+    let mut images = vec![None; pending.len()];
+
+    while queue.len() < DAEMON_INSPECT_CONCURRENCY {
+        let Some((index, id)) = pending.next() else {
+            break;
+        };
+        spawn_inspect_task(&mut queue, daemon.clone(), index, id);
+    }
+
+    while let Some(result) = queue.join_next().await {
+        let (index, image) = match result {
+            Ok(Ok(result)) => result,
+            Ok(Err(error)) => {
+                queue.abort_all();
+                return Err(error);
+            }
+            Err(error) => {
+                queue.abort_all();
+                return Err(DockerPullError::CommandFailed(format!(
+                    "docker image inspect task failed: {error}"
+                )));
+            }
+        };
+        images[index] = image;
+
+        if let Some((index, id)) = pending.next() {
+            spawn_inspect_task(&mut queue, daemon.clone(), index, id);
         }
     }
-    Ok(images)
+
+    Ok(images.into_iter().flatten().collect())
+}
+
+fn spawn_inspect_task(
+    queue: &mut JoinSet<Result<(usize, Option<DaemonImage>)>>,
+    daemon: DockerDaemon,
+    index: usize,
+    id: String,
+) {
+    queue.spawn(async move { Ok((index, daemon.inspect_image(&id).await?)) });
+}
+
+fn ordered_unique_image_ids(summaries: Vec<DaemonImageSummary>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut ids = Vec::with_capacity(summaries.len());
+    for summary in summaries {
+        if seen.insert(summary.id.clone()) {
+            ids.push(summary.id);
+        }
+    }
+    ids
 }
 
 pub async fn materialize_daemon_layers(
@@ -589,6 +632,7 @@ mod tests {
 
     #[cfg(any(unix, windows))]
     use super::DEFAULT_DOCKER_HOST;
+    use super::ordered_unique_image_ids;
     use super::{daemon_inspect_target, docker_endpoint_from_host, encode_path_segment};
     use crate::reference::ImageReference;
 
@@ -609,6 +653,32 @@ mod tests {
             daemon_inspect_target(&reference, "sha256:deadbeef"),
             "sha256:deadbeef"
         );
+    }
+
+    #[test]
+    fn ordered_unique_image_ids_preserves_first_seen_order() {
+        let ids = ordered_unique_image_ids(vec![
+            super::DaemonImageSummary {
+                id: "sha256:1".into(),
+                created: None,
+                repo_tags: None,
+                size: None,
+            },
+            super::DaemonImageSummary {
+                id: "sha256:2".into(),
+                created: None,
+                repo_tags: None,
+                size: None,
+            },
+            super::DaemonImageSummary {
+                id: "sha256:1".into(),
+                created: None,
+                repo_tags: None,
+                size: None,
+            },
+        ]);
+
+        assert_eq!(ids, vec!["sha256:1", "sha256:2"]);
     }
 
     #[cfg(unix)]
