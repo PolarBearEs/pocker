@@ -1,11 +1,11 @@
 use std::collections::HashMap;
-use std::ffi::OsString;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 use base64::Engine;
 use serde::Deserialize;
+use tracing::warn;
 
 use crate::error::{DockerPullError, Result};
 
@@ -117,28 +117,92 @@ fn docker_config_path() -> PathBuf {
 }
 
 fn invoke_helper(helper: &str, registry: &str) -> Result<Option<Credentials>> {
-    let helper_binary: OsString = format!("docker-credential-{helper}").into();
-    let mut child = match Command::new(&helper_binary)
-        .arg("get")
+    let helper_binary = format!("docker-credential-{helper}");
+    let mut command = Command::new(&helper_binary);
+    command.arg("get");
+    invoke_helper_command(command, &helper_binary, registry)
+}
+
+fn invoke_helper_command(
+    mut command: Command,
+    helper_binary: &str,
+    registry: &str,
+) -> Result<Option<Credentials>> {
+    command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
+        .stderr(Stdio::piped());
+    let mut child = match command.spawn() {
         Ok(child) => child,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            warn!(
+                "docker credential helper `{}` not found for `{}`",
+                helper_binary, registry
+            );
+            return Ok(None);
+        }
+        Err(error) => {
+            warn!(
+                "failed to spawn docker credential helper `{}` for `{}`: {}",
+                helper_binary, registry, error
+            );
+            return Ok(None);
+        }
     };
 
-    if let Some(stdin) = child.stdin.as_mut() {
-        stdin.write_all(registry.as_bytes())?;
+    if let Some(stdin) = child.stdin.as_mut()
+        && let Err(error) = stdin.write_all(registry.as_bytes())
+    {
+        warn!(
+            "failed to write registry to docker credential helper `{}` for `{}`: {}",
+            helper_binary, registry, error
+        );
+        return Ok(None);
     }
-    let output = child.wait_with_output()?;
+    let output = match child.wait_with_output() {
+        Ok(output) => output,
+        Err(error) => {
+            warn!(
+                "failed to wait for docker credential helper `{}` for `{}`: {}",
+                helper_binary, registry, error
+            );
+            return Ok(None);
+        }
+    };
     if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if stderr.is_empty() {
+            warn!(
+                "docker credential helper `{}` failed for `{}` with status {}",
+                helper_binary, registry, output.status
+            );
+        } else {
+            warn!(
+                "docker credential helper `{}` failed for `{}` with status {}: {}",
+                helper_binary, registry, output.status, stderr
+            );
+        }
         return Ok(None);
     }
 
-    let response: HelperResponse = serde_json::from_slice(&output.stdout)?;
+    let response: HelperResponse = match serde_json::from_slice(&output.stdout) {
+        Ok(response) => response,
+        Err(error) => {
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if stdout.is_empty() {
+                warn!(
+                    "docker credential helper `{}` returned invalid JSON for `{}`: {}",
+                    helper_binary, registry, error
+                );
+            } else {
+                warn!(
+                    "docker credential helper `{}` returned invalid JSON for `{}`: {} (stdout: {})",
+                    helper_binary, registry, error, stdout
+                );
+            }
+            return Ok(None);
+        }
+    };
     Ok(Some(Credentials::Basic {
         username: response.username,
         password: response.secret,
@@ -170,4 +234,27 @@ fn docker_hub_aliases(registry: &str) -> impl Iterator<Item = &'static str> {
         &[]
     };
     aliases.iter().copied()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::process::Command;
+
+    use super::invoke_helper_command;
+
+    #[cfg(unix)]
+    #[test]
+    fn failing_helper_falls_back_instead_of_aborting_auth_resolution() {
+        let mut command = Command::new("sh");
+        command.arg("-c").arg("echo helper-broke >&2; exit 1");
+
+        let result =
+            invoke_helper_command(command, "docker-credential-test", "registry-1.docker.io")
+                .expect("helper failure should fall back");
+
+        assert!(
+            result.is_none(),
+            "failed helper should not return credentials"
+        );
+    }
 }
