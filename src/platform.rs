@@ -31,6 +31,11 @@ impl Platform {
                 DockerPullError::InvalidInput("platform architecture is required".into())
             })?;
         let variant = parts.next().map(ToString::to_string);
+        if parts.next().is_some() {
+            return Err(DockerPullError::InvalidInput(
+                "platform must use os/arch[/variant] format".into(),
+            ));
+        }
         Ok(Self {
             os: normalize_os(os).to_string(),
             architecture: normalize_architecture(architecture).to_string(),
@@ -92,5 +97,15 @@ mod tests {
     fn normalizes_common_architecture_aliases() {
         let platform = Platform::parse("linux/x86_64").expect("platform should parse");
         assert_eq!(platform.architecture, "amd64");
+    }
+
+    #[test]
+    fn rejects_platforms_with_too_many_segments() {
+        let error = Platform::parse("linux/arm64/v8/extra")
+            .expect_err("platform with extra segments should be rejected");
+        assert_eq!(
+            error.to_string(),
+            "platform must use os/arch[/variant] format"
+        );
     }
 }
