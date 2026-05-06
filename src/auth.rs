@@ -104,8 +104,28 @@ fn load_docker_config() -> Result<Option<DockerConfig>> {
         return Ok(None);
     }
 
-    let content = std::fs::read_to_string(path)?;
-    Ok(Some(serde_json::from_str(&content)?))
+    let content = match std::fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(error) => {
+            warn!(
+                "failed to read docker config at `{}`: {}; continuing without docker auth",
+                path.display(),
+                error
+            );
+            return Ok(None);
+        }
+    };
+    match serde_json::from_str(&content) {
+        Ok(config) => Ok(Some(config)),
+        Err(error) => {
+            warn!(
+                "failed to parse docker config at `{}`: {}; continuing without docker auth",
+                path.display(),
+                error
+            );
+            Ok(None)
+        }
+    }
 }
 
 fn docker_config_path() -> PathBuf {
@@ -244,12 +264,15 @@ fn docker_hub_aliases(registry: &str) -> impl Iterator<Item = &'static str> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     #[cfg(unix)]
     use std::process::Command;
 
+    use tempfile::tempdir;
+
     #[cfg(unix)]
     use super::invoke_helper_command;
-    use super::registry_keys;
+    use super::{load_docker_config, registry_keys};
 
     #[cfg(unix)]
     #[test]
@@ -278,6 +301,32 @@ mod tests {
                 "https://index.docker.io/v1/",
                 "docker.io",
             ]
+        );
+    }
+
+    #[test]
+    fn malformed_docker_config_falls_back_to_no_auth() {
+        let dir = tempdir().expect("tempdir should create");
+        fs::write(dir.path().join("config.json"), "{not-json").expect("config should be written");
+
+        let previous = std::env::var_os("DOCKER_CONFIG");
+        unsafe {
+            std::env::set_var("DOCKER_CONFIG", dir.path());
+        }
+
+        let config = load_docker_config().expect("load should not fail on malformed config");
+
+        unsafe {
+            if let Some(previous) = previous {
+                std::env::set_var("DOCKER_CONFIG", previous);
+            } else {
+                std::env::remove_var("DOCKER_CONFIG");
+            }
+        }
+
+        assert!(
+            config.is_none(),
+            "malformed docker config should be ignored"
         );
     }
 }
