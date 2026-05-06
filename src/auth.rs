@@ -267,12 +267,38 @@ mod tests {
     use std::fs;
     #[cfg(unix)]
     use std::process::Command;
+    use std::sync::{Mutex, OnceLock};
 
+    use base64::Engine as _;
     use tempfile::tempdir;
 
     #[cfg(unix)]
     use super::invoke_helper_command;
-    use super::{load_docker_config, registry_keys};
+    use super::{AuthResolver, Credentials, load_docker_config, registry_keys};
+
+    fn docker_config_env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn with_docker_config_env<T>(path: &std::path::Path, run: impl FnOnce() -> T) -> T {
+        let _guard = docker_config_env_lock()
+            .lock()
+            .expect("docker config env lock should not be poisoned");
+        let previous = std::env::var_os("DOCKER_CONFIG");
+        unsafe {
+            std::env::set_var("DOCKER_CONFIG", path);
+        }
+        let result = run();
+        unsafe {
+            if let Some(previous) = previous {
+                std::env::set_var("DOCKER_CONFIG", previous);
+            } else {
+                std::env::remove_var("DOCKER_CONFIG");
+            }
+        }
+        result
+    }
 
     #[cfg(unix)]
     #[test]
@@ -309,24 +335,42 @@ mod tests {
         let dir = tempdir().expect("tempdir should create");
         fs::write(dir.path().join("config.json"), "{not-json").expect("config should be written");
 
-        let previous = std::env::var_os("DOCKER_CONFIG");
-        unsafe {
-            std::env::set_var("DOCKER_CONFIG", dir.path());
-        }
-
-        let config = load_docker_config().expect("load should not fail on malformed config");
-
-        unsafe {
-            if let Some(previous) = previous {
-                std::env::set_var("DOCKER_CONFIG", previous);
-            } else {
-                std::env::remove_var("DOCKER_CONFIG");
-            }
-        }
+        let config = with_docker_config_env(dir.path(), || {
+            load_docker_config().expect("load should not fail on malformed config")
+        });
 
         assert!(
             config.is_none(),
             "malformed docker config should be ignored"
         );
+    }
+
+    #[test]
+    fn resolves_docker_hub_alias_auth_entry_from_config() {
+        let dir = tempdir().expect("tempdir should create");
+        let auth = base64::engine::general_purpose::STANDARD.encode("demo-user:demo-pass");
+        let config = format!(
+            r#"{{
+                "auths": {{
+                    "https://index.docker.io/v1/": {{
+                        "auth": "{auth}"
+                    }}
+                }}
+            }}"#
+        );
+        fs::write(dir.path().join("config.json"), config).expect("config should be written");
+
+        let credentials = with_docker_config_env(dir.path(), || {
+            AuthResolver::new(None)
+                .expect("resolver should build")
+                .resolve("registry-1.docker.io")
+                .expect("auth resolution should succeed")
+        });
+
+        assert!(matches!(
+            credentials,
+            Some(Credentials::Basic { username, password })
+                if username == "demo-user" && password == "demo-pass"
+        ));
     }
 }
