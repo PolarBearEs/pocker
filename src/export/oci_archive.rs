@@ -14,6 +14,8 @@ use crate::registry::Descriptor;
 use crate::store::Store;
 use crate::store::StoredReference;
 
+const OCI_IMAGE_MANIFEST_MEDIA_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";
+
 #[derive(Debug, Serialize)]
 struct OciLayout<'a> {
     #[serde(rename = "imageLayoutVersion")]
@@ -47,6 +49,12 @@ struct OciManifest {
     layers: Vec<Descriptor>,
 }
 
+struct ArchiveInputs {
+    manifest: OciManifest,
+    diff_ids: Vec<String>,
+    missing_diff_ids: Vec<String>,
+}
+
 pub async fn write_oci_archive(
     path: &Path,
     store: &Store,
@@ -61,16 +69,17 @@ pub async fn write_oci_archive_to_writer<W: Write>(
     store: &Store,
     reference: &StoredReference,
 ) -> Result<()> {
-    let missing_diff_ids = missing_diff_ids(store, reference)?;
-    let daemon_layers = if missing_diff_ids.is_empty() {
+    let inputs = load_archive_inputs(store, reference)?;
+    let daemon_layers = if inputs.missing_diff_ids.is_empty() {
         None
     } else {
-        Some(docker::materialize_daemon_layers(store, &missing_diff_ids).await?)
+        Some(docker::materialize_daemon_layers(store, &inputs.missing_diff_ids).await?)
     };
     write_oci_archive_to_writer_with_fallbacks(
         writer,
         store,
         reference,
+        &inputs,
         daemon_layers
             .as_ref()
             .map(docker::MaterializedDaemonLayers::paths),
@@ -81,6 +90,7 @@ fn write_oci_archive_to_writer_with_fallbacks<W: Write>(
     writer: W,
     store: &Store,
     reference: &StoredReference,
+    inputs: &ArchiveInputs,
     fallback_paths: Option<&HashMap<String, PathBuf>>,
 ) -> Result<()> {
     let mut builder = Builder::new(writer);
@@ -92,31 +102,19 @@ fn write_oci_archive_to_writer_with_fallbacks<W: Write>(
         },
     )?;
 
-    let manifest_path = store.blob_path(&reference.manifest.digest)?;
-    let manifest_bytes = std::fs::read(manifest_path)?;
-    let config_blob_path = store.blob_path(&reference.config_digest)?;
-    let config_bytes = std::fs::read(config_blob_path)?;
-    let manifest: OciManifest = serde_json::from_slice(&manifest_bytes)?;
-    let diff_ids = parse_diff_ids(&config_bytes)?;
-    if diff_ids.len() != manifest.layers.len() {
-        return Err(DockerPullError::BadResponse(format!(
-            "config diff_ids count {} does not match manifest layers count {}",
-            diff_ids.len(),
-            manifest.layers.len()
-        )));
-    }
     let config_path = blob_tar_path(&reference.config_digest)?;
-    let layer_descriptors = manifest
+    let layer_descriptors = inputs
+        .manifest
         .layers
         .iter()
         .cloned()
-        .zip(diff_ids.iter().cloned())
+        .zip(inputs.diff_ids.iter().cloned())
         .collect::<Vec<_>>();
     let layer_sources = layer_descriptors
         .iter()
         .map(|(layer, diff_id)| layer_archive_source(store, fallback_paths, layer, diff_id))
         .collect::<Result<Vec<_>>>()?;
-    let archive_manifest = archive_manifest(&manifest, &layer_sources, &reference.manifest);
+    let archive_manifest = archive_manifest(&inputs.manifest, &layer_sources, &reference.manifest);
     let archive_manifest_bytes = serde_json::to_vec(&archive_manifest)?;
     let mut manifest_descriptor = reference.manifest.clone();
     manifest_descriptor.digest = digest_bytes(&archive_manifest_bytes);
@@ -171,7 +169,7 @@ fn write_oci_archive_to_writer_with_fallbacks<W: Write>(
     Ok(())
 }
 
-fn missing_diff_ids(store: &Store, reference: &StoredReference) -> Result<Vec<String>> {
+fn load_archive_inputs(store: &Store, reference: &StoredReference) -> Result<ArchiveInputs> {
     let manifest_path = store.blob_path(&reference.manifest.digest)?;
     let manifest_bytes = std::fs::read(manifest_path)?;
     let config_blob_path = store.blob_path(&reference.config_digest)?;
@@ -187,12 +185,18 @@ fn missing_diff_ids(store: &Store, reference: &StoredReference) -> Result<Vec<St
     }
 
     let mut missing = Vec::new();
+    let mut resolved_diff_ids = Vec::with_capacity(diff_ids.len());
     for (layer, diff_id) in manifest.layers.iter().zip(diff_ids) {
         if !store.blob_path(&layer.digest)?.exists() {
-            missing.push(diff_id);
+            missing.push(diff_id.clone());
         }
+        resolved_diff_ids.push(diff_id);
     }
-    Ok(missing)
+    Ok(ArchiveInputs {
+        manifest,
+        diff_ids: resolved_diff_ids,
+        missing_diff_ids: missing,
+    })
 }
 
 struct LayerArchiveSource {
@@ -277,16 +281,25 @@ fn archive_manifest(
 ) -> OciManifest {
     OciManifest {
         schema_version: manifest.schema_version,
-        media_type: if manifest.media_type.is_empty() {
-            manifest_descriptor.media_type.clone()
-        } else {
-            manifest.media_type.clone()
-        },
+        media_type: resolved_manifest_media_type(manifest, manifest_descriptor),
         config: manifest.config.clone(),
         layers: layer_sources
             .iter()
             .map(|source| source.descriptor.clone())
             .collect(),
+    }
+}
+
+fn resolved_manifest_media_type(
+    manifest: &OciManifest,
+    manifest_descriptor: &Descriptor,
+) -> String {
+    if !manifest.media_type.is_empty() {
+        manifest.media_type.clone()
+    } else if !manifest_descriptor.media_type.is_empty() {
+        manifest_descriptor.media_type.clone()
+    } else {
+        OCI_IMAGE_MANIFEST_MEDIA_TYPE.to_string()
     }
 }
 
@@ -356,8 +369,8 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        blob_tar_path, oci_ref_name, write_oci_archive_to_writer,
-        write_oci_archive_to_writer_with_fallbacks,
+        OCI_IMAGE_MANIFEST_MEDIA_TYPE, blob_tar_path, load_archive_inputs, oci_ref_name,
+        write_oci_archive_to_writer, write_oci_archive_to_writer_with_fallbacks,
     };
     use crate::platform::Platform;
     use crate::registry::Descriptor;
@@ -512,16 +525,20 @@ mod tests {
         std::fs::write(&fallback_path, materialized_layer_bytes)
             .expect("materialized layer should be written");
         let fallback_paths = HashMap::from([(diff_id.clone(), fallback_path)]);
+        let stored_reference = StoredReference {
+            reference: "ghcr.io/acme/app:1.2.3".to_string(),
+            manifest,
+            config_digest: config.digest.clone(),
+        };
+        let inputs =
+            load_archive_inputs(&store, &stored_reference).expect("archive inputs should load");
 
         let mut archive = Vec::new();
         write_oci_archive_to_writer_with_fallbacks(
             &mut archive,
             &store,
-            &StoredReference {
-                reference: "ghcr.io/acme/app:1.2.3".to_string(),
-                manifest,
-                config_digest: config.digest.clone(),
-            },
+            &stored_reference,
+            &inputs,
             Some(&fallback_paths),
         )
         .expect("archive should be written");
@@ -554,6 +571,98 @@ mod tests {
         assert!(
             entries.contains_key(&blob_tar_path(&diff_id).expect("layer path should build")),
             "materialized layer should be archived at its content digest path"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_manifest_media_type_defaults_to_oci_in_manifest_and_index() {
+        let dir = tempdir().expect("tempdir should create");
+        let store = Store::open(dir.path().to_path_buf())
+            .await
+            .expect("store should open");
+        let config_bytes = br#"{"rootfs":{"diff_ids":["sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]}}"#;
+        let config = Descriptor {
+            media_type: "application/vnd.oci.image.config.v1+json".into(),
+            digest: digest_bytes(config_bytes),
+            size: config_bytes.len() as i64,
+            platform: None,
+            annotations: None,
+        };
+        let layer_bytes = b"layer-bytes";
+        let layer = Descriptor {
+            media_type: "application/vnd.oci.image.layer.v1.tar".into(),
+            digest: digest_bytes(layer_bytes),
+            size: layer_bytes.len() as i64,
+            platform: None,
+            annotations: None,
+        };
+        let manifest_bytes = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "config": {
+                "mediaType": config.media_type,
+                "digest": config.digest,
+                "size": config.size
+            },
+            "layers": [{
+                "mediaType": layer.media_type,
+                "digest": layer.digest,
+                "size": layer.size
+            }]
+        }))
+        .expect("manifest bytes should serialize");
+        let manifest = Descriptor {
+            media_type: String::new(),
+            digest: digest_bytes(&manifest_bytes),
+            size: manifest_bytes.len() as i64,
+            platform: Some(Platform::parse("linux/amd64").expect("platform should parse")),
+            annotations: None,
+        };
+
+        store
+            .save_blob_bytes(&config, config_bytes)
+            .await
+            .expect("config should be saved");
+        store
+            .save_blob_bytes(&layer, layer_bytes)
+            .await
+            .expect("layer should be saved");
+        store
+            .save_blob_bytes(&manifest, &manifest_bytes)
+            .await
+            .expect("manifest should be saved");
+
+        let stored_reference = StoredReference {
+            reference: "ghcr.io/acme/app:1.2.3".to_string(),
+            manifest,
+            config_digest: config.digest.clone(),
+        };
+        let archive = write_test_archive_for_reference(&store, &stored_reference).await;
+        let index: Value = serde_json::from_slice(
+            archive
+                .entries
+                .get("index.json")
+                .expect("index.json should exist"),
+        )
+        .expect("index.json should parse");
+        let manifest_digest = index["manifests"][0]["digest"]
+            .as_str()
+            .expect("manifest digest should be present");
+        assert_eq!(
+            index["manifests"][0]["mediaType"],
+            OCI_IMAGE_MANIFEST_MEDIA_TYPE
+        );
+
+        let manifest_path = blob_tar_path(manifest_digest).expect("manifest path should build");
+        let rewritten_manifest: Value = serde_json::from_slice(
+            archive
+                .entries
+                .get(&manifest_path)
+                .expect("rewritten manifest should exist"),
+        )
+        .expect("rewritten manifest should parse");
+        assert_eq!(
+            rewritten_manifest["mediaType"],
+            OCI_IMAGE_MANIFEST_MEDIA_TYPE
         );
     }
 
@@ -619,21 +728,25 @@ mod tests {
             .await
             .expect("manifest should be saved");
 
+        let stored_reference = StoredReference {
+            reference: reference.to_string(),
+            manifest,
+            config_digest: config.digest.clone(),
+        };
+        write_test_archive_for_reference(&store, &stored_reference).await
+    }
+
+    async fn write_test_archive_for_reference(
+        store: &Store,
+        stored_reference: &StoredReference,
+    ) -> TestArchive {
         let mut archive = Vec::new();
-        write_oci_archive_to_writer(
-            &mut archive,
-            &store,
-            &StoredReference {
-                reference: reference.to_string(),
-                manifest,
-                config_digest: config.digest.clone(),
-            },
-        )
-        .await
-        .expect("archive should be written");
+        write_oci_archive_to_writer(&mut archive, store, stored_reference)
+            .await
+            .expect("archive should be written");
         TestArchive {
             entries: read_archive_entries(&archive),
-            config_digest: config.digest,
+            config_digest: stored_reference.config_digest.clone(),
         }
     }
 
