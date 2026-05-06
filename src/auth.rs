@@ -426,17 +426,17 @@ mod tests {
         let dir = tempdir().expect("tempdir should create");
         let lock = lock_docker_config_env();
         let previous = std::env::var_os("DOCKER_CONFIG");
-        let result = {
-            let guard = DockerConfigEnvGuard::new_with_lock(lock, dir.path());
+        let (result, restored) = {
+            let mut guard = DockerConfigEnvGuard::new_with_lock(lock, dir.path());
             let result = catch_unwind(AssertUnwindSafe(|| panic!("boom")));
-            drop(guard);
-            result
+            guard.restore();
+            let restored = std::env::var_os("DOCKER_CONFIG");
+            (result, restored)
         };
 
         assert!(result.is_err(), "closure panic should propagate");
         assert_eq!(
-            std::env::var_os("DOCKER_CONFIG"),
-            previous,
+            restored, previous,
             "DOCKER_CONFIG should be restored after panic"
         );
     }
