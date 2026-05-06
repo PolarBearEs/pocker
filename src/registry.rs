@@ -182,6 +182,16 @@ impl RegistryClient {
                     true,
                 )
                 .await?;
+            if response.status() == StatusCode::NOT_FOUND {
+                return Err(DockerPullError::ManifestNotFound);
+            }
+            if !response.status().is_success() {
+                return Err(DockerPullError::BadResponse(format!(
+                    "registry returned {} for manifest {}",
+                    response.status(),
+                    descriptor.digest
+                )));
+            }
             let body = response.bytes().await?.to_vec();
             let manifest: ImageManifest = serde_json::from_slice(&body)?;
             return Ok(ResolvedImage {
@@ -585,6 +595,7 @@ mod tests {
     use super::{DEFAULT_REQUEST_RETRIES, RegistryClient, token_cache_key};
     use crate::auth::AuthResolver;
     use crate::error::DockerPullError;
+    use crate::platform::Platform;
     use crate::reference::ImageReference;
 
     #[tokio::test]
@@ -648,5 +659,81 @@ mod tests {
             ImageReference::parse("docker.io/acme/app:latest").expect("reference should parse");
 
         assert_ne!(token_cache_key(&left), token_cache_key(&right));
+    }
+
+    #[tokio::test]
+    async fn missing_child_manifest_from_index_reports_manifest_not_found() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let address = listener.local_addr().expect("listener address");
+
+        let index_body = br#"{
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.index.v1+json",
+            "manifests": [
+                {
+                    "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                    "digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+                    "size": 123,
+                    "platform": {"os": "linux", "architecture": "amd64"}
+                }
+            ]
+        }"#;
+
+        let server = tokio::spawn(async move {
+            let (mut first, _) = listener
+                .accept()
+                .await
+                .expect("first connection should arrive");
+            let mut buffer = [0_u8; 4096];
+            let _ = first.read(&mut buffer).await;
+            first
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.oci.image.index.v1+json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        index_body.len(),
+                        std::str::from_utf8(index_body).expect("index body should be utf8"),
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .expect("index response should be written");
+
+            let (mut second, _) = listener
+                .accept()
+                .await
+                .expect("second connection should arrive");
+            let _ = second.read(&mut buffer).await;
+            second
+                .write_all(
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .expect("manifest response should be written");
+        });
+
+        let client = RegistryClient::new(
+            reqwest::Client::builder()
+                .https_only(false)
+                .build()
+                .expect("client should build"),
+            Arc::new(AuthResolver::new(None).expect("auth resolver should build")),
+            true,
+            DEFAULT_REQUEST_RETRIES,
+        );
+        let reference = ImageReference::parse(&format!("{address}/sample:latest"))
+            .expect("reference should parse");
+
+        let error = client
+            .resolve_image(
+                &reference,
+                &Platform::parse("linux/amd64").expect("platform should parse"),
+            )
+            .await
+            .expect_err("child manifest lookup should fail");
+        assert!(matches!(error, DockerPullError::ManifestNotFound));
+
+        server.await.expect("server task should finish");
     }
 }

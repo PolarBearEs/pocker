@@ -104,8 +104,28 @@ fn load_docker_config() -> Result<Option<DockerConfig>> {
         return Ok(None);
     }
 
-    let content = std::fs::read_to_string(path)?;
-    Ok(Some(serde_json::from_str(&content)?))
+    let content = match std::fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(error) => {
+            warn!(
+                "failed to read docker config at `{}`: {}; continuing without docker auth",
+                path.display(),
+                error
+            );
+            return Ok(None);
+        }
+    };
+    match serde_json::from_str(&content) {
+        Ok(config) => Ok(Some(config)),
+        Err(error) => {
+            warn!(
+                "failed to parse docker config at `{}`: {}; continuing without docker auth",
+                path.display(),
+                error
+            );
+            Ok(None)
+        }
+    }
 }
 
 fn docker_config_path() -> PathBuf {
@@ -244,12 +264,88 @@ fn docker_hub_aliases(registry: &str) -> impl Iterator<Item = &'static str> {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsString;
+    use std::fs;
+    use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
     #[cfg(unix)]
     use std::process::Command;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    use base64::Engine as _;
+    use tempfile::tempdir;
 
     #[cfg(unix)]
     use super::invoke_helper_command;
-    use super::registry_keys;
+    use super::{AuthResolver, Credentials, load_docker_config, registry_keys};
+
+    fn docker_config_env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn lock_docker_config_env() -> MutexGuard<'static, ()> {
+        docker_config_env_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    struct DockerConfigEnvGuard {
+        _lock: MutexGuard<'static, ()>,
+        previous: Option<OsString>,
+        restored: bool,
+    }
+
+    impl DockerConfigEnvGuard {
+        fn new(path: &std::path::Path) -> Self {
+            Self::new_with_lock(lock_docker_config_env(), path)
+        }
+
+        fn new_with_lock(lock: MutexGuard<'static, ()>, path: &std::path::Path) -> Self {
+            let previous = std::env::var_os("DOCKER_CONFIG");
+            unsafe {
+                std::env::set_var("DOCKER_CONFIG", path);
+            }
+            Self {
+                _lock: lock,
+                previous,
+                restored: false,
+            }
+        }
+
+        fn restore(&mut self) {
+            if self.restored {
+                return;
+            }
+            restore_docker_config_env(self.previous.as_deref());
+            self.restored = true;
+        }
+    }
+
+    impl Drop for DockerConfigEnvGuard {
+        fn drop(&mut self) {
+            self.restore();
+        }
+    }
+
+    fn restore_docker_config_env(previous: Option<&std::ffi::OsStr>) {
+        unsafe {
+            if let Some(previous) = previous {
+                std::env::set_var("DOCKER_CONFIG", previous);
+            } else {
+                std::env::remove_var("DOCKER_CONFIG");
+            }
+        }
+    }
+
+    fn with_docker_config_env<T>(path: &std::path::Path, run: impl FnOnce() -> T) -> T {
+        let guard = DockerConfigEnvGuard::new(path);
+        let result = catch_unwind(AssertUnwindSafe(run));
+        drop(guard);
+        match result {
+            Ok(value) => value,
+            Err(payload) => resume_unwind(payload),
+        }
+    }
 
     #[cfg(unix)]
     #[test]
@@ -278,6 +374,70 @@ mod tests {
                 "https://index.docker.io/v1/",
                 "docker.io",
             ]
+        );
+    }
+
+    #[test]
+    fn malformed_docker_config_falls_back_to_no_auth() {
+        let dir = tempdir().expect("tempdir should create");
+        fs::write(dir.path().join("config.json"), "{not-json").expect("config should be written");
+
+        let config = with_docker_config_env(dir.path(), || {
+            load_docker_config().expect("load should not fail on malformed config")
+        });
+
+        assert!(
+            config.is_none(),
+            "malformed docker config should be ignored"
+        );
+    }
+
+    #[test]
+    fn resolves_docker_hub_alias_auth_entry_from_config() {
+        let dir = tempdir().expect("tempdir should create");
+        let auth = base64::engine::general_purpose::STANDARD.encode("demo-user:demo-pass");
+        let config = format!(
+            r#"{{
+                "auths": {{
+                    "https://index.docker.io/v1/": {{
+                        "auth": "{auth}"
+                    }}
+                }}
+            }}"#
+        );
+        fs::write(dir.path().join("config.json"), config).expect("config should be written");
+
+        let credentials = with_docker_config_env(dir.path(), || {
+            AuthResolver::new(None)
+                .expect("resolver should build")
+                .resolve("registry-1.docker.io")
+                .expect("auth resolution should succeed")
+        });
+
+        assert!(matches!(
+            credentials,
+            Some(Credentials::Basic { username, password })
+                if username == "demo-user" && password == "demo-pass"
+        ));
+    }
+
+    #[test]
+    fn docker_config_env_is_restored_after_panic() {
+        let dir = tempdir().expect("tempdir should create");
+        let lock = lock_docker_config_env();
+        let previous = std::env::var_os("DOCKER_CONFIG");
+        let result = {
+            let guard = DockerConfigEnvGuard::new_with_lock(lock, dir.path());
+            let result = catch_unwind(AssertUnwindSafe(|| panic!("boom")));
+            drop(guard);
+            result
+        };
+
+        assert!(result.is_err(), "closure panic should propagate");
+        assert_eq!(
+            std::env::var_os("DOCKER_CONFIG"),
+            previous,
+            "DOCKER_CONFIG should be restored after panic"
         );
     }
 }
