@@ -258,7 +258,17 @@ fn docker_repositories(reference: &str, config_digest: &str) -> Result<Option<se
 
 #[cfg(test)]
 mod tests {
-    use super::oci_ref_name;
+    use std::collections::HashMap;
+    use std::io::{Cursor, Read};
+
+    use serde_json::Value;
+    use sha2::{Digest as _, Sha256};
+    use tempfile::tempdir;
+
+    use super::{oci_ref_name, write_oci_archive_to_writer};
+    use crate::platform::Platform;
+    use crate::registry::Descriptor;
+    use crate::store::{Store, StoredReference};
 
     #[test]
     fn oci_ref_name_uses_tag_only() {
@@ -271,5 +281,187 @@ mod tests {
         let ref_name =
             oci_ref_name("ghcr.io/acme/app@sha256:deadbeef").expect("reference should parse");
         assert!(ref_name.is_none());
+    }
+
+    #[tokio::test]
+    async fn tagged_archive_contains_expected_metadata_entries() {
+        let archive = write_test_archive("ghcr.io/acme/app:1.2.3").await;
+
+        let index: Value = serde_json::from_slice(
+            archive
+                .entries
+                .get("index.json")
+                .expect("index.json should exist"),
+        )
+        .expect("index.json should parse");
+        assert_eq!(
+            index["manifests"][0]["annotations"]["org.opencontainers.image.ref.name"],
+            "1.2.3"
+        );
+
+        let manifest: Value = serde_json::from_slice(
+            archive
+                .entries
+                .get("manifest.json")
+                .expect("manifest.json should exist"),
+        )
+        .expect("manifest.json should parse");
+        assert_eq!(
+            manifest[0]["RepoTags"],
+            serde_json::json!(["ghcr.io/acme/app:1.2.3"])
+        );
+
+        let repositories: Value = serde_json::from_slice(
+            archive
+                .entries
+                .get("repositories")
+                .expect("repositories should exist for tagged references"),
+        )
+        .expect("repositories should parse");
+        assert_eq!(
+            repositories,
+            serde_json::json!({
+                "ghcr.io/acme/app": {
+                    "1.2.3": archive.config_digest.strip_prefix("sha256:").expect("config digest should have prefix")
+                }
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn digest_archive_omits_tag_metadata_entries() {
+        let archive =
+            write_test_archive("ghcr.io/acme/app@sha256:1111111111111111111111111111111111111111111111111111111111111111")
+                .await;
+
+        let index: Value = serde_json::from_slice(
+            archive
+                .entries
+                .get("index.json")
+                .expect("index.json should exist"),
+        )
+        .expect("index.json should parse");
+        assert!(
+            index["manifests"][0]["annotations"]["org.opencontainers.image.ref.name"].is_null()
+        );
+
+        let manifest: Value = serde_json::from_slice(
+            archive
+                .entries
+                .get("manifest.json")
+                .expect("manifest.json should exist"),
+        )
+        .expect("manifest.json should parse");
+        assert_eq!(manifest[0]["RepoTags"], serde_json::json!([]));
+        assert!(
+            !archive.entries.contains_key("repositories"),
+            "digest references should not write repositories metadata"
+        );
+    }
+
+    struct TestArchive {
+        entries: HashMap<String, Vec<u8>>,
+        config_digest: String,
+    }
+
+    async fn write_test_archive(reference: &str) -> TestArchive {
+        let dir = tempdir().expect("tempdir should create");
+        let store = Store::open(dir.path().to_path_buf())
+            .await
+            .expect("store should open");
+        let config_bytes = br#"{"rootfs":{"diff_ids":["sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]}}"#;
+        let config = Descriptor {
+            media_type: "application/vnd.oci.image.config.v1+json".into(),
+            digest: digest_bytes(config_bytes),
+            size: config_bytes.len() as i64,
+            platform: None,
+            annotations: None,
+        };
+        let layer_bytes = b"layer-bytes";
+        let layer = Descriptor {
+            media_type: "application/vnd.oci.image.layer.v1.tar".into(),
+            digest: digest_bytes(layer_bytes),
+            size: layer_bytes.len() as i64,
+            platform: None,
+            annotations: None,
+        };
+        let manifest_bytes = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {
+                "mediaType": config.media_type,
+                "digest": config.digest,
+                "size": config.size
+            },
+            "layers": [{
+                "mediaType": layer.media_type,
+                "digest": layer.digest,
+                "size": layer.size
+            }]
+        }))
+        .expect("manifest bytes should serialize");
+        let manifest = Descriptor {
+            media_type: "application/vnd.oci.image.manifest.v1+json".into(),
+            digest: digest_bytes(&manifest_bytes),
+            size: manifest_bytes.len() as i64,
+            platform: Some(Platform::parse("linux/amd64").expect("platform should parse")),
+            annotations: None,
+        };
+
+        store
+            .save_blob_bytes(&config, config_bytes)
+            .await
+            .expect("config should be saved");
+        store
+            .save_blob_bytes(&layer, layer_bytes)
+            .await
+            .expect("layer should be saved");
+        store
+            .save_blob_bytes(&manifest, &manifest_bytes)
+            .await
+            .expect("manifest should be saved");
+
+        let mut archive = Vec::new();
+        write_oci_archive_to_writer(
+            &mut archive,
+            &store,
+            &StoredReference {
+                reference: reference.to_string(),
+                manifest,
+                config_digest: config.digest.clone(),
+            },
+        )
+        .await
+        .expect("archive should be written");
+        TestArchive {
+            entries: read_archive_entries(&archive),
+            config_digest: config.digest,
+        }
+    }
+
+    fn read_archive_entries(archive: &[u8]) -> HashMap<String, Vec<u8>> {
+        let mut entries = HashMap::new();
+        let cursor = Cursor::new(archive);
+        let mut tar = tar::Archive::new(cursor);
+        for entry in tar.entries().expect("archive entries should open") {
+            let mut entry = entry.expect("entry should read");
+            let path = entry
+                .path()
+                .expect("entry path should parse")
+                .to_string_lossy()
+                .into_owned();
+            let mut bytes = Vec::new();
+            entry
+                .read_to_end(&mut bytes)
+                .expect("entry bytes should read");
+            entries.insert(path, bytes);
+        }
+        entries
+    }
+
+    fn digest_bytes(bytes: &[u8]) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        format!("sha256:{}", hex::encode(hasher.finalize()))
     }
 }
