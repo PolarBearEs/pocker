@@ -269,7 +269,7 @@ mod tests {
     use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
     #[cfg(unix)]
     use std::process::Command;
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::{Mutex, MutexGuard, OnceLock};
 
     use base64::Engine as _;
     use tempfile::tempdir;
@@ -283,6 +283,12 @@ mod tests {
         LOCK.get_or_init(|| Mutex::new(()))
     }
 
+    fn lock_docker_config_env() -> MutexGuard<'static, ()> {
+        docker_config_env_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     fn restore_docker_config_env(previous: Option<OsString>) {
         unsafe {
             if let Some(previous) = previous {
@@ -293,21 +299,26 @@ mod tests {
         }
     }
 
-    fn with_docker_config_env<T>(path: &std::path::Path, run: impl FnOnce() -> T) -> T {
-        let lock = docker_config_env_lock()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+    fn with_docker_config_env_under_lock<T>(
+        _lock: &MutexGuard<'_, ()>,
+        path: &std::path::Path,
+        run: impl FnOnce() -> T,
+    ) -> T {
         let previous = std::env::var_os("DOCKER_CONFIG");
         unsafe {
             std::env::set_var("DOCKER_CONFIG", path);
         }
         let result = catch_unwind(AssertUnwindSafe(run));
         restore_docker_config_env(previous);
-        drop(lock);
         match result {
             Ok(value) => value,
             Err(payload) => resume_unwind(payload),
         }
+    }
+
+    fn with_docker_config_env<T>(path: &std::path::Path, run: impl FnOnce() -> T) -> T {
+        let lock = lock_docker_config_env();
+        with_docker_config_env_under_lock(&lock, path, run)
     }
 
     #[cfg(unix)]
@@ -387,10 +398,11 @@ mod tests {
     #[test]
     fn docker_config_env_is_restored_after_panic() {
         let dir = tempdir().expect("tempdir should create");
+        let lock = lock_docker_config_env();
         let previous = std::env::var_os("DOCKER_CONFIG");
 
         let result = catch_unwind(AssertUnwindSafe(|| {
-            with_docker_config_env(dir.path(), || panic!("boom"));
+            with_docker_config_env_under_lock(&lock, dir.path(), || panic!("boom"));
         }));
 
         assert!(result.is_err(), "closure panic should propagate");
