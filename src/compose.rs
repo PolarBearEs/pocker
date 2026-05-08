@@ -390,28 +390,48 @@ fn interpolate(text: &str, values: &HashMap<String, String>) -> Result<String> {
             output.push('$');
             continue;
         }
-        if next != '{' {
+        if next == '{' {
+            chars.next();
+            let mut expr = String::new();
+            let mut closed = false;
+            for (_, expr_ch) in chars.by_ref() {
+                if expr_ch == '}' {
+                    closed = true;
+                    break;
+                }
+                expr.push(expr_ch);
+            }
+            if !closed {
+                return Err(DockerPullError::InvalidInput(
+                    "unterminated compose variable interpolation".into(),
+                ));
+            }
+            output.push_str(&resolve_variable(&expr, values)?);
+            continue;
+        }
+        if !is_compose_variable_start(next) {
             output.push('$');
             continue;
         }
-        chars.next();
         let mut expr = String::new();
-        let mut closed = false;
-        for (_, expr_ch) in chars.by_ref() {
-            if expr_ch == '}' {
-                closed = true;
+        while let Some((_, var_ch)) = chars.peek().copied() {
+            if !is_compose_variable_char(var_ch) {
                 break;
             }
-            expr.push(expr_ch);
-        }
-        if !closed {
-            return Err(DockerPullError::InvalidInput(
-                "unterminated compose variable interpolation".into(),
-            ));
+            chars.next();
+            expr.push(var_ch);
         }
         output.push_str(&resolve_variable(&expr, values)?);
     }
     Ok(output)
+}
+
+fn is_compose_variable_start(ch: char) -> bool {
+    ch == '_' || ch.is_ascii_alphabetic()
+}
+
+fn is_compose_variable_char(ch: char) -> bool {
+    ch == '_' || ch.is_ascii_alphanumeric()
 }
 
 fn resolve_variable(expr: &str, values: &HashMap<String, String>) -> Result<String> {
@@ -640,11 +660,12 @@ pub fn select_services(resolved: &ComposeImages, services: &[String]) -> Result<
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::fs;
 
     use tempfile::tempdir;
 
-    use super::{resolve_images, select_services, unique_images};
+    use super::{interpolate, resolve_images, select_services, unique_images};
 
     #[test]
     fn resolves_default_file_extends_include_and_env() {
@@ -717,5 +738,25 @@ services:
         ]);
 
         assert_eq!(images, vec!["alpine:latest", "busybox:latest"]);
+    }
+
+    #[test]
+    fn interpolates_unbraced_compose_variables() {
+        let values = HashMap::from([
+            ("REGISTRY".to_string(), "example.com".to_string()),
+            ("IMAGE_TAG".to_string(), "1.2.3".to_string()),
+            ("EMPTY".to_string(), String::new()),
+        ]);
+
+        let interpolated = interpolate(
+            "image: $REGISTRY/app:$IMAGE_TAG\nfallback: ${EMPTY:-latest}\nescaped: $$IMAGE_TAG\nliteral: $-",
+            &values,
+        )
+        .expect("compose interpolation should succeed");
+
+        assert_eq!(
+            interpolated,
+            "image: example.com/app:1.2.3\nfallback: latest\nescaped: $IMAGE_TAG\nliteral: $-"
+        );
     }
 }

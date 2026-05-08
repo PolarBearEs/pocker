@@ -65,7 +65,7 @@ EOF
 cat > "${WORKDIR}/compose/compose.base.yml" <<'EOF'
 services:
   base:
-    image: ${PAUSE_REF}
+    image: $PAUSE_REF
 EOF
 cat > "${WORKDIR}/compose/compose.include.yml" <<'EOF'
 services:
