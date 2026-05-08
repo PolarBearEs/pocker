@@ -3,6 +3,10 @@ name = "pocker"
 version = "0.1.3"
 edition = "2024"
 
+[workspace]
+members = ["crates/pocker-compose"]
+resolver = "3"
+
 [dependencies]
 base64 = "0.22.1"
 clap = { version = "4.6.1", features = ["derive"] }
@@ -13,10 +17,10 @@ http = "1.3.1"
 httpdate = "1.0.3"
 indicatif = "0.17.11"
 percent-encoding = "2.3.2"
+pocker-compose = { path = "crates/pocker-compose" }
 reqwest = { version = "0.12.24", default-features = false, features = ["json", "rustls-tls", "stream"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
-serde_yml = "0.0.12"
 sha2 = "0.10.9"
 tar = "0.4.44"
 tempfile = "3.23.0"

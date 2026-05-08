@@ -45,7 +45,7 @@ pub enum DockerPullError {
     #[error(transparent)]
     Json(#[from] serde_json::Error),
     #[error(transparent)]
-    Yaml(#[from] serde_yml::Error),
+    Compose(#[from] pocker_compose::ComposeError),
     #[error(transparent)]
     Url(#[from] url::ParseError),
     #[error(transparent)]

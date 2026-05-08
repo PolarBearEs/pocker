@@ -4,7 +4,17 @@ use std::path::{Path, PathBuf};
 
 use serde_yml::{Mapping, Value};
 
-use crate::error::{DockerPullError, Result};
+pub type Result<T> = std::result::Result<T, ComposeError>;
+
+#[derive(Debug, thiserror::Error)]
+pub enum ComposeError {
+    #[error("{0}")]
+    InvalidInput(String),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Yaml(#[from] serde_yml::Error),
+}
 
 const DEFAULT_COMPOSE_FILES: [&str; 4] = [
     "compose.yaml",
@@ -165,14 +175,14 @@ impl ComposeProject {
         }
 
         let text = std::fs::read_to_string(&file).map_err(|error| {
-            DockerPullError::InvalidInput(format!(
+            ComposeError::InvalidInput(format!(
                 "failed to read compose file `{}`: {error}",
                 file.display()
             ))
         })?;
         let text = interpolate(&text, &self.env)?;
         let value: Value = serde_yml::from_str(&text).map_err(|error| {
-            DockerPullError::InvalidInput(format!(
+            ComposeError::InvalidInput(format!(
                 "failed to parse compose file `{}`: {error}",
                 file.display()
             ))
@@ -207,10 +217,7 @@ impl ComposeProject {
 
     fn document(&self, file: &Path) -> Result<&ComposeDocument> {
         self.documents.get(file).ok_or_else(|| {
-            DockerPullError::InvalidInput(format!(
-                "compose file `{}` was not loaded",
-                file.display()
-            ))
+            ComposeError::InvalidInput(format!("compose file `{}` was not loaded", file.display()))
         })
     }
 
@@ -234,7 +241,7 @@ impl ComposeProject {
             .find(|service| service.name == key.name)
             .cloned()
             .ok_or_else(|| {
-                DockerPullError::InvalidInput(format!(
+                ComposeError::InvalidInput(format!(
                     "compose service `{}` not found in `{}`",
                     key.name,
                     key.file.display()
@@ -244,7 +251,7 @@ impl ComposeProject {
 
     fn resolve_service(&self, key: &ServiceKey, stack: &mut Vec<ServiceKey>) -> Result<Value> {
         if stack.contains(key) {
-            return Err(DockerPullError::InvalidInput(format!(
+            return Err(ComposeError::InvalidInput(format!(
                 "compose extends cycle at service `{}`",
                 key.name
             )));
@@ -318,7 +325,7 @@ fn find_default_compose_file(working_dir: &Path) -> Result<PathBuf> {
             return normalize_path(&candidate);
         }
     }
-    Err(DockerPullError::InvalidInput(format!(
+    Err(ComposeError::InvalidInput(format!(
         "no compose file found in `{}`",
         working_dir.display()
     )))
@@ -334,7 +341,7 @@ fn absolutize(base: &Path, file: &Path) -> PathBuf {
 
 fn normalize_path(path: &Path) -> Result<PathBuf> {
     path.canonicalize().map_err(|error| {
-        DockerPullError::InvalidInput(format!(
+        ComposeError::InvalidInput(format!(
             "failed to resolve compose path `{}`: {error}",
             path.display()
         ))
@@ -402,7 +409,7 @@ fn interpolate(text: &str, values: &HashMap<String, String>) -> Result<String> {
                 expr.push(expr_ch);
             }
             if !closed {
-                return Err(DockerPullError::InvalidInput(
+                return Err(ComposeError::InvalidInput(
                     "unterminated compose variable interpolation".into(),
                 ));
             }
@@ -456,10 +463,10 @@ fn resolve_variable_with_operator(
     match operator {
         ":-" if !non_empty => Ok(extra.to_string()),
         "-" if !set => Ok(extra.to_string()),
-        ":?" if !non_empty => Err(DockerPullError::InvalidInput(format!(
+        ":?" if !non_empty => Err(ComposeError::InvalidInput(format!(
             "compose variable `{name}` is required: {extra}"
         ))),
-        "?" if !set => Err(DockerPullError::InvalidInput(format!(
+        "?" if !set => Err(ComposeError::InvalidInput(format!(
             "compose variable `{name}` is required: {extra}"
         ))),
         ":+" if non_empty => Ok(extra.to_string()),
@@ -628,7 +635,7 @@ pub fn select_services(resolved: &ComposeImages, services: &[String]) -> Result<
         }
     }
     if !unknown.is_empty() {
-        return Err(DockerPullError::InvalidInput(format!(
+        return Err(ComposeError::InvalidInput(format!(
             "compose service(s) not found: {}",
             unknown.join(", ")
         )));

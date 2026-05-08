@@ -1,6 +1,5 @@
 mod auth;
 mod cli;
-mod compose;
 mod docker;
 mod error;
 mod export;
@@ -24,6 +23,7 @@ use cli::{CacheCommands, Cli, Commands, ComposeCommands, ImageCommands};
 use error::{DockerPullError, Result};
 use http::build_http_client;
 use platform::Platform;
+use pocker_compose as compose;
 use pull::{PullContext, PullOptions, Puller};
 use registry::RegistryClient;
 use store::Store;

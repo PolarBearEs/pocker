@@ -877,10 +877,10 @@ dependencies = [
  "httpdate",
  "indicatif",
  "percent-encoding",
+ "pocker-compose",
  "reqwest",
  "serde",
  "serde_json",
- "serde_yml",
  "sha2",
  "tar",
  "tempfile",
@@ -890,6 +890,15 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+]
+
+[[package]]
+name = "pocker-compose"
+version = "0.1.3"
+dependencies = [
+ "serde_yml",
+ "tempfile",
+ "thiserror",
 ]
 
 [[package]]
