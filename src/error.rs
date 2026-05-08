@@ -45,6 +45,8 @@ pub enum DockerPullError {
     #[error(transparent)]
     Json(#[from] serde_json::Error),
     #[error(transparent)]
+    Yaml(#[from] serde_yaml::Error),
+    #[error(transparent)]
     Url(#[from] url::ParseError),
     #[error(transparent)]
     Header(#[from] http::header::ToStrError),

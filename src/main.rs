@@ -1,5 +1,6 @@
 mod auth;
 mod cli;
+mod compose;
 mod docker;
 mod error;
 mod export;
@@ -12,6 +13,7 @@ mod registry;
 mod store;
 mod ui;
 
+use std::io::IsTerminal;
 use std::io::Read;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -19,15 +21,43 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use auth::{AuthResolver, Credentials};
 use clap::Parser;
-use cli::{CacheCommands, Cli, Commands, ImageCommands};
+use cli::{CacheCommands, Cli, Commands, ComposeCommands, ImageCommands};
 use error::{DockerPullError, Result};
 use http::build_http_client;
 use platform::Platform;
 use pull::{PullContext, PullOptions, Puller};
 use registry::RegistryClient;
 use store::Store;
+use tokio::task::JoinSet;
 use tracing_subscriber::EnvFilter;
-use ui::Ui;
+use ui::{Ui, UiGroup};
+
+struct PullRequestOptions {
+    platform: Option<String>,
+    concurrency: usize,
+    image_concurrency: usize,
+    blob_retries: u32,
+    request_retries: u32,
+    no_load: bool,
+    keep_layer_blobs: bool,
+    plain_http: bool,
+    insecure_skip_tls_verify: bool,
+    ca_file: Option<std::path::PathBuf>,
+    username: Option<String>,
+    password_stdin: bool,
+    quiet: bool,
+    no_animations: bool,
+}
+
+#[derive(Clone)]
+struct SharedPullState {
+    store: Arc<Store>,
+    registry: Arc<RegistryClient>,
+    stop: Arc<AtomicBool>,
+    blob_retry_limit: u32,
+    options: PullOptions,
+    ui_group: UiGroup,
+}
 
 #[tokio::main]
 async fn main() {
@@ -44,58 +74,67 @@ async fn run() -> Result<()> {
 
     match cli.command {
         Commands::Pull(args) => {
-            let cache_dir = cli.global.cache_dir.clone();
-            let store = Arc::new(Store::open(cache_dir).await?);
-            let reference = reference::ImageReference::parse(&args.reference)?;
-            let quiet = cli.global.quiet || args.quiet;
-            let platform = args
-                .platform
-                .as_deref()
-                .map(Platform::parse)
-                .transpose()?
-                .unwrap_or_else(Platform::host);
-            let ui = Arc::new(Ui::new(quiet, !args.no_animations));
-            let password = if args.password_stdin {
-                Some(read_password_stdin()?)
-            } else {
-                None
-            };
-            let credentials = match (args.username, password) {
-                (Some(username), Some(password)) => Some(Credentials::Basic { username, password }),
-                (None, None) => None,
-                _ => {
-                    return Err(DockerPullError::InvalidInput(
-                        "`--username` requires `--password-stdin`".into(),
-                    ));
-                }
-            };
-            let auth = Arc::new(AuthResolver::new(credentials)?);
-            let client = Arc::new(RegistryClient::new(
-                build_http_client(
-                    args.plain_http,
-                    args.insecure_skip_tls_verify,
-                    args.ca_file.as_deref(),
-                )?,
-                auth,
-                args.plain_http,
-                args.request_retries,
-            ));
-            let stop = install_signal_handler();
-            let options = PullOptions {
-                platform,
-                concurrency: args.concurrency.max(1),
+            let request = PullRequestOptions {
+                platform: args.platform,
+                concurrency: args.concurrency,
+                image_concurrency: 1,
+                blob_retries: args.blob_retries,
+                request_retries: args.request_retries,
                 no_load: args.no_load,
                 keep_layer_blobs: args.keep_layer_blobs,
+                plain_http: args.plain_http,
+                insecure_skip_tls_verify: args.insecure_skip_tls_verify,
+                ca_file: args.ca_file,
+                username: args.username,
+                password_stdin: args.password_stdin,
+                quiet: args.quiet,
+                no_animations: args.no_animations,
             };
-            let context = PullContext {
-                store,
-                registry: client,
-                stop,
-                ui,
-                blob_retry_limit: args.blob_retries,
-            };
-            Puller::new(context).pull(reference, options).await?;
+            pull_references(
+                &cli.global.cache_dir,
+                cli.global.quiet,
+                vec![args.reference],
+                request,
+            )
+            .await?;
         }
+        Commands::Compose(args) => match args.command {
+            ComposeCommands::Config(config_args) => {
+                let resolved = compose::resolve_images(&args.file, &std::env::current_dir()?)?;
+                let resolved = compose::select_services(&resolved, &config_args.services)?;
+                print_compose_config(&resolved, config_args.images, config_args.services_only);
+            }
+            ComposeCommands::Pull(pull_args) => {
+                let resolved = compose::resolve_images(&args.file, &std::env::current_dir()?)?;
+                let resolved = compose::select_services(&resolved, &pull_args.services)?;
+                if !(resolved.skipped_build_only.is_empty() || cli.global.quiet || pull_args.quiet)
+                {
+                    eprintln!(
+                        "warning: skipping build-only compose services without image: {}",
+                        resolved.skipped_build_only.join(", ")
+                    );
+                }
+                print_compose_pull_plan(&resolved, cli.global.quiet || pull_args.quiet);
+                let images = compose::unique_images(&resolved.images);
+                let request = PullRequestOptions {
+                    platform: pull_args.platform,
+                    concurrency: pull_args.concurrency,
+                    image_concurrency: pull_args.image_concurrency,
+                    blob_retries: pull_args.blob_retries,
+                    request_retries: pull_args.request_retries,
+                    no_load: pull_args.no_load,
+                    keep_layer_blobs: pull_args.keep_layer_blobs,
+                    plain_http: pull_args.plain_http,
+                    insecure_skip_tls_verify: pull_args.insecure_skip_tls_verify,
+                    ca_file: pull_args.ca_file,
+                    username: pull_args.username,
+                    password_stdin: pull_args.password_stdin,
+                    quiet: pull_args.quiet,
+                    no_animations: true,
+                };
+                pull_references(&cli.global.cache_dir, cli.global.quiet, images, request).await?;
+            }
+        },
         Commands::Cache(args) => {
             let store = Store::open(cli.global.cache_dir.clone()).await?;
             match args.command {
@@ -113,6 +152,221 @@ async fn run() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn print_compose_config(resolved: &compose::ComposeImages, images: bool, services_only: bool) {
+    if images {
+        for image in &resolved.images {
+            println!("{image}");
+        }
+        return;
+    }
+
+    if services_only {
+        for service in &resolved.services {
+            println!("{}", service.service);
+        }
+        return;
+    }
+
+    print_compose_pull_plan(resolved, false);
+}
+
+fn print_compose_pull_plan(resolved: &compose::ComposeImages, quiet: bool) {
+    if quiet {
+        return;
+    }
+
+    let images = compose::unique_images(&resolved.images);
+    eprintln!(
+        "{} {} service(s), {} unique image(s)",
+        color("Compose pull plan:", Color::Cyan),
+        resolved.services.len(),
+        images.len()
+    );
+
+    let mut first_service_by_image = std::collections::HashMap::new();
+    for service in &resolved.services {
+        if let Some(image) = &service.image {
+            if let Some(first_service) = first_service_by_image.get(image) {
+                eprintln!(
+                    "  {} {} {} {}",
+                    color(&service.service, Color::Green),
+                    color("->", Color::Dim),
+                    image,
+                    color(&format!("(shared with {first_service})"), Color::Dim)
+                );
+            } else {
+                first_service_by_image.insert(image.clone(), service.service.clone());
+                eprintln!(
+                    "  {} {} {}",
+                    color(&service.service, Color::Green),
+                    color("->", Color::Dim),
+                    image
+                );
+            }
+        } else if service.build_only {
+            eprintln!(
+                "  {} {} {}",
+                color(&service.service, Color::Green),
+                color("->", Color::Dim),
+                color("build-only (skipped)", Color::Yellow)
+            );
+        }
+    }
+}
+
+#[derive(Copy, Clone)]
+enum Color {
+    Green,
+    Yellow,
+    Cyan,
+    Dim,
+}
+
+fn color(value: &str, color: Color) -> String {
+    if !should_color_stderr() {
+        return value.to_string();
+    }
+    let code = match color {
+        Color::Green => "32",
+        Color::Yellow => "33",
+        Color::Cyan => "36",
+        Color::Dim => "2",
+    };
+    format!("\x1b[{code}m{value}\x1b[0m")
+}
+
+fn should_color_stderr() -> bool {
+    std::io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none()
+}
+
+async fn pull_references(
+    cache_dir: &std::path::Path,
+    global_quiet: bool,
+    references: Vec<String>,
+    request: PullRequestOptions,
+) -> Result<()> {
+    let store = Arc::new(Store::open(cache_dir.to_path_buf()).await?);
+    let quiet = global_quiet || request.quiet;
+    let platform = request
+        .platform
+        .as_deref()
+        .map(Platform::parse)
+        .transpose()?
+        .unwrap_or_else(Platform::host);
+    let ui = Arc::new(Ui::new(quiet, !request.no_animations));
+    let password = if request.password_stdin {
+        Some(read_password_stdin()?)
+    } else {
+        None
+    };
+    let credentials = match (request.username, password) {
+        (Some(username), Some(password)) => Some(Credentials::Basic { username, password }),
+        (None, None) => None,
+        _ => {
+            return Err(DockerPullError::InvalidInput(
+                "`--username` requires `--password-stdin`".into(),
+            ));
+        }
+    };
+    let auth = Arc::new(AuthResolver::new(credentials)?);
+    let client = Arc::new(RegistryClient::new(
+        build_http_client(
+            request.plain_http,
+            request.insecure_skip_tls_verify,
+            request.ca_file.as_deref(),
+        )?,
+        auth,
+        request.plain_http,
+        request.request_retries,
+    ));
+    let stop = install_signal_handler();
+    let options = PullOptions {
+        platform,
+        concurrency: request.concurrency.max(1),
+        no_load: request.no_load,
+        keep_layer_blobs: request.keep_layer_blobs,
+    };
+
+    if references.len() <= 1 || request.image_concurrency <= 1 {
+        let context = PullContext {
+            store,
+            registry: client,
+            stop,
+            ui,
+            blob_retry_limit: request.blob_retries,
+        };
+        let puller = Puller::new(context);
+        for reference in references {
+            let reference = reference::ImageReference::parse(&reference)?;
+            puller.pull(reference, options.clone()).await?;
+        }
+        return Ok(());
+    }
+
+    let state = SharedPullState {
+        store,
+        registry: client,
+        stop,
+        blob_retry_limit: request.blob_retries,
+        options,
+        ui_group: UiGroup::new(quiet, false),
+    };
+    pull_references_parallel(state, references, request.image_concurrency.max(1)).await
+}
+
+async fn pull_references_parallel(
+    state: SharedPullState,
+    references: Vec<String>,
+    image_concurrency: usize,
+) -> Result<()> {
+    let mut pending = references.into_iter();
+    let mut queue = JoinSet::new();
+
+    while queue.len() < image_concurrency {
+        let Some(reference) = pending.next() else {
+            break;
+        };
+        spawn_pull_task(&mut queue, state.clone(), reference);
+    }
+
+    while let Some(result) = queue.join_next().await {
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                queue.abort_all();
+                return Err(error);
+            }
+            Err(error) => {
+                queue.abort_all();
+                return Err(DockerPullError::CommandFailed(format!(
+                    "compose pull task failed: {error}"
+                )));
+            }
+        }
+
+        if let Some(reference) = pending.next() {
+            spawn_pull_task(&mut queue, state.clone(), reference);
+        }
+    }
+
+    Ok(())
+}
+
+fn spawn_pull_task(queue: &mut JoinSet<Result<()>>, state: SharedPullState, reference: String) {
+    queue.spawn(async move {
+        let reference = reference::ImageReference::parse(&reference)?;
+        let label = reference.display_name();
+        let context = PullContext {
+            store: state.store,
+            registry: state.registry,
+            stop: state.stop,
+            ui: Arc::new(state.ui_group.image_ui(label)),
+            blob_retry_limit: state.blob_retry_limit,
+        };
+        Puller::new(context).pull(reference, state.options).await
+    });
 }
 
 fn init_tracing() {
