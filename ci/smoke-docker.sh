@@ -57,6 +57,66 @@ run_pocker --cache-dir "${WORKDIR}/cache-public" pull "${PUBLIC_REF}"
 docker image inspect "${PUBLIC_REF}" >/dev/null
 run_pocker image inspect "${PUBLIC_REF}" >/dev/null
 
+echo "smoke: compose config and service-filtered pull"
+mkdir -p "${WORKDIR}/compose"
+cat > "${WORKDIR}/compose/.env" <<EOF
+PAUSE_REF=${PUBLIC_REF}
+EOF
+cat > "${WORKDIR}/compose/compose.base.yml" <<'EOF'
+services:
+  base:
+    image: ${PAUSE_REF}
+EOF
+cat > "${WORKDIR}/compose/compose.include.yml" <<'EOF'
+services:
+  included:
+    image: ${PAUSE_REF}
+EOF
+cat > "${WORKDIR}/compose/custom-compose.yml" <<'EOF'
+include:
+  - compose.include.yml
+
+services:
+  target:
+    extends:
+      file: compose.base.yml
+      service: base
+
+  duplicate:
+    extends:
+      service: target
+
+  build_only:
+    build: .
+EOF
+
+COMPOSE_FILE="${WORKDIR}/compose/custom-compose.yml"
+CONFIG_IMAGES_OUTPUT="$(run_pocker compose -f "${COMPOSE_FILE}" config --images target)"
+if [[ "${CONFIG_IMAGES_OUTPUT}" != "${PUBLIC_REF}" ]]; then
+  echo "unexpected compose config --images output: ${CONFIG_IMAGES_OUTPUT}" >&2
+  exit 1
+fi
+CONFIG_SERVICES_OUTPUT="$(run_pocker compose -f "${COMPOSE_FILE}" config --services target)"
+if [[ "${CONFIG_SERVICES_OUTPUT}" != "target" ]]; then
+  echo "unexpected compose config --services output: ${CONFIG_SERVICES_OUTPUT}" >&2
+  exit 1
+fi
+set +e
+UNKNOWN_OUTPUT="$(run_pocker compose -f "${COMPOSE_FILE}" config --images missing 2>&1)"
+UNKNOWN_STATUS=$?
+set -e
+if [[ "${UNKNOWN_STATUS}" -eq 0 ]]; then
+  echo "expected unknown compose service to fail" >&2
+  exit 1
+fi
+grep -q "compose service(s) not found: missing" <<<"${UNKNOWN_OUTPUT}" || {
+  echo "missing unknown compose service error" >&2
+  echo "${UNKNOWN_OUTPUT}" >&2
+  exit 1
+}
+run_pocker --cache-dir "${WORKDIR}/cache-compose" compose -f "${COMPOSE_FILE}" pull --no-load target
+find "${WORKDIR}/cache-compose/blobs/sha256" -type f | grep -q .
+
 echo "smoke: multi-platform pull selects linux/arm64 config"
 run_pocker --cache-dir "${WORKDIR}/cache-platform" pull --no-load --platform linux/arm64 "${PUBLIC_REF}"
 python3 - "${WORKDIR}/cache-platform" <<'PY'
