@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::env;
 use std::path::{Path, PathBuf};
 
-use serde_yaml::{Mapping, Value};
+use serde_yml::{Mapping, Value};
 
 use crate::error::{DockerPullError, Result};
 
@@ -38,6 +38,7 @@ struct ComposeProject {
 #[derive(Debug)]
 struct ComposeDocument {
     services: Vec<Service>,
+    includes: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -117,6 +118,7 @@ pub fn resolve_images(files: &[PathBuf], working_dir: &Path) -> Result<ComposeIm
         synthetic_file.clone(),
         ComposeDocument {
             services: merged_services,
+            includes: Vec::new(),
         },
     );
 
@@ -169,7 +171,7 @@ impl ComposeProject {
             ))
         })?;
         let text = interpolate(&text, &self.env)?;
-        let value: Value = serde_yaml::from_str(&text).map_err(|error| {
+        let value: Value = serde_yml::from_str(&text).map_err(|error| {
             DockerPullError::InvalidInput(format!(
                 "failed to parse compose file `{}`: {error}",
                 file.display()
@@ -180,11 +182,17 @@ impl ComposeProject {
             file.clone(),
             ComposeDocument {
                 services: collect_services(&value, &file),
+                includes: collect_includes(&value)
+                    .into_iter()
+                    .map(|include| {
+                        absolutize(file.parent().unwrap_or_else(|| Path::new(".")), &include)
+                    })
+                    .map(|include| normalize_path(&include))
+                    .collect::<Result<Vec<_>>>()?,
             },
         );
 
-        for include in collect_includes(&value) {
-            let include = absolutize(file.parent().unwrap_or_else(|| Path::new(".")), &include);
+        for include in self.document(&file)?.includes.clone() {
             self.load_document(&include)?;
         }
         for extends_file in collect_extends_files(&value) {
@@ -207,29 +215,13 @@ impl ComposeProject {
     }
 
     fn collect_include_files(&self, file: &Path, output: &mut Vec<PathBuf>) -> Result<()> {
-        let text = std::fs::read_to_string(file).map_err(|error| {
-            DockerPullError::InvalidInput(format!(
-                "failed to read compose file `{}`: {error}",
-                file.display()
-            ))
-        })?;
-        let text = interpolate(&text, &self.env)?;
-        let value: Value = serde_yaml::from_str(&text).map_err(|error| {
-            DockerPullError::InvalidInput(format!(
-                "failed to parse compose file `{}`: {error}",
-                file.display()
-            ))
-        })?;
-        for include in collect_includes(&value) {
-            let include = normalize_path(&absolutize(
-                file.parent().unwrap_or_else(|| Path::new(".")),
-                &include,
-            ))?;
-            if output.contains(&include) {
+        let document = self.document(file)?;
+        for include in &document.includes {
+            if output.contains(include) {
                 continue;
             }
             output.push(include.clone());
-            self.collect_include_files(&include, output)?;
+            self.collect_include_files(include, output)?;
         }
         Ok(())
     }

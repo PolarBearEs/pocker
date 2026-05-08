@@ -13,7 +13,6 @@ mod registry;
 mod store;
 mod ui;
 
-use std::io::IsTerminal;
 use std::io::Read;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -225,7 +224,7 @@ enum Color {
 }
 
 fn color(value: &str, color: Color) -> String {
-    if !should_color_stderr() {
+    if !ui::should_color_stderr() {
         return value.to_string();
     }
     let code = match color {
@@ -235,10 +234,6 @@ fn color(value: &str, color: Color) -> String {
         Color::Dim => "2",
     };
     format!("\x1b[{code}m{value}\x1b[0m")
-}
-
-fn should_color_stderr() -> bool {
-    std::io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none()
 }
 
 async fn pull_references(

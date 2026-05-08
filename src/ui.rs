@@ -595,7 +595,7 @@ fn success_color(value: &str) -> String {
     }
 }
 
-fn should_color_stderr() -> bool {
+pub(crate) fn should_color_stderr() -> bool {
     std::io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none()
 }
 
