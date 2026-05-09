@@ -8,6 +8,7 @@ It pulls images directly from registries, resumes interrupted downloads from a l
 
 - Resumable layer downloads
 - Docker credential helper and `config.json` auth support
+- Native Docker Compose image discovery and pull support
 - Docker image list, inspect, save, and load commands
 - Configurable retry behavior for retryable registry failures
 
@@ -68,6 +69,26 @@ printf '%s' "$REGISTRY_PASSWORD" | \
     ghcr.io/example/private-image:latest
 ```
 
+Inspect images referenced by a Compose project:
+
+```bash
+pocker compose config --images
+pocker compose -f docker-compose.prod.yml config --images api worker
+```
+
+Pull Compose service images:
+
+```bash
+pocker compose pull
+pocker compose -f docker-compose.prod.yml pull api worker
+```
+
+Pull more than one Compose image at a time:
+
+```bash
+pocker compose pull --max-parallel-images 4
+```
+
 Docker image helpers:
 
 ```bash
@@ -84,6 +105,7 @@ See full help:
 pocker --help
 pocker cache --help
 pocker pull --help
+pocker compose --help
 pocker image --help
 ```
 
@@ -96,6 +118,10 @@ pocker image --help
 - Use `--blob-retries` to raise the retry budget for unstable connections; `0` means unlimited retries
 - Use `--request-retries` to raise the retry budget for request/connect/503-style failures; `0` means unlimited retries
 - Registry retries are bounded by default; setting a retry flag to `0` makes that retry path unlimited
+- `pocker compose` parses Compose files itself and does not require the Docker Compose CLI
+- Compose file selection supports default compose file discovery and repeated `-f/--file`
+- Compose image discovery supports service `image`, `.env` interpolation, `include`, and `extends`; build-only services are reported as skipped because there is no registry image to pull
+- `pocker compose pull [SERVICE]...` pulls only the selected services when service names are provided
 
 ## Support Matrix
 
