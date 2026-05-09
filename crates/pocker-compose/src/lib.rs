@@ -442,7 +442,7 @@ fn is_compose_variable_char(ch: char) -> bool {
 }
 
 fn resolve_variable(expr: &str, values: &HashMap<String, String>) -> Result<String> {
-    let operators = [":-", "-", ":?", "?", ":+", "+"];
+    let operators = [":?", "?", ":-", ":+", "-", "+"];
     for operator in operators {
         if let Some((name, extra)) = expr.split_once(operator) {
             return resolve_variable_with_operator(name, operator, extra, values);
@@ -672,7 +672,7 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::{interpolate, resolve_images, select_services, unique_images};
+    use super::{ComposeError, interpolate, resolve_images, select_services, unique_images};
 
     #[test]
     fn resolves_default_file_extends_include_and_env() {
@@ -765,5 +765,17 @@ services:
             interpolated,
             "image: example.com/app:1.2.3\nfallback: latest\nescaped: $IMAGE_TAG\nliteral: $-"
         );
+    }
+
+    #[test]
+    fn required_variable_operator_wins_over_dash_in_message() {
+        let error = interpolate("${REQUIRED?-must be set}", &HashMap::new())
+            .expect_err("required operator should fail when variable is unset");
+
+        assert!(matches!(
+            error,
+            ComposeError::InvalidInput(message)
+                if message == "compose variable `REQUIRED` is required: -must be set"
+        ));
     }
 }

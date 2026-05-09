@@ -155,7 +155,7 @@ async fn run() -> Result<()> {
 
 fn print_compose_config(resolved: &compose::ComposeImages, images: bool, services_only: bool) {
     if images {
-        for image in &resolved.images {
+        for image in &compose::unique_images(&resolved.images) {
             println!("{image}");
         }
         return;

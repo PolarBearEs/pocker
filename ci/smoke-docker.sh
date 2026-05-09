@@ -101,6 +101,11 @@ if [[ "${CONFIG_SERVICES_OUTPUT}" != "target" ]]; then
   echo "unexpected compose config --services output: ${CONFIG_SERVICES_OUTPUT}" >&2
   exit 1
 fi
+CONFIG_ALL_IMAGES_OUTPUT="$(run_pocker compose -f "${COMPOSE_FILE}" config --images)"
+if [[ "${CONFIG_ALL_IMAGES_OUTPUT}" != "${PUBLIC_REF}" ]]; then
+  echo "unexpected deduped compose config --images output: ${CONFIG_ALL_IMAGES_OUTPUT}" >&2
+  exit 1
+fi
 set +e
 UNKNOWN_OUTPUT="$(run_pocker compose -f "${COMPOSE_FILE}" config --images missing 2>&1)"
 UNKNOWN_STATUS=$?
