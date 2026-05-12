@@ -8,8 +8,9 @@ use futures_util::stream::{FuturesUnordered, StreamExt};
 use crate::docker;
 use crate::error::{DockerPullError, Result};
 use crate::image::pair_layers;
+use crate::local_registry;
 use crate::platform::Platform;
-use crate::reference::ImageReference;
+use crate::reference::{ImageReference, ReferenceTarget};
 use crate::registry::{Descriptor, RegistryClient};
 use crate::store::{Store, StoredReference};
 use crate::ui::Ui;
@@ -31,6 +32,13 @@ pub struct PullOptions {
     pub concurrency: usize,
     pub no_load: bool,
     pub keep_layer_blobs: bool,
+    pub load_mode: LoadMode,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum LoadMode {
+    Stream,
+    Registry,
 }
 
 #[derive(Clone)]
@@ -176,7 +184,14 @@ async fn finalize_reference(
         }
     } else {
         context.ui.begin_load(normalized);
-        docker::load_reference_archive_stream(&context.store, stored_reference).await?;
+        match options.load_mode {
+            LoadMode::Stream => {
+                docker::load_reference_archive_stream(&context.store, stored_reference).await?;
+            }
+            LoadMode::Registry => {
+                load_reference_through_local_registry(context, reference, stored_reference).await?;
+            }
+        }
         if !options.keep_layer_blobs {
             context.ui.set_image_status(normalized, "Pruning cache");
             context
@@ -193,5 +208,25 @@ async fn finalize_reference(
             "Ready"
         },
     );
+    Ok(())
+}
+
+async fn load_reference_through_local_registry(
+    context: &PullContext,
+    reference: &ImageReference,
+    stored_reference: &StoredReference,
+) -> Result<()> {
+    if matches!(reference.target, ReferenceTarget::Digest(_)) {
+        docker::load_reference_archive_stream(&context.store, stored_reference).await?;
+        return Ok(());
+    }
+
+    let registry =
+        local_registry::LocalRegistry::start(context.store.clone(), stored_reference.clone())
+            .await?;
+    let synthetic = registry.synthetic_reference();
+    docker::pull_image(&synthetic).await?;
+    docker::tag_image(&synthetic, &reference.display_name()).await?;
+    let _ = docker::remove_image_tag(&synthetic).await;
     Ok(())
 }

@@ -57,6 +57,16 @@ run_pocker --cache-dir "${WORKDIR}/cache-public" pull "${PUBLIC_REF}"
 docker image inspect "${PUBLIC_REF}" >/dev/null
 run_pocker image inspect "${PUBLIC_REF}" >/dev/null
 
+echo "smoke: local registry load mode"
+docker image rm -f "${PUBLIC_REF}" >/dev/null 2>&1 || true
+docker images --format '{{.Repository}}:{{.Tag}}' | grep 'pocker-cache' | xargs -r docker image rm -f >/dev/null 2>&1 || true
+run_pocker --cache-dir "${WORKDIR}/cache-registry-load" pull --load-mode registry "${PUBLIC_REF}"
+docker image inspect "${PUBLIC_REF}" >/dev/null
+if docker images --format '{{.Repository}}:{{.Tag}}' | grep -q 'pocker-cache'; then
+  echo "temporary local registry image tag was not cleaned up" >&2
+  exit 1
+fi
+
 echo "smoke: compose config and service-filtered pull"
 mkdir -p "${WORKDIR}/compose"
 cat > "${WORKDIR}/compose/.env" <<EOF
