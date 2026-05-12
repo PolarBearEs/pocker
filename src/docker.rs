@@ -203,7 +203,15 @@ pub async fn load_reference_archive_stream(
 
     let load_result = daemon.load_archive_stream(ReaderStream::new(reader)).await;
     if let Err(error) = load_result {
-        let _ = writer.await;
+        match writer.await {
+            Ok(Err(writer_error)) => return Err(writer_error),
+            Err(join_error) => {
+                return Err(DockerPullError::CommandFailed(format!(
+                    "archive stream writer failed: {join_error}"
+                )));
+            }
+            Ok(Ok(())) => {}
+        }
         return Err(error);
     }
 
