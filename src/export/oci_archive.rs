@@ -1,7 +1,6 @@
 use std::collections::HashMap;
-use std::fs::File;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 use tar::{Builder, Header};
@@ -55,32 +54,50 @@ struct ArchiveInputs {
     missing_diff_ids: Vec<String>,
 }
 
-pub async fn write_oci_archive(
-    path: &Path,
-    store: &Store,
-    reference: &StoredReference,
-) -> Result<()> {
-    let file = File::create(path)?;
-    write_oci_archive_to_writer(file, store, reference).await
+pub(crate) struct PreparedOciArchive {
+    inputs: ArchiveInputs,
+    daemon_layers: Option<docker::MaterializedDaemonLayers>,
 }
 
+#[cfg(test)]
 pub async fn write_oci_archive_to_writer<W: Write>(
     writer: W,
     store: &Store,
     reference: &StoredReference,
 ) -> Result<()> {
+    let prepared = prepare_oci_archive(store, reference).await?;
+    write_prepared_oci_archive_to_writer(writer, store, reference, &prepared)
+}
+
+pub(crate) async fn prepare_oci_archive(
+    store: &Store,
+    reference: &StoredReference,
+) -> Result<PreparedOciArchive> {
     let inputs = load_archive_inputs(store, reference)?;
     let daemon_layers = if inputs.missing_diff_ids.is_empty() {
         None
     } else {
         Some(docker::materialize_daemon_layers(store, &inputs.missing_diff_ids).await?)
     };
+    Ok(PreparedOciArchive {
+        inputs,
+        daemon_layers,
+    })
+}
+
+pub(crate) fn write_prepared_oci_archive_to_writer<W: Write>(
+    writer: W,
+    store: &Store,
+    reference: &StoredReference,
+    prepared: &PreparedOciArchive,
+) -> Result<()> {
     write_oci_archive_to_writer_with_fallbacks(
         writer,
         store,
         reference,
-        &inputs,
-        daemon_layers
+        &prepared.inputs,
+        prepared
+            .daemon_layers
             .as_ref()
             .map(docker::MaterializedDaemonLayers::paths),
     )
