@@ -175,7 +175,6 @@ async fn finalize_reference(
                 .await?;
         }
     } else {
-        context.ui.set_image_status(normalized, "Packaging archive");
         context.ui.begin_load(normalized);
         docker::load_reference_archive_stream(&context.store, stored_reference).await?;
         if !options.keep_layer_blobs {
