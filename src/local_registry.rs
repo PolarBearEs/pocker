@@ -23,7 +23,7 @@ impl LocalRegistry {
     pub async fn start(store: Arc<Store>, reference: StoredReference) -> Result<Self> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let port = listener.local_addr()?.port();
-        let address = format!("localhost:{port}");
+        let address = format!("127.0.0.1:{port}");
         let repository = synthetic_repository(&reference.manifest.digest)?;
         let state = Arc::new(RegistryState {
             store,

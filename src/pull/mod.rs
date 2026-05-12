@@ -217,6 +217,9 @@ async fn load_reference_through_local_registry(
     stored_reference: &StoredReference,
 ) -> Result<()> {
     if matches!(reference.target, ReferenceTarget::Digest(_)) {
+        context.ui.warn(
+            "registry load mode does not support digest references yet; falling back to stream load",
+        );
         docker::load_reference_archive_stream(&context.store, stored_reference).await?;
         return Ok(());
     }

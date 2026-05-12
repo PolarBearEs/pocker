@@ -52,6 +52,7 @@ const PATH_SEGMENT_ENCODE_SET: &AsciiSet = &CONTROLS
     .add(b'{')
     .add(b'|')
     .add(b'}');
+const QUERY_VALUE_ENCODE_SET: &AsciiSet = &PATH_SEGMENT_ENCODE_SET.add(b'&').add(b'=').add(b'+');
 const DAEMON_INSPECT_CONCURRENCY: usize = 8;
 const LOAD_ARCHIVE_STREAM_BUFFER_BYTES: usize = 1024 * 1024;
 
@@ -734,7 +735,7 @@ fn encode_path_segment(value: &str) -> String {
 }
 
 fn encode_query_value(value: &str) -> String {
-    utf8_percent_encode(value, PATH_SEGMENT_ENCODE_SET).to_string()
+    utf8_percent_encode(value, QUERY_VALUE_ENCODE_SET).to_string()
 }
 
 fn split_tagged_reference(reference: &str) -> Result<(&str, &str)> {
@@ -789,7 +790,9 @@ mod tests {
 
     #[cfg(any(unix, windows))]
     use super::DEFAULT_DOCKER_HOST;
-    use super::{daemon_inspect_target, docker_endpoint_from_host, encode_path_segment};
+    use super::{
+        daemon_inspect_target, docker_endpoint_from_host, encode_path_segment, encode_query_value,
+    };
     use super::{ordered_unique_image_ids, split_tagged_reference};
     use crate::reference::ImageReference;
 
@@ -887,6 +890,14 @@ mod tests {
         assert_eq!(
             encode_path_segment("docker.io/library/alpine:latest"),
             "docker.io%2Flibrary%2Falpine%3Alatest"
+        );
+    }
+
+    #[test]
+    fn encodes_image_names_for_api_query_values() {
+        assert_eq!(
+            encode_query_value("example.com/acme/app&name=value+tag:latest"),
+            "example.com%2Facme%2Fapp%26name%3Dvalue%2Btag%3Alatest"
         );
     }
 }
