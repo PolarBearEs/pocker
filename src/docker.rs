@@ -15,11 +15,14 @@ use sha2::{Digest as _, Sha256};
 use tar::Archive;
 use tempfile::{NamedTempFile, TempDir};
 use tokio::io::AsyncWriteExt;
+use tokio::io::DuplexStream;
 use tokio::task::JoinSet;
-use tokio_util::io::ReaderStream;
+use tokio_util::io::{ReaderStream, SyncIoBridge};
 
 use crate::error::{DockerPullError, Result};
-use crate::export::oci_archive::write_oci_archive;
+use crate::export::oci_archive::{
+    PreparedOciArchive, prepare_oci_archive, write_prepared_oci_archive_to_writer,
+};
 use crate::image::LayerSpec;
 use crate::reference::{ImageReference, ReferenceTarget};
 use crate::store::{Store, StoredReference};
@@ -50,6 +53,7 @@ const PATH_SEGMENT_ENCODE_SET: &AsciiSet = &CONTROLS
     .add(b'|')
     .add(b'}');
 const DAEMON_INSPECT_CONCURRENCY: usize = 8;
+const LOAD_ARCHIVE_STREAM_BUFFER_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone)]
 enum DockerEndpoint {
@@ -92,6 +96,19 @@ impl DockerDaemon {
     async fn load_archive(&self, path: &Path) -> Result<()> {
         let file = tokio::fs::File::open(path).await?;
         let body = reqwest::Body::wrap_stream(ReaderStream::new(file));
+        let response = self
+            .client
+            .post(self.url("/images/load?quiet=1"))
+            .header(reqwest::header::CONTENT_TYPE, "application/x-tar")
+            .body(body)
+            .send()
+            .await?;
+        self.ensure_success(response, "docker image load").await?;
+        Ok(())
+    }
+
+    async fn load_archive_stream(&self, stream: ReaderStream<DuplexStream>) -> Result<()> {
+        let body = reqwest::Body::wrap_stream(stream);
         let response = self
             .client
             .post(self.url("/images/load?quiet=1"))
@@ -170,13 +187,40 @@ impl DockerDaemon {
     }
 }
 
-pub async fn write_reference_archive(
+pub async fn load_reference_archive_stream(
     store: &Store,
     reference: &StoredReference,
-) -> Result<NamedTempFile> {
-    let temp = NamedTempFile::new_in(store.root())?;
-    write_oci_archive(temp.path(), store, reference).await?;
-    Ok(temp)
+) -> Result<()> {
+    let daemon = DockerDaemon::connect()?;
+    let prepared = prepare_oci_archive(store, reference).await?;
+    let (reader, writer) = tokio::io::duplex(LOAD_ARCHIVE_STREAM_BUFFER_BYTES);
+    let writer = SyncIoBridge::new(writer);
+    let store = store.clone();
+    let reference = reference.clone();
+    let writer = tokio::task::spawn_blocking(move || {
+        write_archive_to_stream(writer, store, reference, prepared)
+    });
+
+    let load_result = daemon.load_archive_stream(ReaderStream::new(reader)).await;
+    if let Err(error) = load_result {
+        let _ = writer.await;
+        return Err(error);
+    }
+
+    writer.await.map_err(|error| {
+        DockerPullError::CommandFailed(format!("archive stream writer failed: {error}"))
+    })?
+}
+
+fn write_archive_to_stream(
+    mut writer: SyncIoBridge<DuplexStream>,
+    store: Store,
+    reference: StoredReference,
+    prepared: PreparedOciArchive,
+) -> Result<()> {
+    write_prepared_oci_archive_to_writer(&mut writer, &store, &reference, &prepared)?;
+    writer.shutdown()?;
+    Ok(())
 }
 
 pub async fn daemon_has_reference(reference: &ImageReference, config_digest: &str) -> Result<bool> {

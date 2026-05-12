@@ -176,7 +176,8 @@ async fn finalize_reference(
         }
     } else {
         context.ui.set_image_status(normalized, "Packaging archive");
-        let archive = docker::write_reference_archive(&context.store, stored_reference).await?;
+        context.ui.begin_load(normalized);
+        docker::load_reference_archive_stream(&context.store, stored_reference).await?;
         if !options.keep_layer_blobs {
             context.ui.set_image_status(normalized, "Pruning cache");
             context
@@ -184,8 +185,6 @@ async fn finalize_reference(
                 .prune_reference_layer_blobs(stored_reference)
                 .await?;
         }
-        context.ui.begin_load(normalized);
-        docker::load_archive(archive.path()).await?;
     }
     context.ui.finish_image(
         normalized,
