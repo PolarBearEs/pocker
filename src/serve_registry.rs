@@ -6,13 +6,14 @@ use std::sync::atomic::AtomicBool;
 use reqwest::header::RANGE;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, oneshot};
+use tokio::task::JoinHandle;
 
 use crate::error::{DockerPullError, Result};
 use crate::platform::Platform;
 use crate::pull::{PullContext, download};
-use crate::reference::ImageReference;
-use crate::registry::{Descriptor, RegistryClient, decode_cache_repository};
+use crate::reference::{ImageReference, ReferenceTarget};
+use crate::registry::{Descriptor, RegistryClient, cache_repository, decode_cache_repository};
 use crate::store::{Store, StoredReference};
 use crate::ui::Ui;
 
@@ -35,6 +36,68 @@ pub struct ServeConfig {
     pub quiet: bool,
 }
 
+pub struct TemporaryCacheRegistry {
+    address: String,
+    repository: String,
+    tag: String,
+    _task: JoinHandle<()>,
+    shutdown: Option<oneshot::Sender<()>>,
+}
+
+impl TemporaryCacheRegistry {
+    pub async fn start(
+        store: Arc<Store>,
+        registry: Arc<RegistryClient>,
+        reference: &ImageReference,
+        stored_reference: &StoredReference,
+    ) -> Result<Self> {
+        let tag = match &reference.target {
+            ReferenceTarget::Tag(tag) => tag.clone(),
+            ReferenceTarget::Digest(_) => {
+                return Err(DockerPullError::InvalidInput(
+                    "temporary cache registry requires a tag reference".into(),
+                ));
+            }
+        };
+        store.save_reference(stored_reference).await?;
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?.to_string();
+        let repository = cache_repository(&reference.registry, &reference.repository);
+        let state = Arc::new(ServeState {
+            store,
+            registry,
+            pull_missing: false,
+            blob_retry_limit: 1,
+            quiet: true,
+            downloads: Arc::new(Semaphore::new(1)),
+        });
+        let (shutdown, shutdown_rx) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _ = run_server(listener, state, Some(shutdown_rx)).await;
+        });
+
+        Ok(Self {
+            address,
+            repository,
+            tag,
+            _task: task,
+            shutdown: Some(shutdown),
+        })
+    }
+
+    pub fn synthetic_reference(&self) -> String {
+        format!("{}/{}:{}", self.address, self.repository, self.tag)
+    }
+}
+
+impl Drop for TemporaryCacheRegistry {
+    fn drop(&mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+    }
+}
+
 pub async fn serve(config: ServeConfig) -> Result<()> {
     let listener = TcpListener::bind(config.listen).await?;
     let state = Arc::new(ServeState {
@@ -45,14 +108,33 @@ pub async fn serve(config: ServeConfig) -> Result<()> {
         quiet: config.quiet,
         downloads: Arc::new(Semaphore::new(config.concurrency)),
     });
+    run_server(listener, state, None).await
+}
 
+async fn run_server(
+    listener: TcpListener,
+    state: Arc<ServeState>,
+    mut shutdown: Option<oneshot::Receiver<()>>,
+) -> Result<()> {
     loop {
-        let (stream, _) = listener.accept().await?;
-        let state = Arc::clone(&state);
-        tokio::spawn(async move {
-            let _ = handle_connection(stream, state).await;
-        });
+        tokio::select! {
+            result = listener.accept() => {
+                let (stream, _) = result?;
+                let state = Arc::clone(&state);
+                tokio::spawn(async move {
+                    let _ = handle_connection(stream, state).await;
+                });
+            }
+            _ = async {
+                if let Some(shutdown) = shutdown.as_mut() {
+                    let _ = shutdown.await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => break,
+        }
     }
+    Ok(())
 }
 
 struct ServeState {

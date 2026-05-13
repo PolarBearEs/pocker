@@ -8,10 +8,10 @@ use futures_util::stream::{FuturesUnordered, StreamExt};
 use crate::docker;
 use crate::error::{DockerPullError, Result};
 use crate::image::pair_layers;
-use crate::local_registry;
 use crate::platform::Platform;
 use crate::reference::{ImageReference, ReferenceTarget};
 use crate::registry::{Descriptor, RegistryClient};
+use crate::serve_registry;
 use crate::store::{Store, StoredReference};
 use crate::ui::Ui;
 
@@ -190,7 +190,7 @@ async fn finalize_reference(
                 docker::load_reference_archive_stream(&context.store, stored_reference).await?;
             }
             LoadMode::Registry => {
-                load_reference_through_local_registry(context, reference, stored_reference).await?;
+                load_reference_through_cache_registry(context, reference, stored_reference).await?;
             }
         }
         if !options.keep_layer_blobs {
@@ -212,7 +212,7 @@ async fn finalize_reference(
     Ok(())
 }
 
-async fn load_reference_through_local_registry(
+async fn load_reference_through_cache_registry(
     context: &PullContext,
     reference: &ImageReference,
     stored_reference: &StoredReference,
@@ -225,9 +225,13 @@ async fn load_reference_through_local_registry(
         return Ok(());
     }
 
-    let registry =
-        local_registry::LocalRegistry::start(context.store.clone(), stored_reference.clone())
-            .await?;
+    let registry = serve_registry::TemporaryCacheRegistry::start(
+        context.store.clone(),
+        context.registry.clone(),
+        reference,
+        stored_reference,
+    )
+    .await?;
     let synthetic = registry.synthetic_reference();
     docker::pull_image(&synthetic).await?;
     let tag_result = docker::tag_image(&synthetic, &reference.display_name()).await;

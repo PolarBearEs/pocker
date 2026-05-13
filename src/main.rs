@@ -5,7 +5,6 @@ mod error;
 mod export;
 mod http;
 mod image;
-mod local_registry;
 mod platform;
 mod pull;
 mod reference;
