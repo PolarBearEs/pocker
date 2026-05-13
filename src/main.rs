@@ -5,6 +5,7 @@ mod error;
 mod export;
 mod http;
 mod image;
+mod local_registry;
 mod platform;
 mod pull;
 mod reference;
@@ -39,6 +40,7 @@ struct PullRequestOptions {
     request_retries: u32,
     no_load: bool,
     keep_layer_blobs: bool,
+    load_mode: pull::LoadMode,
     plain_http: bool,
     insecure_skip_tls_verify: bool,
     ca_file: Option<std::path::PathBuf>,
@@ -81,6 +83,7 @@ async fn run() -> Result<()> {
                 request_retries: args.request_retries,
                 no_load: args.no_load,
                 keep_layer_blobs: args.keep_layer_blobs,
+                load_mode: args.load_mode,
                 plain_http: args.plain_http,
                 insecure_skip_tls_verify: args.insecure_skip_tls_verify,
                 ca_file: args.ca_file,
@@ -123,6 +126,7 @@ async fn run() -> Result<()> {
                     request_retries: pull_args.request_retries,
                     no_load: pull_args.no_load,
                     keep_layer_blobs: pull_args.keep_layer_blobs,
+                    load_mode: pull_args.load_mode,
                     plain_http: pull_args.plain_http,
                     insecure_skip_tls_verify: pull_args.insecure_skip_tls_verify,
                     ca_file: pull_args.ca_file,
@@ -282,6 +286,7 @@ async fn pull_references(
         concurrency: request.concurrency.max(1),
         no_load: request.no_load,
         keep_layer_blobs: request.keep_layer_blobs,
+        load_mode: request.load_mode,
     };
 
     if references.len() <= 1 || request.image_concurrency <= 1 {

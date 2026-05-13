@@ -1,9 +1,10 @@
 use std::path::PathBuf;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use crate::platform::Platform;
 use crate::pull::DEFAULT_BLOB_RETRIES;
+use crate::pull::LoadMode;
 use crate::registry::DEFAULT_REQUEST_RETRIES;
 
 #[derive(Debug, Parser)]
@@ -117,6 +118,13 @@ pub struct ComposePullArgs {
         help = "Keep downloaded layer blobs in the cache after packaging/loading"
     )]
     pub keep_layer_blobs: bool,
+    #[arg(
+        long = "load-mode",
+        value_enum,
+        default_value = "stream",
+        help = "Docker import mode to use after downloading; registry is experimental and local-daemon only"
+    )]
+    pub load_mode: LoadMode,
     #[arg(long, help = "Use plain HTTP instead of HTTPS for registry requests")]
     pub plain_http: bool,
     #[arg(
@@ -229,6 +237,13 @@ pub struct PullArgs {
         help = "Keep downloaded layer blobs in the cache after packaging/loading"
     )]
     pub keep_layer_blobs: bool,
+    #[arg(
+        long = "load-mode",
+        value_enum,
+        default_value = "stream",
+        help = "Docker import mode to use after downloading; registry is experimental and local-daemon only"
+    )]
+    pub load_mode: LoadMode,
     #[arg(long, help = "Use plain HTTP instead of HTTPS for registry requests")]
     pub plain_http: bool,
     #[arg(
@@ -248,6 +263,19 @@ pub struct PullArgs {
     pub no_animations: bool,
 }
 
+impl ValueEnum for LoadMode {
+    fn value_variants<'a>() -> &'a [Self] {
+        &[Self::Stream, Self::Registry]
+    }
+
+    fn to_possible_value(&self) -> Option<clap::builder::PossibleValue> {
+        match self {
+            Self::Stream => Some(clap::builder::PossibleValue::new("stream")),
+            Self::Registry => Some(clap::builder::PossibleValue::new("registry")),
+        }
+    }
+}
+
 fn default_cache_dir() -> PathBuf {
     directories::ProjectDirs::from("", "", "pocker")
         .map(|dirs| dirs.data_local_dir().to_path_buf())
@@ -265,7 +293,7 @@ fn platform_help() -> String {
 mod tests {
     use clap::{CommandFactory, Parser};
 
-    use super::{CacheCommands, Cli, Commands, ComposeCommands, platform_help};
+    use super::{CacheCommands, Cli, Commands, ComposeCommands, LoadMode, platform_help};
 
     #[test]
     fn pull_accepts_no_animations_flag() {
@@ -275,6 +303,16 @@ mod tests {
         };
 
         assert!(args.no_animations);
+    }
+
+    #[test]
+    fn pull_accepts_registry_load_mode() {
+        let cli = Cli::parse_from(["pocker", "pull", "--load-mode", "registry", "alpine:latest"]);
+        let Commands::Pull(args) = cli.command else {
+            panic!("expected pull command");
+        };
+
+        assert_eq!(args.load_mode, LoadMode::Registry);
     }
 
     #[test]

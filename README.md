@@ -41,6 +41,12 @@ Pull a specific platform:
 pocker pull --platform linux/arm64 ghcr.io/example/app:latest
 ```
 
+Import through a temporary local registry instead of Docker's archive load API:
+
+```bash
+pocker pull --load-mode registry ghcr.io/example/app:latest
+```
+
 Increase blob retries on unstable links:
 
 ```bash
@@ -118,6 +124,7 @@ pocker image --help
 - Use `--blob-retries` to raise the retry budget for unstable connections; `0` means unlimited retries
 - Use `--request-retries` to raise the retry budget for request/connect/503-style failures; `0` means unlimited retries
 - Registry retries are bounded by default; setting a retry flag to `0` makes that retry path unlimited
+- `--load-mode registry` is experimental and requires the Docker daemon to reach pocker on `127.0.0.1`; use the default `stream` mode for remote Docker daemons or unsupported environments
 - `pocker compose` parses Compose files itself and does not require the Docker Compose CLI
 - Compose file selection supports default compose file discovery and repeated `-f/--file`
 - Compose image discovery supports service `image`, `.env` interpolation, `include`, and `extends`; build-only services are reported as skipped because there is no registry image to pull

@@ -52,6 +52,7 @@ const PATH_SEGMENT_ENCODE_SET: &AsciiSet = &CONTROLS
     .add(b'{')
     .add(b'|')
     .add(b'}');
+const QUERY_VALUE_ENCODE_SET: &AsciiSet = &PATH_SEGMENT_ENCODE_SET.add(b'&').add(b'=').add(b'+');
 const DAEMON_INSPECT_CONCURRENCY: usize = 8;
 const LOAD_ARCHIVE_STREAM_BUFFER_BYTES: usize = 1024 * 1024;
 
@@ -152,6 +153,50 @@ impl DockerDaemon {
             file.write_all(&chunk?).await?;
         }
         file.flush().await?;
+        Ok(())
+    }
+
+    async fn pull_image(&self, reference: &str) -> Result<()> {
+        let (repository, tag) = split_tagged_reference(reference)?;
+        let response = self
+            .client
+            .post(self.url(&format!(
+                "/images/create?fromImage={}&tag={}",
+                encode_query_value(repository),
+                encode_query_value(tag)
+            )))
+            .send()
+            .await?;
+        let response = self.ensure_success(response, "docker image pull").await?;
+        ensure_json_stream_success(response.text().await?, "docker image pull")
+    }
+
+    async fn tag_image(&self, source: &str, target: &str) -> Result<()> {
+        let (repository, tag) = split_tagged_reference(target)?;
+        let response = self
+            .client
+            .post(self.url(&format!(
+                "/images/{}/tag?repo={}&tag={}",
+                encode_path_segment(source),
+                encode_query_value(repository),
+                encode_query_value(tag)
+            )))
+            .send()
+            .await?;
+        self.ensure_success(response, "docker image tag").await?;
+        Ok(())
+    }
+
+    async fn remove_image_tag(&self, reference: &str) -> Result<()> {
+        let response = self
+            .client
+            .delete(self.url(&format!(
+                "/images/{}?force=1&noprune=1",
+                encode_path_segment(reference)
+            )))
+            .send()
+            .await?;
+        self.ensure_success(response, "docker image remove").await?;
         Ok(())
     }
 
@@ -353,6 +398,18 @@ pub struct ImageSummary {
 
 pub async fn load_archive(path: &Path) -> Result<()> {
     DockerDaemon::connect()?.load_archive(path).await
+}
+
+pub async fn pull_image(reference: &str) -> Result<()> {
+    DockerDaemon::connect()?.pull_image(reference).await
+}
+
+pub async fn tag_image(source: &str, target: &str) -> Result<()> {
+    DockerDaemon::connect()?.tag_image(source, target).await
+}
+
+pub async fn remove_image_tag(reference: &str) -> Result<()> {
+    DockerDaemon::connect()?.remove_image_tag(reference).await
 }
 
 pub async fn inspect_image(reference: &str) -> Result<Option<Value>> {
@@ -677,6 +734,55 @@ fn encode_path_segment(value: &str) -> String {
     utf8_percent_encode(value, PATH_SEGMENT_ENCODE_SET).to_string()
 }
 
+fn encode_query_value(value: &str) -> String {
+    utf8_percent_encode(value, QUERY_VALUE_ENCODE_SET).to_string()
+}
+
+fn split_tagged_reference(reference: &str) -> Result<(&str, &str)> {
+    if reference.contains('@') {
+        return Err(DockerPullError::InvalidInput(format!(
+            "image reference `{reference}` is not a tagged reference"
+        )));
+    }
+    let slash = reference.rfind('/');
+    let colon = reference.rfind(':').ok_or_else(|| {
+        DockerPullError::InvalidInput(format!("image reference `{reference}` is missing a tag"))
+    })?;
+    if slash.is_some_and(|slash| colon < slash) {
+        return Err(DockerPullError::InvalidInput(format!(
+            "image reference `{reference}` is missing a tag"
+        )));
+    }
+    Ok((&reference[..colon], &reference[colon + 1..]))
+}
+
+fn ensure_json_stream_success(body: String, action: &str) -> Result<()> {
+    for line in body.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if let Some(error) = value.get("error").and_then(|value| value.as_str()) {
+            return Err(DockerPullError::CommandFailed(format!(
+                "{action} failed: {error}"
+            )));
+        }
+        if let Some(error) = value
+            .get("errorDetail")
+            .and_then(|value| value.get("message"))
+            .and_then(|value| value.as_str())
+        {
+            return Err(DockerPullError::CommandFailed(format!(
+                "{action} failed: {error}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(unix)]
@@ -684,8 +790,10 @@ mod tests {
 
     #[cfg(any(unix, windows))]
     use super::DEFAULT_DOCKER_HOST;
-    use super::ordered_unique_image_ids;
-    use super::{daemon_inspect_target, docker_endpoint_from_host, encode_path_segment};
+    use super::{
+        daemon_inspect_target, docker_endpoint_from_host, encode_path_segment, encode_query_value,
+    };
+    use super::{ordered_unique_image_ids, split_tagged_reference};
     use crate::reference::ImageReference;
 
     #[test]
@@ -733,6 +841,20 @@ mod tests {
         assert_eq!(ids, vec!["sha256:1", "sha256:2"]);
     }
 
+    #[test]
+    fn split_tagged_reference_handles_registry_ports() {
+        assert_eq!(
+            split_tagged_reference("127.0.0.1:5000/pocker/image:latest")
+                .expect("reference should split"),
+            ("127.0.0.1:5000/pocker/image", "latest")
+        );
+    }
+
+    #[test]
+    fn split_tagged_reference_rejects_digest_references() {
+        assert!(split_tagged_reference("alpine@sha256:deadbeef").is_err());
+    }
+
     #[cfg(unix)]
     #[test]
     fn docker_host_defaults_to_unix_socket() {
@@ -768,6 +890,14 @@ mod tests {
         assert_eq!(
             encode_path_segment("docker.io/library/alpine:latest"),
             "docker.io%2Flibrary%2Falpine%3Alatest"
+        );
+    }
+
+    #[test]
+    fn encodes_image_names_for_api_query_values() {
+        assert_eq!(
+            encode_query_value("example.com/acme/app&name=value+tag:latest"),
+            "example.com%2Facme%2Fapp%26name%3Dvalue%2Btag%3Alatest"
         );
     }
 }
