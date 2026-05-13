@@ -229,7 +229,6 @@ async fn load_reference_through_cache_registry(
         context.store.clone(),
         context.registry.clone(),
         reference,
-        stored_reference,
     )
     .await?;
     let synthetic = registry.synthetic_reference();

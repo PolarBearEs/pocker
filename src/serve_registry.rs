@@ -49,7 +49,6 @@ impl TemporaryCacheRegistry {
         store: Arc<Store>,
         registry: Arc<RegistryClient>,
         reference: &ImageReference,
-        stored_reference: &StoredReference,
     ) -> Result<Self> {
         let tag = match &reference.target {
             ReferenceTarget::Tag(tag) => tag.clone(),
@@ -59,7 +58,6 @@ impl TemporaryCacheRegistry {
                 ));
             }
         };
-        store.save_reference(stored_reference).await?;
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let address = listener.local_addr()?.to_string();
         let repository = cache_repository(&reference.registry, &reference.repository);
@@ -562,24 +560,33 @@ impl RegistryResponse {
         let Some(range) = range else {
             return self;
         };
-        let Some(start) = range
-            .strip_prefix("bytes=")
-            .and_then(|value| value.strip_suffix('-'))
-            .and_then(|value| value.parse::<u64>().ok())
-        else {
+        let Some(range) = parse_byte_range(range, self.content_length) else {
             return RegistryResponse::empty(416, "Range Not Satisfiable");
         };
-        if start >= self.content_length {
-            return RegistryResponse::empty(416, "Range Not Satisfiable");
-        }
-        let total = self.content_length;
-        let end = total - 1;
         self.status = 206;
         self.reason = "Partial Content";
-        self.content_length = total - start;
-        self.range = Some(ResponseRange { start, end, total });
+        self.content_length = range.end - range.start + 1;
+        self.range = Some(range);
         self
     }
+}
+
+fn parse_byte_range(value: &str, total: u64) -> Option<ResponseRange> {
+    let value = value.strip_prefix("bytes=")?;
+    let (start, end) = value.split_once('-')?;
+    if start.is_empty() {
+        return None;
+    }
+    let start = start.parse::<u64>().ok()?;
+    let end = if end.is_empty() {
+        total.checked_sub(1)?
+    } else {
+        end.parse::<u64>().ok()?
+    };
+    if start > end || end >= total {
+        return None;
+    }
+    Some(ResponseRange { start, end, total })
 }
 
 async fn write_response(stream: &mut TcpStream, response: RegistryResponse) -> Result<()> {
@@ -627,8 +634,9 @@ mod tests {
     use tempfile::tempdir;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+    use tokio::sync::Semaphore;
 
-    use super::{ServeConfig, serve};
+    use super::{ServeState, parse_byte_range, run_server};
     use crate::auth::AuthResolver;
     use crate::platform::Platform;
     use crate::pull::{PullContext, PullOptions, Puller};
@@ -758,6 +766,23 @@ mod tests {
             .expect("range request should succeed");
         assert_eq!(ranged.status(), StatusCode::PARTIAL_CONTENT);
         assert_eq!(ranged.text().await.expect("body should read"), "456789");
+    }
+
+    #[test]
+    fn parse_byte_range_accepts_open_and_closed_ranges() {
+        let open = parse_byte_range("bytes=4-", 10).expect("open range should parse");
+        assert_eq!((open.start, open.end, open.total), (4, 9, 10));
+
+        let closed = parse_byte_range("bytes=4-7", 10).expect("closed range should parse");
+        assert_eq!((closed.start, closed.end, closed.total), (4, 7, 10));
+    }
+
+    #[test]
+    fn parse_byte_range_rejects_unsatisfiable_ranges() {
+        assert!(parse_byte_range("bytes=99-", 10).is_none());
+        assert!(parse_byte_range("bytes=7-4", 10).is_none());
+        assert!(parse_byte_range("bytes=4-99", 10).is_none());
+        assert!(parse_byte_range("bytes=-4", 10).is_none());
     }
 
     #[tokio::test]
@@ -929,7 +954,6 @@ mod tests {
             .await
             .expect("listener should bind");
         let address = listener.local_addr().expect("listener address");
-        drop(listener);
         let registry = Arc::new(RegistryClient::new(
             reqwest::Client::builder()
                 .https_only(false)
@@ -939,19 +963,17 @@ mod tests {
             true,
             0,
         ));
-        tokio::spawn(async move {
-            let _ = serve(ServeConfig {
-                listen: address,
-                store,
-                registry,
-                pull_missing,
-                blob_retry_limit: 1,
-                concurrency: 1,
-                quiet: true,
-            })
-            .await;
+        let state = Arc::new(ServeState {
+            store,
+            registry,
+            pull_missing,
+            blob_retry_limit: 1,
+            quiet: true,
+            downloads: Arc::new(Semaphore::new(1)),
         });
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        tokio::spawn(async move {
+            let _ = run_server(listener, state, None).await;
+        });
         address
     }
 
