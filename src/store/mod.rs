@@ -17,7 +17,7 @@ pub struct Store {
     root: PathBuf,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredReference {
     pub reference: String,
     pub manifest: Descriptor,
@@ -57,6 +57,7 @@ impl Store {
         ensure_directory(&root.join("blobs").join("sha256"))?;
         ensure_directory(&root.join("partials"))?;
         ensure_directory(&root.join("partials").join("sha256"))?;
+        ensure_directory(&root.join("references"))?;
         Ok(Self { root })
     }
 
@@ -72,6 +73,12 @@ impl Store {
     fn partial_metadata_path(&self, digest: &str) -> Result<PathBuf> {
         let path = digest_path(self.root.join("partials"), digest)?;
         Ok(path.with_extension("json"))
+    }
+
+    fn reference_path(&self, reference: &str) -> PathBuf {
+        self.root
+            .join("references")
+            .join(format!("{}.json", reference_key(reference)))
     }
 
     pub async fn ensure_blob_complete(&self, digest: &str, expected_size: i64) -> Result<bool> {
@@ -253,6 +260,15 @@ impl Store {
         Ok(removed)
     }
 
+    pub async fn save_reference(&self, record: &StoredReference) -> Result<()> {
+        let path = self.reference_path(&record.reference);
+        atomic_write_json(&path, record)
+    }
+
+    pub async fn load_reference(&self, reference: &str) -> Result<Option<StoredReference>> {
+        read_json_if_exists(&self.reference_path(reference))
+    }
+
     pub async fn clear(&self) -> Result<ClearedCache> {
         let root = self.root.clone();
         let files = tokio::task::spawn_blocking(move || collect_cache_files(&root))
@@ -293,6 +309,14 @@ fn digest_bytes(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     format!("sha256:{}", hex::encode(hasher.finalize()))
+}
+
+fn reference_key(reference: &str) -> String {
+    use sha2::{Digest as _, Sha256};
+
+    let mut hasher = Sha256::new();
+    hasher.update(reference.as_bytes());
+    hex::encode(hasher.finalize())
 }
 
 fn collect_cache_files(root: &Path) -> Result<Vec<ClearedCacheFile>> {
@@ -345,7 +369,7 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::{ClearedCacheFile, Store, StoredReference};
+    use super::{ClearedCacheFile, Store, StoredReference, reference_key};
     use crate::registry::Descriptor;
 
     #[cfg(unix)]
@@ -560,6 +584,65 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn save_and_load_reference_metadata() {
+        let dir = tempdir().expect("tempdir should create");
+        let store = Store::open(dir.path().to_path_buf())
+            .await
+            .expect("store should open");
+        let record = StoredReference {
+            reference: "registry-1.docker.io/library/alpine:latest".into(),
+            manifest: Descriptor {
+                media_type: "application/vnd.oci.image.manifest.v1+json".into(),
+                digest: "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+                    .into(),
+                size: 2,
+                platform: None,
+                annotations: None,
+            },
+            config_digest:
+                "sha256:2222222222222222222222222222222222222222222222222222222222222222".into(),
+        };
+
+        store
+            .save_reference(&record)
+            .await
+            .expect("reference metadata should save");
+        let loaded = store
+            .load_reference(&record.reference)
+            .await
+            .expect("reference metadata should load")
+            .expect("reference metadata should exist");
+
+        assert_eq!(loaded.reference, record.reference);
+        assert_eq!(loaded.manifest.digest, record.manifest.digest);
+    }
+
+    #[tokio::test]
+    async fn missing_reference_metadata_returns_none() {
+        let dir = tempdir().expect("tempdir should create");
+        let store = Store::open(dir.path().to_path_buf())
+            .await
+            .expect("store should open");
+
+        assert!(
+            store
+                .load_reference("registry-1.docker.io/library/missing:latest")
+                .await
+                .expect("metadata lookup should succeed")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn reference_key_is_stable_and_filesystem_safe() {
+        let key = reference_key("registry.example:5000/team/app:latest");
+
+        assert_eq!(key.len(), 64);
+        assert!(key.chars().all(|ch| ch.is_ascii_hexdigit()));
+        assert_eq!(key, reference_key("registry.example:5000/team/app:latest"));
     }
 
     #[test]

@@ -10,6 +10,7 @@ mod platform;
 mod pull;
 mod reference;
 mod registry;
+mod serve_registry;
 mod store;
 mod ui;
 
@@ -48,6 +49,7 @@ struct PullRequestOptions {
     password_stdin: bool,
     quiet: bool,
     no_animations: bool,
+    cache_from: Option<url::Url>,
 }
 
 #[derive(Clone)]
@@ -91,6 +93,7 @@ async fn run() -> Result<()> {
                 password_stdin: args.password_stdin,
                 quiet: args.quiet,
                 no_animations: args.no_animations,
+                cache_from: args.cache_from,
             };
             pull_references(
                 &cli.global.cache_dir,
@@ -134,10 +137,61 @@ async fn run() -> Result<()> {
                     password_stdin: pull_args.password_stdin,
                     quiet: pull_args.quiet,
                     no_animations: true,
+                    cache_from: pull_args.cache_from,
                 };
                 pull_references(&cli.global.cache_dir, cli.global.quiet, images, request).await?;
             }
         },
+        Commands::Serve(args) => {
+            let store = Arc::new(Store::open(cli.global.cache_dir.clone()).await?);
+            let password = if args.password_stdin {
+                Some(read_password_stdin()?)
+            } else {
+                None
+            };
+            let credentials = match (args.username, password) {
+                (Some(username), Some(password)) => Some(Credentials::Basic { username, password }),
+                (None, None) => None,
+                _ => {
+                    return Err(DockerPullError::InvalidInput(
+                        "`--username` requires `--password-stdin`".into(),
+                    ));
+                }
+            };
+            let auth = Arc::new(AuthResolver::new(credentials)?);
+            let client = Arc::new(RegistryClient::new(
+                build_http_client(
+                    args.plain_http,
+                    args.insecure_skip_tls_verify,
+                    args.ca_file.as_deref(),
+                )?,
+                auth,
+                args.plain_http,
+                args.request_retries,
+            ));
+            let quiet = cli.global.quiet || args.quiet;
+            if !quiet {
+                eprintln!(
+                    "Serving pocker cache on {} ({})",
+                    args.listen,
+                    if args.pull_missing {
+                        "pull missing enabled"
+                    } else {
+                        "cache only"
+                    }
+                );
+            }
+            serve_registry::serve(serve_registry::ServeConfig {
+                listen: args.listen,
+                store,
+                registry: client,
+                pull_missing: args.pull_missing,
+                blob_retry_limit: args.blob_retries,
+                concurrency: args.concurrency.max(1),
+                quiet,
+            })
+            .await?;
+        }
         Commands::Cache(args) => {
             let store = Store::open(cli.global.cache_dir.clone()).await?;
             match args.command {
@@ -270,15 +324,20 @@ async fn pull_references(
         }
     };
     let auth = Arc::new(AuthResolver::new(credentials)?);
-    let client = Arc::new(RegistryClient::new(
+    let client = Arc::new(RegistryClient::new_with_cache_from(
         build_http_client(
-            request.plain_http,
+            request.plain_http
+                || request
+                    .cache_from
+                    .as_ref()
+                    .is_some_and(|url| url.scheme() == "http"),
             request.insecure_skip_tls_verify,
             request.ca_file.as_deref(),
         )?,
         auth,
         request.plain_http,
         request.request_retries,
+        request.cache_from,
     ));
     let stop = install_signal_handler();
     let options = PullOptions {

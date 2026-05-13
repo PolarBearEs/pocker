@@ -1,6 +1,8 @@
+use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use url::Url;
 
 use crate::platform::Platform;
 use crate::pull::DEFAULT_BLOB_RETRIES;
@@ -33,6 +35,8 @@ pub struct GlobalArgs {
 pub enum Commands {
     #[command(about = "Pull an OCI image directly from a registry")]
     Pull(PullArgs),
+    #[command(about = "Serve the local cache as an OCI registry")]
+    Serve(ServeArgs),
     #[command(about = "Run Docker Compose helper commands")]
     Compose(ComposeArgs),
     #[command(about = "Manage the local blob and partial-download cache")]
@@ -139,6 +143,60 @@ pub struct ComposePullArgs {
     #[arg(long, help = "Read the registry password from stdin")]
     pub password_stdin: bool,
     #[arg(long, help = "Suppress progress and status output")]
+    pub quiet: bool,
+    #[arg(
+        long,
+        value_name = "URL",
+        help = "Pull through a pocker cache registry"
+    )]
+    pub cache_from: Option<Url>,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct ServeArgs {
+    #[arg(long, default_value = "127.0.0.1:5000", help = "Address to listen on")]
+    pub listen: SocketAddr,
+    #[arg(
+        long,
+        help = "Fetch missing manifests and blobs from upstream registries"
+    )]
+    pub pull_missing: bool,
+    #[arg(
+        long = "max-parallel-downloads",
+        visible_alias = "concurrency",
+        default_value_t = 4,
+        help = "Maximum concurrent layer downloads"
+    )]
+    pub concurrency: usize,
+    #[arg(
+        long = "blob-retries",
+        default_value_t = DEFAULT_BLOB_RETRIES,
+        help = "Maximum retries for interrupted blob downloads; use 0 for unlimited retries"
+    )]
+    pub blob_retries: u32,
+    #[arg(
+        long = "request-retries",
+        default_value_t = DEFAULT_REQUEST_RETRIES,
+        help = "Maximum retries for registry requests before any response or on retryable HTTP status; use 0 for unlimited retries"
+    )]
+    pub request_retries: u32,
+    #[arg(
+        long,
+        help = "Use plain HTTP instead of HTTPS for upstream registry requests"
+    )]
+    pub plain_http: bool,
+    #[arg(
+        long,
+        help = "Disable TLS certificate verification for upstream registry requests"
+    )]
+    pub insecure_skip_tls_verify: bool,
+    #[arg(long, help = "Additional upstream CA certificate bundle in PEM format")]
+    pub ca_file: Option<PathBuf>,
+    #[arg(long, help = "Upstream registry username; requires --password-stdin")]
+    pub username: Option<String>,
+    #[arg(long, help = "Read the upstream registry password from stdin")]
+    pub password_stdin: bool,
+    #[arg(long, help = "Suppress status output")]
     pub quiet: bool,
 }
 
@@ -261,6 +319,12 @@ pub struct PullArgs {
     pub quiet: bool,
     #[arg(long, help = "Disable animated progress output during pull")]
     pub no_animations: bool,
+    #[arg(
+        long,
+        value_name = "URL",
+        help = "Pull through a pocker cache registry"
+    )]
+    pub cache_from: Option<Url>,
 }
 
 impl ValueEnum for LoadMode {
@@ -343,6 +407,67 @@ mod tests {
         };
 
         assert_eq!(args.request_retries, 12);
+    }
+
+    #[test]
+    fn pull_accepts_cache_from_url() {
+        let cli = Cli::parse_from([
+            "pocker",
+            "pull",
+            "--cache-from",
+            "http://127.0.0.1:5000",
+            "alpine:latest",
+        ]);
+        let Commands::Pull(args) = cli.command else {
+            panic!("expected pull command");
+        };
+
+        assert_eq!(
+            args.cache_from.as_ref().map(|url| url.as_str()),
+            Some("http://127.0.0.1:5000/")
+        );
+    }
+
+    #[test]
+    fn pull_rejects_invalid_cache_from_url() {
+        let error = Cli::try_parse_from([
+            "pocker",
+            "pull",
+            "--cache-from",
+            "not-a-url",
+            "alpine:latest",
+        ])
+        .expect_err("invalid cache URL should be rejected");
+
+        assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+    }
+
+    #[test]
+    fn serve_parses_defaults() {
+        let cli = Cli::parse_from(["pocker", "serve"]);
+        let Commands::Serve(args) = cli.command else {
+            panic!("expected serve command");
+        };
+
+        assert_eq!(args.listen.to_string(), "127.0.0.1:5000");
+        assert!(!args.pull_missing);
+    }
+
+    #[test]
+    fn serve_accepts_pull_missing_and_listen() {
+        let cli = Cli::parse_from([
+            "pocker",
+            "serve",
+            "--pull-missing",
+            "--listen",
+            "0.0.0.0:5000",
+        ]);
+        let Commands::Serve(args) = cli.command else {
+            panic!("expected serve command");
+        };
+
+        assert_eq!(args.listen.to_string(), "0.0.0.0:5000");
+        assert!(args.pull_missing);
     }
 
     #[test]

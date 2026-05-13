@@ -1,4 +1,4 @@
-mod download;
+pub mod download;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -131,6 +131,7 @@ impl Puller {
             manifest: resolved.manifest.clone(),
             config_digest: resolved.config.digest.clone(),
         };
+        self.context.store.save_reference(&stored_reference).await?;
 
         if options.no_load {
             self.context.ui.finish_image(&normalized, "Pulled");

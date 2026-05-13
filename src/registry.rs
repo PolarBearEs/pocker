@@ -22,6 +22,7 @@ const MANIFEST_ACCEPT: &str = concat!(
     "application/vnd.docker.distribution.manifest.v2+json"
 );
 pub const DEFAULT_REQUEST_RETRIES: u32 = 5;
+pub const POCKER_CACHE_PREFIX: &str = "pocker-cache";
 const MAX_AUTH_RETRIES: u32 = 2;
 
 #[derive(Debug, Clone)]
@@ -31,6 +32,7 @@ pub struct RegistryClient {
     token_cache: Arc<Mutex<HashMap<String, String>>>,
     plain_http: bool,
     request_retry_limit: u32,
+    cache_from: Option<Url>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -85,6 +87,12 @@ pub struct BlobMetadata {
     pub size: Option<u64>,
 }
 
+#[derive(Debug, Clone)]
+pub struct RawManifest {
+    pub descriptor: Descriptor,
+    pub bytes: Vec<u8>,
+}
+
 impl RegistryClient {
     pub fn new(
         client: Client,
@@ -92,13 +100,61 @@ impl RegistryClient {
         plain_http: bool,
         request_retry_limit: u32,
     ) -> Self {
+        Self::new_with_cache_from(client, auth, plain_http, request_retry_limit, None)
+    }
+
+    pub fn new_with_cache_from(
+        client: Client,
+        auth: Arc<AuthResolver>,
+        plain_http: bool,
+        request_retry_limit: u32,
+        cache_from: Option<Url>,
+    ) -> Self {
         Self {
             client,
             auth,
             token_cache: Arc::new(Mutex::new(HashMap::new())),
             plain_http,
             request_retry_limit,
+            cache_from,
         }
+    }
+
+    pub async fn get_manifest_raw(
+        &self,
+        reference: &ImageReference,
+        accept: Option<&str>,
+    ) -> Result<RawManifest> {
+        let response = self
+            .send(
+                Method::GET,
+                self.manifest_url(reference)?,
+                reference,
+                accept,
+                None,
+                true,
+            )
+            .await?;
+        raw_manifest_from_response(response).await
+    }
+
+    pub async fn get_manifest_digest_raw(
+        &self,
+        reference: &ImageReference,
+        digest: &str,
+        accept: Option<&str>,
+    ) -> Result<RawManifest> {
+        let response = self
+            .send(
+                Method::GET,
+                self.manifest_digest_url(reference, digest)?,
+                reference,
+                accept,
+                None,
+                true,
+            )
+            .await?;
+        raw_manifest_from_response(response).await
     }
 
     pub async fn resolve_image(
@@ -276,6 +332,14 @@ impl RegistryClient {
     }
 
     fn manifest_url(&self, reference: &ImageReference) -> Result<Url> {
+        if let Some(cache_from) = &self.cache_from {
+            return cache_url(
+                cache_from,
+                reference,
+                "manifests",
+                reference.manifest_reference(),
+            );
+        }
         Url::parse(&format!(
             "{}://{}/v2/{}/manifests/{}",
             self.scheme(),
@@ -287,6 +351,9 @@ impl RegistryClient {
     }
 
     fn manifest_digest_url(&self, reference: &ImageReference, digest: &str) -> Result<Url> {
+        if let Some(cache_from) = &self.cache_from {
+            return cache_url(cache_from, reference, "manifests", digest);
+        }
         Url::parse(&format!(
             "{}://{}/v2/{}/manifests/{digest}",
             self.scheme(),
@@ -297,6 +364,9 @@ impl RegistryClient {
     }
 
     fn blob_url(&self, reference: &ImageReference, digest: &str) -> Result<Url> {
+        if let Some(cache_from) = &self.cache_from {
+            return cache_url(cache_from, reference, "blobs", digest);
+        }
         Url::parse(&format!(
             "{}://{}/v2/{}/blobs/{digest}",
             self.scheme(),
@@ -323,8 +393,16 @@ impl RegistryClient {
         let mut retries = 0_u32;
         let mut auth_retries = 0_u32;
         loop {
-            let token = self.token_cache.lock().await.get(&cache_key).cloned();
-            let credentials = self.auth.resolve(&reference.registry)?;
+            let token = if self.uses_cache_from() {
+                None
+            } else {
+                self.token_cache.lock().await.get(&cache_key).cloned()
+            };
+            let credentials = if self.uses_cache_from() {
+                None
+            } else {
+                self.auth.resolve(&reference.registry)?
+            };
             let mut request = self.client.request(method.clone(), url.clone());
             if let Some(accept) = accept {
                 request = request.header(ACCEPT, accept);
@@ -358,6 +436,10 @@ impl RegistryClient {
                 }
                 Err(error) => return Err(error.into()),
             };
+
+            if response.status() == StatusCode::UNAUTHORIZED && self.uses_cache_from() {
+                return Err(DockerPullError::Unauthorized(reference.normalized()));
+            }
 
             if response.status() == StatusCode::UNAUTHORIZED {
                 if auth_retries >= MAX_AUTH_RETRIES {
@@ -449,6 +531,91 @@ impl RegistryClient {
         let body: TokenResponse = response.json().await?;
         Ok(body.token.or(body.access_token))
     }
+
+    fn uses_cache_from(&self) -> bool {
+        self.cache_from.is_some()
+    }
+}
+
+async fn raw_manifest_from_response(response: Response) -> Result<RawManifest> {
+    if response.status() == StatusCode::NOT_FOUND {
+        return Err(DockerPullError::ManifestNotFound);
+    }
+    if !response.status().is_success() {
+        return Err(DockerPullError::BadResponse(format!(
+            "registry returned {} for manifest",
+            response.status()
+        )));
+    }
+    let digest = header_string(&response, "docker-content-digest")?;
+    let media_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.split(';').next().unwrap_or(value).trim().to_string())
+        .unwrap_or_default();
+    let bytes = response.bytes().await?.to_vec();
+    let envelope: ManifestEnvelope = serde_json::from_slice(&bytes)?;
+    Ok(RawManifest {
+        descriptor: Descriptor {
+            media_type: if media_type.is_empty() {
+                envelope.media_type
+            } else {
+                media_type
+            },
+            digest: digest.unwrap_or_else(|| digest_bytes(&bytes)),
+            size: bytes.len() as i64,
+            platform: None,
+            annotations: None,
+        },
+        bytes,
+    })
+}
+
+pub fn cache_repository(registry: &str, repository: &str) -> String {
+    format!(
+        "{}/{}/{}",
+        POCKER_CACHE_PREFIX,
+        hex::encode(registry.as_bytes()),
+        repository
+    )
+}
+
+pub fn decode_cache_repository(repository: &str) -> Result<(String, String)> {
+    let mut parts = repository.splitn(3, '/');
+    let Some(prefix) = parts.next() else {
+        return Err(invalid_cache_repository(repository));
+    };
+    let Some(encoded_registry) = parts.next() else {
+        return Err(invalid_cache_repository(repository));
+    };
+    let Some(upstream_repository) = parts.next() else {
+        return Err(invalid_cache_repository(repository));
+    };
+    if prefix != POCKER_CACHE_PREFIX || upstream_repository.is_empty() {
+        return Err(invalid_cache_repository(repository));
+    }
+    let bytes = hex::decode(encoded_registry).map_err(|_| invalid_cache_repository(repository))?;
+    let registry = String::from_utf8(bytes).map_err(|_| invalid_cache_repository(repository))?;
+    if registry.is_empty() {
+        return Err(invalid_cache_repository(repository));
+    }
+    Ok((registry, upstream_repository.to_string()))
+}
+
+fn invalid_cache_repository(repository: &str) -> DockerPullError {
+    DockerPullError::InvalidInput(format!("invalid pocker cache repository `{repository}`"))
+}
+
+fn cache_url(
+    base_url: &Url,
+    reference: &ImageReference,
+    resource: &str,
+    suffix: &str,
+) -> Result<Url> {
+    let base = base_url.as_str().trim_end_matches('/');
+    let repository = cache_repository(&reference.registry, &reference.repository);
+    Url::parse(&format!("{base}/v2/{repository}/{resource}/{suffix}")).map_err(Into::into)
 }
 
 fn token_cache_key(reference: &ImageReference) -> String {
@@ -619,7 +786,10 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
-    use super::{DEFAULT_REQUEST_RETRIES, RegistryClient, parse_www_authenticate, token_cache_key};
+    use super::{
+        DEFAULT_REQUEST_RETRIES, RegistryClient, cache_repository, decode_cache_repository,
+        parse_www_authenticate, token_cache_key,
+    };
     use crate::auth::AuthResolver;
     use crate::error::DockerPullError;
     use crate::platform::Platform;
@@ -702,6 +872,23 @@ mod tests {
             challenge.scope.as_deref(),
             Some("repository:acme/app:pull,push")
         );
+    }
+
+    #[test]
+    fn cache_repository_encodes_registry_with_port() {
+        let repository = cache_repository("registry.example:5000", "team/app");
+
+        assert_eq!(
+            decode_cache_repository(&repository).expect("cache repository should decode"),
+            ("registry.example:5000".to_string(), "team/app".to_string())
+        );
+    }
+
+    #[test]
+    fn decode_cache_repository_rejects_malformed_paths() {
+        assert!(decode_cache_repository("team/app").is_err());
+        assert!(decode_cache_repository("pocker-cache/not-hex/team/app").is_err());
+        assert!(decode_cache_repository("pocker-cache/").is_err());
     }
 
     #[tokio::test]
