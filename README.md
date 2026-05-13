@@ -47,6 +47,15 @@ Pull through another pocker cache server:
 pocker pull --cache-from http://cache.example:5000 alpine:latest
 ```
 
+The cache server sees normalized upstream image paths, so `alpine:latest` is served
+through a path like `cache.example:5000/registry-1.docker.io/library/alpine:latest`.
+By default, cache misses fall back to the upstream registry. To require that all
+content comes from the cache server:
+
+```bash
+pocker pull --cache-from http://cache.example:5000 --cache-only alpine:latest
+```
+
 Import through a temporary local registry instead of Docker's archive load API:
 
 ```bash
@@ -93,6 +102,7 @@ Pull Compose service images:
 ```bash
 pocker compose pull
 pocker compose -f docker-compose.prod.yml pull api worker
+pocker compose pull --cache-from http://cache.example:5000
 ```
 
 Pull more than one Compose image at a time:

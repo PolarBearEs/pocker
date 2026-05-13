@@ -49,6 +49,7 @@ struct PullRequestOptions {
     quiet: bool,
     no_animations: bool,
     cache_from: Option<url::Url>,
+    cache_only: bool,
 }
 
 #[derive(Clone)]
@@ -93,6 +94,7 @@ async fn run() -> Result<()> {
                 quiet: args.quiet,
                 no_animations: args.no_animations,
                 cache_from: args.cache_from,
+                cache_only: args.cache_only,
             };
             pull_references(
                 &cli.global.cache_dir,
@@ -137,6 +139,7 @@ async fn run() -> Result<()> {
                     quiet: pull_args.quiet,
                     no_animations: true,
                     cache_from: pull_args.cache_from,
+                    cache_only: pull_args.cache_only,
                 };
                 pull_references(&cli.global.cache_dir, cli.global.quiet, images, request).await?;
             }
@@ -337,6 +340,7 @@ async fn pull_references(
         request.plain_http,
         request.request_retries,
         request.cache_from,
+        request.cache_only,
     ));
     let stop = install_signal_handler();
     let options = PullOptions {

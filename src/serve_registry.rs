@@ -910,6 +910,7 @@ mod tests {
                     .parse()
                     .expect("cache URL should parse"),
             ),
+            true,
         ));
         let puller = Puller::new(PullContext {
             store: Arc::clone(&client_store),

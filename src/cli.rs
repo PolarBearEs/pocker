@@ -147,9 +147,15 @@ pub struct ComposePullArgs {
     #[arg(
         long,
         value_name = "URL",
-        help = "Pull through a pocker cache registry"
+        help = "Prefer a pocker cache registry, falling back to upstream on cache misses"
     )]
     pub cache_from: Option<Url>,
+    #[arg(
+        long,
+        requires = "cache_from",
+        help = "Require --cache-from content and do not fall back to upstream"
+    )]
+    pub cache_only: bool,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -322,9 +328,15 @@ pub struct PullArgs {
     #[arg(
         long,
         value_name = "URL",
-        help = "Pull through a pocker cache registry"
+        help = "Prefer a pocker cache registry, falling back to upstream on cache misses"
     )]
     pub cache_from: Option<Url>,
+    #[arg(
+        long,
+        requires = "cache_from",
+        help = "Require --cache-from content and do not fall back to upstream"
+    )]
+    pub cache_only: bool,
 }
 
 impl ValueEnum for LoadMode {
@@ -429,6 +441,34 @@ mod tests {
     }
 
     #[test]
+    fn pull_accepts_cache_only_with_cache_from() {
+        let cli = Cli::parse_from([
+            "pocker",
+            "pull",
+            "--cache-from",
+            "http://127.0.0.1:5000",
+            "--cache-only",
+            "alpine:latest",
+        ]);
+        let Commands::Pull(args) = cli.command else {
+            panic!("expected pull command");
+        };
+
+        assert!(args.cache_only);
+    }
+
+    #[test]
+    fn pull_rejects_cache_only_without_cache_from() {
+        let error = Cli::try_parse_from(["pocker", "pull", "--cache-only", "alpine:latest"])
+            .expect_err("cache-only requires cache-from");
+
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+    }
+
+    #[test]
     fn pull_rejects_invalid_cache_from_url() {
         let error = Cli::try_parse_from([
             "pocker",
@@ -511,6 +551,26 @@ mod tests {
 
         assert_eq!(args.file.len(), 2);
         assert_eq!(pull.services, vec!["app"]);
+    }
+
+    #[test]
+    fn compose_pull_accepts_cache_only_with_cache_from() {
+        let cli = Cli::parse_from([
+            "pocker",
+            "compose",
+            "pull",
+            "--cache-from",
+            "http://127.0.0.1:5000",
+            "--cache-only",
+        ]);
+        let Commands::Compose(args) = cli.command else {
+            panic!("expected compose command");
+        };
+        let ComposeCommands::Pull(pull) = args.command else {
+            panic!("expected compose pull command");
+        };
+
+        assert!(pull.cache_only);
     }
 
     #[test]
