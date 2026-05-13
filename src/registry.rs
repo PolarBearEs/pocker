@@ -22,7 +22,6 @@ const MANIFEST_ACCEPT: &str = concat!(
     "application/vnd.docker.distribution.manifest.v2+json"
 );
 pub const DEFAULT_REQUEST_RETRIES: u32 = 5;
-pub const POCKER_CACHE_PREFIX: &str = "pocker-cache";
 const MAX_AUTH_RETRIES: u32 = 2;
 
 #[derive(Debug, Clone)]
@@ -573,34 +572,21 @@ async fn raw_manifest_from_response(response: Response) -> Result<RawManifest> {
 }
 
 pub fn cache_repository(registry: &str, repository: &str) -> String {
-    format!(
-        "{}/{}/{}",
-        POCKER_CACHE_PREFIX,
-        hex::encode(registry.as_bytes()),
-        repository
-    )
+    format!("{registry}/{repository}")
 }
 
 pub fn decode_cache_repository(repository: &str) -> Result<(String, String)> {
-    let mut parts = repository.splitn(3, '/');
-    let Some(prefix) = parts.next() else {
-        return Err(invalid_cache_repository(repository));
-    };
-    let Some(encoded_registry) = parts.next() else {
+    let mut parts = repository.splitn(2, '/');
+    let Some(registry) = parts.next() else {
         return Err(invalid_cache_repository(repository));
     };
     let Some(upstream_repository) = parts.next() else {
         return Err(invalid_cache_repository(repository));
     };
-    if prefix != POCKER_CACHE_PREFIX || upstream_repository.is_empty() {
+    if registry.is_empty() || upstream_repository.is_empty() {
         return Err(invalid_cache_repository(repository));
     }
-    let bytes = hex::decode(encoded_registry).map_err(|_| invalid_cache_repository(repository))?;
-    let registry = String::from_utf8(bytes).map_err(|_| invalid_cache_repository(repository))?;
-    if registry.is_empty() {
-        return Err(invalid_cache_repository(repository));
-    }
-    Ok((registry, upstream_repository.to_string()))
+    Ok((registry.to_string(), upstream_repository.to_string()))
 }
 
 fn invalid_cache_repository(repository: &str) -> DockerPullError {
@@ -875,9 +861,10 @@ mod tests {
     }
 
     #[test]
-    fn cache_repository_encodes_registry_with_port() {
+    fn cache_repository_keeps_registry_as_first_segment() {
         let repository = cache_repository("registry.example:5000", "team/app");
 
+        assert_eq!(repository, "registry.example:5000/team/app");
         assert_eq!(
             decode_cache_repository(&repository).expect("cache repository should decode"),
             ("registry.example:5000".to_string(), "team/app".to_string())
@@ -886,9 +873,9 @@ mod tests {
 
     #[test]
     fn decode_cache_repository_rejects_malformed_paths() {
-        assert!(decode_cache_repository("team/app").is_err());
-        assert!(decode_cache_repository("pocker-cache/not-hex/team/app").is_err());
-        assert!(decode_cache_repository("pocker-cache/").is_err());
+        assert!(decode_cache_repository("registry.example").is_err());
+        assert!(decode_cache_repository("/team/app").is_err());
+        assert!(decode_cache_repository("registry.example/").is_err());
     }
 
     #[tokio::test]
