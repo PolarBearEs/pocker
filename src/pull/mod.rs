@@ -229,7 +229,8 @@ async fn load_reference_through_local_registry(
             .await?;
     let synthetic = registry.synthetic_reference();
     docker::pull_image(&synthetic).await?;
-    docker::tag_image(&synthetic, &reference.display_name()).await?;
+    let tag_result = docker::tag_image(&synthetic, &reference.display_name()).await;
     let _ = docker::remove_image_tag(&synthetic).await;
+    tag_result?;
     Ok(())
 }

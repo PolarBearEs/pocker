@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use percent_encoding::percent_decode_str;
@@ -164,12 +165,13 @@ async fn route_request(request: &Request, state: &RegistryState) -> RegistryResp
 
     if let Some(digest) = route_suffix(rest, &state.repository, "/blobs/") {
         let digest = percent_decode_path_segment(digest);
-        return match read_blob(state, &digest).await {
-            Ok(bytes) => RegistryResponse::bytes(
+        return match blob_response_body(state, &digest).await {
+            Ok((path, content_length)) => RegistryResponse::file(
                 200,
                 "OK",
                 BLOB_CONTENT_TYPE.to_string(),
-                bytes,
+                path,
+                content_length,
                 request.method == "HEAD",
             )
             .with_digest(&digest),
@@ -205,20 +207,30 @@ async fn read_manifest(state: &RegistryState) -> Result<(Vec<u8>, String)> {
     Ok((bytes, state.reference.manifest.media_type.clone()))
 }
 
-async fn read_blob(state: &RegistryState, digest: &str) -> Result<Vec<u8>> {
+async fn blob_response_body(state: &RegistryState, digest: &str) -> Result<(PathBuf, u64)> {
     let path = state.store.blob_path(digest)?;
-    if !path.exists() {
-        return Err(DockerPullError::MissingBlobFile(digest.to_string(), path));
-    }
-    tokio::fs::read(path).await.map_err(Into::into)
+    let metadata = tokio::fs::metadata(&path).await.map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            DockerPullError::MissingBlobFile(digest.to_string(), path.clone())
+        } else {
+            error.into()
+        }
+    })?;
+    Ok((path, metadata.len()))
+}
+
+enum RegistryBody {
+    Empty,
+    Bytes(Vec<u8>),
+    File(PathBuf),
 }
 
 struct RegistryResponse {
     status: u16,
     reason: &'static str,
     content_type: String,
-    body: Vec<u8>,
-    content_length: usize,
+    body: RegistryBody,
+    content_length: u64,
     digest: Option<String>,
 }
 
@@ -228,7 +240,7 @@ impl RegistryResponse {
             status,
             reason,
             content_type: "text/plain".to_string(),
-            body: Vec::new(),
+            body: RegistryBody::Empty,
             content_length: 0,
             digest: None,
         }
@@ -239,8 +251,8 @@ impl RegistryResponse {
             status,
             reason,
             content_type: "text/plain".to_string(),
-            content_length: text.len(),
-            body: text.into_bytes(),
+            content_length: text.len() as u64,
+            body: RegistryBody::Bytes(text.into_bytes()),
             digest: None,
         }
     }
@@ -257,8 +269,34 @@ impl RegistryResponse {
             status,
             reason,
             content_type,
+            content_length: content_length as u64,
+            body: if headers_only {
+                RegistryBody::Empty
+            } else {
+                RegistryBody::Bytes(bytes)
+            },
+            digest: None,
+        }
+    }
+
+    fn file(
+        status: u16,
+        reason: &'static str,
+        content_type: String,
+        path: PathBuf,
+        content_length: u64,
+        headers_only: bool,
+    ) -> Self {
+        Self {
+            status,
+            reason,
+            content_type,
             content_length,
-            body: if headers_only { Vec::new() } else { bytes },
+            body: if headers_only {
+                RegistryBody::Empty
+            } else {
+                RegistryBody::File(path)
+            },
             digest: None,
         }
     }
@@ -280,7 +318,14 @@ async fn write_response(stream: &mut TcpStream, response: RegistryResponse) -> R
     }
     headers.push_str("\r\n");
     stream.write_all(headers.as_bytes()).await?;
-    stream.write_all(&response.body).await?;
+    match response.body {
+        RegistryBody::Empty => {}
+        RegistryBody::Bytes(bytes) => stream.write_all(&bytes).await?,
+        RegistryBody::File(path) => {
+            let mut file = tokio::fs::File::open(path).await?;
+            tokio::io::copy(&mut file, stream).await?;
+        }
+    }
     stream.flush().await?;
     stream.shutdown().await?;
     Ok(())
