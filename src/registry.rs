@@ -31,6 +31,8 @@ pub struct RegistryClient {
     token_cache: Arc<Mutex<HashMap<String, String>>>,
     plain_http: bool,
     request_retry_limit: u32,
+    cache_from: Option<Url>,
+    cache_only: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -85,6 +87,21 @@ pub struct BlobMetadata {
     pub size: Option<u64>,
 }
 
+struct RegistryRequest<'a> {
+    method: Method,
+    url: Url,
+    fallback_url: Option<Url>,
+    accept: Option<&'a str>,
+    range: Option<&'a str>,
+    allow_retry: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct RawManifest {
+    pub descriptor: Descriptor,
+    pub bytes: Vec<u8>,
+}
+
 impl RegistryClient {
     pub fn new(
         client: Client,
@@ -92,13 +109,69 @@ impl RegistryClient {
         plain_http: bool,
         request_retry_limit: u32,
     ) -> Self {
+        Self::new_with_cache_from(client, auth, plain_http, request_retry_limit, None, false)
+    }
+
+    pub fn new_with_cache_from(
+        client: Client,
+        auth: Arc<AuthResolver>,
+        plain_http: bool,
+        request_retry_limit: u32,
+        cache_from: Option<Url>,
+        cache_only: bool,
+    ) -> Self {
         Self {
             client,
             auth,
             token_cache: Arc::new(Mutex::new(HashMap::new())),
             plain_http,
             request_retry_limit,
+            cache_from,
+            cache_only,
         }
+    }
+
+    pub async fn get_manifest_raw(
+        &self,
+        reference: &ImageReference,
+        accept: Option<&str>,
+    ) -> Result<RawManifest> {
+        let response = self
+            .send(
+                RegistryRequest {
+                    method: Method::GET,
+                    url: self.manifest_url(reference)?,
+                    fallback_url: self.fallback_manifest_url(reference)?,
+                    accept,
+                    range: None,
+                    allow_retry: true,
+                },
+                reference,
+            )
+            .await?;
+        raw_manifest_from_response(response).await
+    }
+
+    pub async fn get_manifest_digest_raw(
+        &self,
+        reference: &ImageReference,
+        digest: &str,
+        accept: Option<&str>,
+    ) -> Result<RawManifest> {
+        let response = self
+            .send(
+                RegistryRequest {
+                    method: Method::GET,
+                    url: self.manifest_digest_url(reference, digest)?,
+                    fallback_url: self.fallback_manifest_digest_url(reference, digest)?,
+                    accept,
+                    range: None,
+                    allow_retry: true,
+                },
+                reference,
+            )
+            .await?;
+        raw_manifest_from_response(response).await
     }
 
     pub async fn resolve_image(
@@ -109,12 +182,15 @@ impl RegistryClient {
         let url = self.manifest_url(reference)?;
         let response = self
             .send(
-                Method::GET,
-                url,
+                RegistryRequest {
+                    method: Method::GET,
+                    url,
+                    fallback_url: self.fallback_manifest_url(reference)?,
+                    accept: Some(MANIFEST_ACCEPT),
+                    range: None,
+                    allow_retry: true,
+                },
                 reference,
-                Some(MANIFEST_ACCEPT),
-                None,
-                true,
             )
             .await?;
         if response.status() == StatusCode::NOT_FOUND {
@@ -174,12 +250,16 @@ impl RegistryClient {
             let manifest_url = self.manifest_digest_url(reference, &descriptor.digest)?;
             let response = self
                 .send(
-                    Method::GET,
-                    manifest_url,
+                    RegistryRequest {
+                        method: Method::GET,
+                        url: manifest_url,
+                        fallback_url: self
+                            .fallback_manifest_digest_url(reference, &descriptor.digest)?,
+                        accept: Some(MANIFEST_ACCEPT),
+                        range: None,
+                        allow_retry: true,
+                    },
                     reference,
-                    Some(MANIFEST_ACCEPT),
-                    None,
-                    true,
                 )
                 .await?;
             if response.status() == StatusCode::NOT_FOUND {
@@ -226,12 +306,15 @@ impl RegistryClient {
     ) -> Result<BlobMetadata> {
         let response = self
             .send(
-                Method::HEAD,
-                self.blob_url(reference, digest)?,
+                RegistryRequest {
+                    method: Method::HEAD,
+                    url: self.blob_url(reference, digest)?,
+                    fallback_url: self.fallback_blob_url(reference, digest)?,
+                    accept: None,
+                    range: None,
+                    allow_retry: true,
+                },
                 reference,
-                None,
-                None,
-                true,
             )
             .await?;
         if response.status() == StatusCode::NOT_FOUND {
@@ -253,12 +336,15 @@ impl RegistryClient {
     ) -> Result<Response> {
         let range = (offset > 0).then(|| format!("bytes={offset}-"));
         self.send(
-            Method::GET,
-            self.blob_url(reference, digest)?,
+            RegistryRequest {
+                method: Method::GET,
+                url: self.blob_url(reference, digest)?,
+                fallback_url: self.fallback_blob_url(reference, digest)?,
+                accept: None,
+                range: range.as_deref(),
+                allow_retry: true,
+            },
             reference,
-            None,
-            range.as_deref(),
-            true,
         )
         .await
     }
@@ -276,6 +362,25 @@ impl RegistryClient {
     }
 
     fn manifest_url(&self, reference: &ImageReference) -> Result<Url> {
+        if let Some(cache_from) = &self.cache_from {
+            return cache_url(
+                cache_from,
+                reference,
+                "manifests",
+                reference.manifest_reference(),
+            );
+        }
+        self.direct_manifest_url(reference)
+    }
+
+    fn fallback_manifest_url(&self, reference: &ImageReference) -> Result<Option<Url>> {
+        if self.uses_cache_from() && !self.cache_only {
+            return self.direct_manifest_url(reference).map(Some);
+        }
+        Ok(None)
+    }
+
+    fn direct_manifest_url(&self, reference: &ImageReference) -> Result<Url> {
         Url::parse(&format!(
             "{}://{}/v2/{}/manifests/{}",
             self.scheme(),
@@ -287,6 +392,24 @@ impl RegistryClient {
     }
 
     fn manifest_digest_url(&self, reference: &ImageReference, digest: &str) -> Result<Url> {
+        if let Some(cache_from) = &self.cache_from {
+            return cache_url(cache_from, reference, "manifests", digest);
+        }
+        self.direct_manifest_digest_url(reference, digest)
+    }
+
+    fn fallback_manifest_digest_url(
+        &self,
+        reference: &ImageReference,
+        digest: &str,
+    ) -> Result<Option<Url>> {
+        if self.uses_cache_from() && !self.cache_only {
+            return self.direct_manifest_digest_url(reference, digest).map(Some);
+        }
+        Ok(None)
+    }
+
+    fn direct_manifest_digest_url(&self, reference: &ImageReference, digest: &str) -> Result<Url> {
         Url::parse(&format!(
             "{}://{}/v2/{}/manifests/{digest}",
             self.scheme(),
@@ -297,6 +420,20 @@ impl RegistryClient {
     }
 
     fn blob_url(&self, reference: &ImageReference, digest: &str) -> Result<Url> {
+        if let Some(cache_from) = &self.cache_from {
+            return cache_url(cache_from, reference, "blobs", digest);
+        }
+        self.direct_blob_url(reference, digest)
+    }
+
+    fn fallback_blob_url(&self, reference: &ImageReference, digest: &str) -> Result<Option<Url>> {
+        if self.uses_cache_from() && !self.cache_only {
+            return self.direct_blob_url(reference, digest).map(Some);
+        }
+        Ok(None)
+    }
+
+    fn direct_blob_url(&self, reference: &ImageReference, digest: &str) -> Result<Url> {
         Url::parse(&format!(
             "{}://{}/v2/{}/blobs/{digest}",
             self.scheme(),
@@ -312,35 +449,64 @@ impl RegistryClient {
 
     async fn send(
         &self,
-        method: Method,
+        request: RegistryRequest<'_>,
+        reference: &ImageReference,
+    ) -> Result<Response> {
+        let response = self
+            .send_to_url(
+                &request,
+                request.url.clone(),
+                reference,
+                self.uses_cache_from(),
+            )
+            .await?;
+        if response.status() == StatusCode::NOT_FOUND
+            && let Some(fallback_url) = request.fallback_url.clone()
+        {
+            return self
+                .send_to_url(&request, fallback_url, reference, false)
+                .await;
+        }
+        Ok(response)
+    }
+
+    async fn send_to_url(
+        &self,
+        request: &RegistryRequest<'_>,
         url: Url,
         reference: &ImageReference,
-        accept: Option<&str>,
-        range: Option<&str>,
-        allow_retry: bool,
+        cache_request: bool,
     ) -> Result<Response> {
         let cache_key = token_cache_key(reference);
         let mut retries = 0_u32;
         let mut auth_retries = 0_u32;
         loop {
-            let token = self.token_cache.lock().await.get(&cache_key).cloned();
-            let credentials = self.auth.resolve(&reference.registry)?;
-            let mut request = self.client.request(method.clone(), url.clone());
-            if let Some(accept) = accept {
-                request = request.header(ACCEPT, accept);
+            let token = if cache_request {
+                None
+            } else {
+                self.token_cache.lock().await.get(&cache_key).cloned()
+            };
+            let credentials = if cache_request {
+                None
+            } else {
+                self.auth.resolve(&reference.registry)?
+            };
+            let mut builder = self.client.request(request.method.clone(), url.clone());
+            if let Some(accept) = request.accept {
+                builder = builder.header(ACCEPT, accept);
             }
-            if let Some(range) = range {
-                request = request.header(RANGE, range);
+            if let Some(range) = request.range {
+                builder = builder.header(RANGE, range);
             }
             if let Some(token) = &token {
-                request = request.bearer_auth(token);
+                builder = builder.bearer_auth(token);
             } else if let Some(Credentials::Basic { username, password }) = &credentials {
-                request = request.basic_auth(username, Some(password));
+                builder = builder.basic_auth(username, Some(password));
             }
 
-            let response = match request.send().await {
+            let response = match builder.send().await {
                 Ok(response) => response,
-                Err(error) if allow_retry && is_retryable_http_error(&error) => {
+                Err(error) if request.allow_retry && is_retryable_http_error(&error) => {
                     let detail = error.to_string();
                     if request_retry_limit_exhausted(retries, self.request_retry_limit) {
                         return Err(retry_limit_exceeded("registry request", retries, detail));
@@ -358,6 +524,10 @@ impl RegistryClient {
                 }
                 Err(error) => return Err(error.into()),
             };
+
+            if response.status() == StatusCode::UNAUTHORIZED && cache_request {
+                return Err(DockerPullError::Unauthorized(reference.normalized()));
+            }
 
             if response.status() == StatusCode::UNAUTHORIZED {
                 if auth_retries >= MAX_AUTH_RETRIES {
@@ -385,7 +555,7 @@ impl RegistryClient {
                 return Err(DockerPullError::Unauthorized(reference.normalized()));
             }
 
-            if allow_retry && is_retryable_status(response.status()) {
+            if request.allow_retry && is_retryable_status(response.status()) {
                 let status = response.status();
                 if request_retry_limit_exhausted(retries, self.request_retry_limit) {
                     return Err(retry_limit_exceeded(
@@ -414,7 +584,7 @@ impl RegistryClient {
                 )));
             }
 
-            debug!("registry {} {}", method, url);
+            debug!("registry {} {}", request.method, url);
             return Ok(response);
         }
     }
@@ -449,6 +619,78 @@ impl RegistryClient {
         let body: TokenResponse = response.json().await?;
         Ok(body.token.or(body.access_token))
     }
+
+    fn uses_cache_from(&self) -> bool {
+        self.cache_from.is_some()
+    }
+}
+
+async fn raw_manifest_from_response(response: Response) -> Result<RawManifest> {
+    if response.status() == StatusCode::NOT_FOUND {
+        return Err(DockerPullError::ManifestNotFound);
+    }
+    if !response.status().is_success() {
+        return Err(DockerPullError::BadResponse(format!(
+            "registry returned {} for manifest",
+            response.status()
+        )));
+    }
+    let digest = header_string(&response, "docker-content-digest")?;
+    let media_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.split(';').next().unwrap_or(value).trim().to_string())
+        .unwrap_or_default();
+    let bytes = response.bytes().await?.to_vec();
+    let envelope: ManifestEnvelope = serde_json::from_slice(&bytes)?;
+    Ok(RawManifest {
+        descriptor: Descriptor {
+            media_type: if media_type.is_empty() {
+                envelope.media_type
+            } else {
+                media_type
+            },
+            digest: digest.unwrap_or_else(|| digest_bytes(&bytes)),
+            size: bytes.len() as i64,
+            platform: None,
+            annotations: None,
+        },
+        bytes,
+    })
+}
+
+pub fn cache_repository(registry: &str, repository: &str) -> String {
+    format!("{registry}/{repository}")
+}
+
+pub fn decode_cache_repository(repository: &str) -> Result<(String, String)> {
+    let mut parts = repository.splitn(2, '/');
+    let Some(registry) = parts.next() else {
+        return Err(invalid_cache_repository(repository));
+    };
+    let Some(upstream_repository) = parts.next() else {
+        return Err(invalid_cache_repository(repository));
+    };
+    if registry.is_empty() || upstream_repository.is_empty() {
+        return Err(invalid_cache_repository(repository));
+    }
+    Ok((registry.to_string(), upstream_repository.to_string()))
+}
+
+fn invalid_cache_repository(repository: &str) -> DockerPullError {
+    DockerPullError::InvalidInput(format!("invalid pocker cache repository `{repository}`"))
+}
+
+fn cache_url(
+    base_url: &Url,
+    reference: &ImageReference,
+    resource: &str,
+    suffix: &str,
+) -> Result<Url> {
+    let base = base_url.as_str().trim_end_matches('/');
+    let repository = cache_repository(&reference.registry, &reference.repository);
+    Url::parse(&format!("{base}/v2/{repository}/{resource}/{suffix}")).map_err(Into::into)
 }
 
 fn token_cache_key(reference: &ImageReference) -> String {
@@ -619,7 +861,10 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
-    use super::{DEFAULT_REQUEST_RETRIES, RegistryClient, parse_www_authenticate, token_cache_key};
+    use super::{
+        DEFAULT_REQUEST_RETRIES, RegistryClient, cache_repository, decode_cache_repository,
+        parse_www_authenticate, token_cache_key,
+    };
     use crate::auth::AuthResolver;
     use crate::error::DockerPullError;
     use crate::platform::Platform;
@@ -704,6 +949,24 @@ mod tests {
         );
     }
 
+    #[test]
+    fn cache_repository_keeps_registry_as_first_segment() {
+        let repository = cache_repository("registry.example:5000", "team/app");
+
+        assert_eq!(repository, "registry.example:5000/team/app");
+        assert_eq!(
+            decode_cache_repository(&repository).expect("cache repository should decode"),
+            ("registry.example:5000".to_string(), "team/app".to_string())
+        );
+    }
+
+    #[test]
+    fn decode_cache_repository_rejects_malformed_paths() {
+        assert!(decode_cache_repository("registry.example").is_err());
+        assert!(decode_cache_repository("/team/app").is_err());
+        assert!(decode_cache_repository("registry.example/").is_err());
+    }
+
     #[tokio::test]
     async fn missing_child_manifest_from_index_reports_manifest_not_found() {
         let listener = TcpListener::bind("127.0.0.1:0")
@@ -778,5 +1041,135 @@ mod tests {
         assert!(matches!(error, DockerPullError::ManifestNotFound));
 
         server.await.expect("server task should finish");
+    }
+
+    #[tokio::test]
+    async fn cache_from_manifest_miss_falls_back_to_upstream() {
+        let cache = spawn_single_response(
+            b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
+        )
+        .await;
+        let manifest = sample_manifest_bytes();
+        let upstream = spawn_single_response(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.oci.image.manifest.v1+json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                manifest.len(),
+                std::str::from_utf8(&manifest).expect("manifest should be utf8"),
+            )
+            .into_bytes(),
+        )
+        .await;
+        let client = cache_from_client(cache, false);
+        let reference = ImageReference::parse(&format!("{upstream}/sample:latest"))
+            .expect("reference should parse");
+
+        client
+            .resolve_image(
+                &reference,
+                &Platform::parse("linux/amd64").expect("platform should parse"),
+            )
+            .await
+            .expect("cache miss should fall back to upstream");
+    }
+
+    #[tokio::test]
+    async fn cache_only_manifest_miss_does_not_fall_back_to_upstream() {
+        let cache = spawn_single_response(
+            b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
+        )
+        .await;
+        let client = cache_from_client(cache, true);
+        let reference =
+            ImageReference::parse("127.0.0.1:1/sample:latest").expect("reference should parse");
+
+        let error = client
+            .resolve_image(
+                &reference,
+                &Platform::parse("linux/amd64").expect("platform should parse"),
+            )
+            .await
+            .expect_err("cache-only miss should fail");
+
+        assert!(matches!(error, DockerPullError::ManifestNotFound));
+    }
+
+    #[tokio::test]
+    async fn cache_from_blob_miss_falls_back_to_upstream() {
+        let cache = spawn_single_response(
+            b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
+        )
+        .await;
+        let body = b"blob";
+        let upstream = spawn_single_response(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                std::str::from_utf8(body).expect("blob should be utf8"),
+            )
+            .into_bytes(),
+        )
+        .await;
+        let client = cache_from_client(cache, false);
+        let reference = ImageReference::parse(&format!("{upstream}/sample:latest"))
+            .expect("reference should parse");
+
+        let bytes = client
+            .get_blob_bytes(
+                &reference,
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )
+            .await
+            .expect("cache blob miss should fall back to upstream");
+
+        assert_eq!(bytes, body);
+    }
+
+    async fn spawn_single_response(response: Vec<u8>) -> std::net::SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let address = listener.local_addr().expect("listener address");
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("connection should arrive");
+            let mut buffer = [0_u8; 4096];
+            let _ = stream.read(&mut buffer).await;
+            stream
+                .write_all(&response)
+                .await
+                .expect("response should be written");
+        });
+        address
+    }
+
+    fn cache_from_client(cache: std::net::SocketAddr, cache_only: bool) -> RegistryClient {
+        RegistryClient::new_with_cache_from(
+            reqwest::Client::builder()
+                .https_only(false)
+                .build()
+                .expect("client should build"),
+            Arc::new(AuthResolver::new(None).expect("auth resolver should build")),
+            true,
+            DEFAULT_REQUEST_RETRIES,
+            Some(
+                format!("http://{cache}")
+                    .parse()
+                    .expect("cache URL should parse"),
+            ),
+            cache_only,
+        )
+    }
+
+    fn sample_manifest_bytes() -> Vec<u8> {
+        br#"{
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+                "size": 2
+            },
+            "layers": []
+        }"#
+        .to_vec()
     }
 }

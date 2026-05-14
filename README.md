@@ -41,6 +41,21 @@ Pull a specific platform:
 pocker pull --platform linux/arm64 ghcr.io/example/app:latest
 ```
 
+Pull through another pocker cache server:
+
+```bash
+pocker pull --cache-from http://cache.example:5000 alpine:latest
+```
+
+The cache server sees normalized upstream image paths, so `alpine:latest` is served
+through a path like `cache.example:5000/registry-1.docker.io/library/alpine:latest`.
+By default, cache misses fall back to the upstream registry. To require that all
+content comes from the cache server:
+
+```bash
+pocker pull --cache-from http://cache.example:5000 --cache-only alpine:latest
+```
+
 Import through a temporary local registry instead of Docker's archive load API:
 
 ```bash
@@ -87,12 +102,26 @@ Pull Compose service images:
 ```bash
 pocker compose pull
 pocker compose -f docker-compose.prod.yml pull api worker
+pocker compose pull --cache-from http://cache.example:5000
 ```
 
 Pull more than one Compose image at a time:
 
 ```bash
 pocker compose pull --max-parallel-images 4
+```
+
+Serve the local pocker cache as an OCI registry-compatible cache:
+
+```bash
+pocker serve --listen 0.0.0.0:5000
+```
+
+By default, `pocker serve` is cache-only and returns `404` for missing content. To let
+the serving instance fetch missing manifests and blobs from upstream registries:
+
+```bash
+pocker serve --listen 0.0.0.0:5000 --pull-missing
 ```
 
 Docker image helpers:
@@ -111,6 +140,7 @@ See full help:
 pocker --help
 pocker cache --help
 pocker pull --help
+pocker serve --help
 pocker compose --help
 pocker image --help
 ```
@@ -120,10 +150,13 @@ pocker image --help
 - Docker access uses `DOCKER_HOST` if set, otherwise `/var/run/docker.sock`
 - Registry auth is reused from Docker config when available
 - Use `--cache-dir` to override the default local cache location
+- Use `pocker serve` with `pocker pull --cache-from` to pull through another pocker cache
 - Use `pocker cache clean` to wipe and recreate the local cache directory
 - Use `--blob-retries` to raise the retry budget for unstable connections; `0` means unlimited retries
 - Use `--request-retries` to raise the retry budget for request/connect/503-style failures; `0` means unlimited retries
 - Registry retries are bounded by default; setting a retry flag to `0` makes that retry path unlimited
+- `pocker serve` is cache-only by default; `--pull-missing` explicitly allows upstream registry requests
+- Upstream auth for `pocker serve --pull-missing` is resolved on the serving instance, not forwarded by clients
 - `--load-mode registry` is experimental and requires the Docker daemon to reach pocker on `127.0.0.1`; use the default `stream` mode for remote Docker daemons or unsupported environments
 - `pocker compose` parses Compose files itself and does not require the Docker Compose CLI
 - Compose file selection supports default compose file discovery and repeated `-f/--file`
@@ -147,3 +180,4 @@ pocker image --help
 - Docker image workflows require access to a Docker daemon socket
 - Private registry pulls require either `--username` with `--password-stdin` or Docker config-based auth
 - Plain HTTP registries require `--plain-http`
+- Plain HTTP pocker cache servers can be used with `--cache-from http://host:port`
