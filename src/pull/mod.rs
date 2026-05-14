@@ -75,7 +75,6 @@ impl Puller {
             manifest: resolved.manifest.clone(),
             config_digest: resolved.config.digest.clone(),
         };
-        self.context.store.save_reference(&stored_reference).await?;
 
         if !options.no_load
             && finalize_existing_reference(&self.context, &reference, &stored_reference, &options)
@@ -144,6 +143,8 @@ impl Puller {
             })??;
         }
 
+        self.context.store.save_reference(&stored_reference).await?;
+
         if options.no_load {
             self.context.ui.finish_image(&normalized, "Pulled");
         } else {
@@ -190,6 +191,8 @@ async fn finalize_existing_reference(
     }
 
     context.ui.set_image_status(normalized, "Already exists");
+    context.ui.prepare_layers(&[]);
+    context.store.save_reference(stored_reference).await?;
     if !options.keep_layer_blobs {
         context.ui.set_image_status(normalized, "Pruning cache");
         context
