@@ -10,6 +10,7 @@ use crate::error::{DockerPullError, Result};
 use crate::pull::PullContext;
 use crate::reference::ImageReference;
 use crate::registry::Descriptor;
+use crate::store::DownloadPlan;
 
 const CHECKPOINT_BYTES: u64 = 8 * 1024 * 1024;
 const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(2);
@@ -71,20 +72,16 @@ pub async fn download_blob(
                 "registry ignored range request for {}, restarting blob",
                 descriptor.digest
             );
-            context
-                .store
-                .reset_partial(&descriptor.digest, expected_size)
-                .await?;
-            offset = 0;
-            plan = context
-                .store
-                .prepare_download(normalized_reference, &descriptor, expected_size)
-                .await?;
-            context
-                .ui
-                .start_layer_download(&descriptor.digest, expected_size, offset);
-            bytes_since_checkpoint = 0;
-            last_checkpoint = Instant::now();
+            reset_download_state(
+                context,
+                normalized_reference,
+                &descriptor,
+                expected_size,
+                &mut plan,
+                &mut offset,
+            )
+            .await?;
+            reset_checkpoint_tracking(&mut bytes_since_checkpoint, &mut last_checkpoint);
             tokio::time::sleep(delay).await;
             continue;
         }
@@ -101,12 +98,8 @@ pub async fn download_blob(
                 .store
                 .reset_partial(&descriptor.digest, expected_size)
                 .await?;
-            offset = 0;
-            context
-                .ui
-                .start_layer_download(&descriptor.digest, expected_size, offset);
-            bytes_since_checkpoint = 0;
-            last_checkpoint = Instant::now();
+            reset_download_progress(context, &descriptor.digest, expected_size, &mut offset);
+            reset_checkpoint_tracking(&mut bytes_since_checkpoint, &mut last_checkpoint);
             tokio::time::sleep(delay).await;
             continue;
         }
@@ -207,6 +200,43 @@ fn validate_blob_response_status(status: StatusCode, offset: u64, digest: &str) 
     Err(DockerPullError::BadResponse(format!(
         "unexpected blob response status {status} for {digest} at offset {offset}"
     )))
+}
+
+async fn reset_download_state(
+    context: &PullContext,
+    normalized_reference: &str,
+    descriptor: &Descriptor,
+    expected_size: u64,
+    plan: &mut DownloadPlan,
+    offset: &mut u64,
+) -> Result<()> {
+    context
+        .store
+        .reset_partial(&descriptor.digest, expected_size)
+        .await?;
+    *plan = context
+        .store
+        .prepare_download(normalized_reference, descriptor, expected_size)
+        .await?;
+    reset_download_progress(context, &descriptor.digest, expected_size, offset);
+    Ok(())
+}
+
+fn reset_download_progress(
+    context: &PullContext,
+    digest: &str,
+    expected_size: u64,
+    offset: &mut u64,
+) {
+    *offset = 0;
+    context
+        .ui
+        .start_layer_download(digest, expected_size, *offset);
+}
+
+fn reset_checkpoint_tracking(bytes_since_checkpoint: &mut u64, last_checkpoint: &mut Instant) {
+    *bytes_since_checkpoint = 0;
+    *last_checkpoint = Instant::now();
 }
 
 fn retry_delay(offset: u64) -> Duration {
