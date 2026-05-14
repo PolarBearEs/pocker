@@ -197,12 +197,7 @@ impl RegistryClient {
             return Err(DockerPullError::ManifestNotFound);
         }
         let digest = header_string(&response, "docker-content-digest")?;
-        let media_type = response
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .map(|value| value.split(';').next().unwrap_or(value).trim().to_string())
-            .unwrap_or_default();
+        let media_type = response_content_media_type(&response);
         let body = response.bytes().await?.to_vec();
         let envelope: ManifestEnvelope = serde_json::from_slice(&body)?;
         if envelope.schema_version != 2 {
@@ -381,14 +376,7 @@ impl RegistryClient {
     }
 
     fn direct_manifest_url(&self, reference: &ImageReference) -> Result<Url> {
-        Url::parse(&format!(
-            "{}://{}/v2/{}/manifests/{}",
-            self.scheme(),
-            reference.registry,
-            reference.repository,
-            reference.manifest_reference()
-        ))
-        .map_err(Into::into)
+        self.direct_resource_url(reference, "manifests", reference.manifest_reference())
     }
 
     fn manifest_digest_url(&self, reference: &ImageReference, digest: &str) -> Result<Url> {
@@ -410,13 +398,7 @@ impl RegistryClient {
     }
 
     fn direct_manifest_digest_url(&self, reference: &ImageReference, digest: &str) -> Result<Url> {
-        Url::parse(&format!(
-            "{}://{}/v2/{}/manifests/{digest}",
-            self.scheme(),
-            reference.registry,
-            reference.repository
-        ))
-        .map_err(Into::into)
+        self.direct_resource_url(reference, "manifests", digest)
     }
 
     fn blob_url(&self, reference: &ImageReference, digest: &str) -> Result<Url> {
@@ -434,8 +416,17 @@ impl RegistryClient {
     }
 
     fn direct_blob_url(&self, reference: &ImageReference, digest: &str) -> Result<Url> {
+        self.direct_resource_url(reference, "blobs", digest)
+    }
+
+    fn direct_resource_url(
+        &self,
+        reference: &ImageReference,
+        resource: &str,
+        suffix: &str,
+    ) -> Result<Url> {
         Url::parse(&format!(
-            "{}://{}/v2/{}/blobs/{digest}",
+            "{}://{}/v2/{}/{resource}/{suffix}",
             self.scheme(),
             reference.registry,
             reference.repository
@@ -636,12 +627,7 @@ async fn raw_manifest_from_response(response: Response) -> Result<RawManifest> {
         )));
     }
     let digest = header_string(&response, "docker-content-digest")?;
-    let media_type = response
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .map(|value| value.split(';').next().unwrap_or(value).trim().to_string())
-        .unwrap_or_default();
+    let media_type = response_content_media_type(&response);
     let bytes = response.bytes().await?.to_vec();
     let envelope: ManifestEnvelope = serde_json::from_slice(&bytes)?;
     Ok(RawManifest {
@@ -832,6 +818,15 @@ fn header_string(response: &Response, name: &str) -> Result<Option<String>> {
         .get(name)
         .map(|value| value.to_str().map(ToString::to_string))
         .transpose()?)
+}
+
+fn response_content_media_type(response: &Response) -> String {
+    response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.split(';').next().unwrap_or(value).trim().to_string())
+        .unwrap_or_default()
 }
 
 fn digest_bytes(bytes: &[u8]) -> String {

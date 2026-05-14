@@ -20,7 +20,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use auth::{AuthResolver, Credentials};
 use clap::Parser;
-use cli::{CacheCommands, Cli, Commands, ComposeCommands, ImageCommands};
+use cli::{
+    CacheCommands, Cli, Commands, ComposeCommands, ComposePullArgs, ImageCommands, PullArgs,
+};
 use error::{DockerPullError, Result};
 use http::build_http_client;
 use platform::Platform;
@@ -52,6 +54,55 @@ struct PullRequestOptions {
     cache_only: bool,
 }
 
+impl PullRequestOptions {
+    fn from_pull_args(args: PullArgs) -> (String, Self) {
+        (
+            args.reference,
+            Self {
+                platform: args.platform,
+                concurrency: args.concurrency,
+                image_concurrency: 1,
+                blob_retries: args.blob_retries,
+                request_retries: args.request_retries,
+                no_load: args.no_load,
+                keep_layer_blobs: args.keep_layer_blobs,
+                load_mode: args.load_mode,
+                plain_http: args.plain_http,
+                insecure_skip_tls_verify: args.insecure_skip_tls_verify,
+                ca_file: args.ca_file,
+                username: args.username,
+                password_stdin: args.password_stdin,
+                quiet: args.quiet,
+                no_animations: args.no_animations,
+                cache_from: args.cache_from,
+                cache_only: args.cache_only,
+            },
+        )
+    }
+
+    fn from_compose_pull_args(args: ComposePullArgs) -> Self {
+        Self {
+            platform: args.platform,
+            concurrency: args.concurrency,
+            image_concurrency: args.image_concurrency,
+            blob_retries: args.blob_retries,
+            request_retries: args.request_retries,
+            no_load: args.no_load,
+            keep_layer_blobs: args.keep_layer_blobs,
+            load_mode: args.load_mode,
+            plain_http: args.plain_http,
+            insecure_skip_tls_verify: args.insecure_skip_tls_verify,
+            ca_file: args.ca_file,
+            username: args.username,
+            password_stdin: args.password_stdin,
+            quiet: args.quiet,
+            no_animations: true,
+            cache_from: args.cache_from,
+            cache_only: args.cache_only,
+        }
+    }
+}
+
 #[derive(Clone)]
 struct SharedPullState {
     store: Arc<Store>,
@@ -77,29 +128,11 @@ async fn run() -> Result<()> {
 
     match cli.command {
         Commands::Pull(args) => {
-            let request = PullRequestOptions {
-                platform: args.platform,
-                concurrency: args.concurrency,
-                image_concurrency: 1,
-                blob_retries: args.blob_retries,
-                request_retries: args.request_retries,
-                no_load: args.no_load,
-                keep_layer_blobs: args.keep_layer_blobs,
-                load_mode: args.load_mode,
-                plain_http: args.plain_http,
-                insecure_skip_tls_verify: args.insecure_skip_tls_verify,
-                ca_file: args.ca_file,
-                username: args.username,
-                password_stdin: args.password_stdin,
-                quiet: args.quiet,
-                no_animations: args.no_animations,
-                cache_from: args.cache_from,
-                cache_only: args.cache_only,
-            };
+            let (reference, request) = PullRequestOptions::from_pull_args(args);
             pull_references(
                 &cli.global.cache_dir,
                 cli.global.quiet,
-                vec![args.reference],
+                vec![reference],
                 request,
             )
             .await?;
@@ -122,44 +155,13 @@ async fn run() -> Result<()> {
                 }
                 print_compose_pull_plan(&resolved, cli.global.quiet || pull_args.quiet);
                 let images = compose::unique_images(&resolved.images);
-                let request = PullRequestOptions {
-                    platform: pull_args.platform,
-                    concurrency: pull_args.concurrency,
-                    image_concurrency: pull_args.image_concurrency,
-                    blob_retries: pull_args.blob_retries,
-                    request_retries: pull_args.request_retries,
-                    no_load: pull_args.no_load,
-                    keep_layer_blobs: pull_args.keep_layer_blobs,
-                    load_mode: pull_args.load_mode,
-                    plain_http: pull_args.plain_http,
-                    insecure_skip_tls_verify: pull_args.insecure_skip_tls_verify,
-                    ca_file: pull_args.ca_file,
-                    username: pull_args.username,
-                    password_stdin: pull_args.password_stdin,
-                    quiet: pull_args.quiet,
-                    no_animations: true,
-                    cache_from: pull_args.cache_from,
-                    cache_only: pull_args.cache_only,
-                };
+                let request = PullRequestOptions::from_compose_pull_args(pull_args);
                 pull_references(&cli.global.cache_dir, cli.global.quiet, images, request).await?;
             }
         },
         Commands::Serve(args) => {
             let store = Arc::new(Store::open(cli.global.cache_dir.clone()).await?);
-            let password = if args.password_stdin {
-                Some(read_password_stdin()?)
-            } else {
-                None
-            };
-            let credentials = match (args.username, password) {
-                (Some(username), Some(password)) => Some(Credentials::Basic { username, password }),
-                (None, None) => None,
-                _ => {
-                    return Err(DockerPullError::InvalidInput(
-                        "`--username` requires `--password-stdin`".into(),
-                    ));
-                }
-            };
+            let credentials = read_credentials(args.username, args.password_stdin)?;
             let auth = Arc::new(AuthResolver::new(credentials)?);
             let client = Arc::new(RegistryClient::new(
                 build_http_client(
@@ -311,20 +313,7 @@ async fn pull_references(
         .transpose()?
         .unwrap_or_else(Platform::host);
     let ui = Arc::new(Ui::new(quiet, !request.no_animations));
-    let password = if request.password_stdin {
-        Some(read_password_stdin()?)
-    } else {
-        None
-    };
-    let credentials = match (request.username, password) {
-        (Some(username), Some(password)) => Some(Credentials::Basic { username, password }),
-        (None, None) => None,
-        _ => {
-            return Err(DockerPullError::InvalidInput(
-                "`--username` requires `--password-stdin`".into(),
-            ));
-        }
-    };
+    let credentials = read_credentials(request.username, request.password_stdin)?;
     let auth = Arc::new(AuthResolver::new(credentials)?);
     let client = Arc::new(RegistryClient::new_with_cache_from(
         build_http_client(
@@ -440,6 +429,22 @@ fn read_password_stdin() -> Result<String> {
     let mut password = String::new();
     std::io::stdin().read_to_string(&mut password)?;
     Ok(password.trim_end_matches(['\n', '\r']).to_string())
+}
+
+fn read_credentials(username: Option<String>, password_stdin: bool) -> Result<Option<Credentials>> {
+    let password = if password_stdin {
+        Some(read_password_stdin()?)
+    } else {
+        None
+    };
+
+    match (username, password) {
+        (Some(username), Some(password)) => Ok(Some(Credentials::Basic { username, password })),
+        (None, None) => Ok(None),
+        _ => Err(DockerPullError::InvalidInput(
+            "`--username` requires `--password-stdin`".into(),
+        )),
+    }
 }
 
 fn install_signal_handler() -> Arc<AtomicBool> {
