@@ -70,15 +70,33 @@ impl Puller {
             .await?;
         let config_bytes = load_blob_bytes(&self.context, &reference, &resolved.config).await?;
 
+        let stored_reference = StoredReference {
+            reference: normalized.clone(),
+            manifest: resolved.manifest.clone(),
+            config_digest: resolved.config.digest.clone(),
+        };
+        self.context.store.save_reference(&stored_reference).await?;
+
+        if !options.no_load
+            && finalize_existing_reference(&self.context, &reference, &stored_reference, &options)
+                .await?
+        {
+            return Ok(());
+        }
+
         let layers = pair_layers(resolved.layers.clone(), &config_bytes)?;
         let layer_digests = layers
             .iter()
             .map(|layer| layer.descriptor.digest.clone())
             .collect::<Vec<_>>();
         self.context.ui.prepare_layers(&layer_digests);
-        let daemon_layers = docker::daemon_layer_coverage(&layers)
-            .await
-            .unwrap_or_default();
+        let daemon_layers = if options.load_mode == LoadMode::Stream {
+            docker::daemon_layer_coverage(&layers)
+                .await
+                .unwrap_or_default()
+        } else {
+            Default::default()
+        };
         let mut downloads = Vec::new();
 
         for layer in layers {
@@ -126,17 +144,10 @@ impl Puller {
             })??;
         }
 
-        let stored_reference = StoredReference {
-            reference: normalized.clone(),
-            manifest: resolved.manifest.clone(),
-            config_digest: resolved.config.digest.clone(),
-        };
-        self.context.store.save_reference(&stored_reference).await?;
-
         if options.no_load {
             self.context.ui.finish_image(&normalized, "Pulled");
         } else {
-            finalize_reference(&self.context, &reference, &stored_reference, &options).await?;
+            load_reference(&self.context, &reference, &stored_reference, &options).await?;
         }
 
         Ok(())
@@ -164,51 +175,56 @@ async fn load_blob_bytes(
     Ok(bytes)
 }
 
-async fn finalize_reference(
+async fn finalize_existing_reference(
+    context: &PullContext,
+    reference: &ImageReference,
+    stored_reference: &StoredReference,
+    options: &PullOptions,
+) -> Result<bool> {
+    let normalized = &stored_reference.reference;
+    let already_loaded = docker::daemon_has_reference(reference, &stored_reference.config_digest)
+        .await
+        .unwrap_or(false);
+    if !already_loaded {
+        return Ok(false);
+    }
+
+    context.ui.set_image_status(normalized, "Already exists");
+    if !options.keep_layer_blobs {
+        context.ui.set_image_status(normalized, "Pruning cache");
+        context
+            .store
+            .prune_reference_layer_blobs(stored_reference)
+            .await?;
+    }
+    context.ui.finish_image(normalized, "Already exists");
+    Ok(true)
+}
+
+async fn load_reference(
     context: &PullContext,
     reference: &ImageReference,
     stored_reference: &StoredReference,
     options: &PullOptions,
 ) -> Result<()> {
     let normalized = &stored_reference.reference;
-    let already_loaded = docker::daemon_has_reference(reference, &stored_reference.config_digest)
-        .await
-        .unwrap_or(false);
-    if already_loaded {
-        context.ui.set_image_status(normalized, "Already exists");
-        if !options.keep_layer_blobs {
-            context.ui.set_image_status(normalized, "Pruning cache");
-            context
-                .store
-                .prune_reference_layer_blobs(stored_reference)
-                .await?;
+    context.ui.begin_load(normalized);
+    match options.load_mode {
+        LoadMode::Stream => {
+            docker::load_reference_archive_stream(&context.store, stored_reference).await?;
         }
-    } else {
-        context.ui.begin_load(normalized);
-        match options.load_mode {
-            LoadMode::Stream => {
-                docker::load_reference_archive_stream(&context.store, stored_reference).await?;
-            }
-            LoadMode::Registry => {
-                load_reference_through_cache_registry(context, reference, stored_reference).await?;
-            }
-        }
-        if !options.keep_layer_blobs {
-            context.ui.set_image_status(normalized, "Pruning cache");
-            context
-                .store
-                .prune_reference_layer_blobs(stored_reference)
-                .await?;
+        LoadMode::Registry => {
+            load_reference_through_cache_registry(context, reference, stored_reference).await?;
         }
     }
-    context.ui.finish_image(
-        normalized,
-        if already_loaded {
-            "Already exists"
-        } else {
-            "Ready"
-        },
-    );
+    if !options.keep_layer_blobs {
+        context.ui.set_image_status(normalized, "Pruning cache");
+        context
+            .store
+            .prune_reference_layer_blobs(stored_reference)
+            .await?;
+    }
+    context.ui.finish_image(normalized, "Ready");
     Ok(())
 }
 
