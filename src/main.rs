@@ -438,11 +438,21 @@ fn read_credentials(username: Option<String>, password_stdin: bool) -> Result<Op
         None
     };
 
+    credentials_from_parts(username, password)
+}
+
+fn credentials_from_parts(
+    username: Option<String>,
+    password: Option<String>,
+) -> Result<Option<Credentials>> {
     match (username, password) {
         (Some(username), Some(password)) => Ok(Some(Credentials::Basic { username, password })),
         (None, None) => Ok(None),
-        _ => Err(DockerPullError::InvalidInput(
+        (Some(_), None) => Err(DockerPullError::InvalidInput(
             "`--username` requires `--password-stdin`".into(),
+        )),
+        (None, Some(_)) => Err(DockerPullError::InvalidInput(
+            "`--password-stdin` requires `--username`".into(),
         )),
     }
 }
@@ -662,5 +672,31 @@ fn format_created(created: Option<i64>) -> String {
         format!("1 {unit} ago")
     } else {
         format!("{value} {unit}s ago")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::credentials_from_parts;
+    use crate::error::DockerPullError;
+
+    #[test]
+    fn credentials_reject_username_without_password_stdin() {
+        let error = credentials_from_parts(Some("alice".into()), None)
+            .expect_err("username without password should fail");
+
+        assert!(
+            matches!(error, DockerPullError::InvalidInput(message) if message == "`--username` requires `--password-stdin`")
+        );
+    }
+
+    #[test]
+    fn credentials_reject_password_stdin_without_username() {
+        let error = credentials_from_parts(None, Some("secret".into()))
+            .expect_err("password without username should fail");
+
+        assert!(
+            matches!(error, DockerPullError::InvalidInput(message) if message == "`--password-stdin` requires `--username`")
+        );
     }
 }
