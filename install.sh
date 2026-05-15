@@ -99,18 +99,29 @@ path_contains() {
   esac
 }
 
-if [ "${POCKER_INSTALL_DIR:-}" ]; then
-  install_dir="$POCKER_INSTALL_DIR"
-else
-  [ "${HOME:-}" ] || die "HOME is not set; set POCKER_INSTALL_DIR to choose an install directory"
-  install_dir="$HOME/.local/bin"
-fi
+default_install_dir() {
+  if [ "$(id -u)" -eq 0 ]; then
+    printf '%s\n' /usr/local/bin
+  elif [ -w /usr/local/bin ]; then
+    printf '%s\n' /usr/local/bin
+  else
+    [ "${HOME:-}" ] || die "HOME is not set; set POCKER_INSTALL_DIR to choose an install directory"
+    printf '%s\n' "$HOME/.local/bin"
+  fi
+}
 
+need_cmd id
 need_cmd uname
 need_cmd mktemp
 need_cmd chmod
 need_cmd mkdir
 need_cmd awk
+
+if [ "${POCKER_INSTALL_DIR:-}" ]; then
+  install_dir="$POCKER_INSTALL_DIR"
+else
+  install_dir="$(default_install_dir)"
+fi
 
 detect_asset
 
