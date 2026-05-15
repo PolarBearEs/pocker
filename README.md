@@ -14,6 +14,21 @@ It pulls images directly from registries, resumes interrupted downloads from a l
 
 ## Install
 
+Install the latest prebuilt binary:
+
+```bash
+curl -fsSL https://github.com/PolarBearEs/pocker/releases/latest/download/install.sh | sh
+```
+
+To install a specific release or install somewhere else:
+
+```bash
+curl -fsSL https://github.com/PolarBearEs/pocker/releases/download/v0.1.3/install.sh | \
+  POCKER_VERSION=v0.1.3 POCKER_INSTALL_DIR=/usr/local/bin sh
+```
+
+Or install from source:
+
 ```bash
 cargo install --path .
 ```
