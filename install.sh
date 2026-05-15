@@ -53,16 +53,43 @@ download() {
   fi
 }
 
-verify_checksum() {
-  checksum_file="$1"
+extract_asset_digest() {
+  metadata_file="$1"
+
+  awk -v wanted="$asset" '
+    $0 ~ "\"name\"[[:space:]]*:" {
+      in_asset = ($0 ~ "\"name\"[[:space:]]*:[[:space:]]*\"" wanted "\"")
+    }
+    in_asset && $0 ~ "\"digest\"[[:space:]]*:" {
+      if (match($0, /"digest"[[:space:]]*:[[:space:]]*"sha256:[0-9A-Fa-f]+"/)) {
+        digest = substr($0, RSTART, RLENGTH)
+        sub(/^.*sha256:/, "", digest)
+        sub(/"$/, "", digest)
+        print tolower(digest)
+        exit
+      }
+    }
+  ' "$metadata_file"
+}
+
+file_sha256() {
+  file="$1"
 
   if command -v sha256sum >/dev/null 2>&1; then
-    (cd "$tmp_dir" && sha256sum -c "$checksum_file")
+    sha256sum "$file" | awk '{ print $1 }'
   elif command -v shasum >/dev/null 2>&1; then
-    (cd "$tmp_dir" && shasum -a 256 -c "$checksum_file")
+    shasum -a 256 "$file" | awk '{ print $1 }'
   else
     die "missing required command: sha256sum or shasum"
   fi
+}
+
+verify_digest() {
+  expected="$1"
+  actual="$(file_sha256 "$tmp_bin")"
+
+  [ "$actual" = "$expected" ] || die "checksum mismatch for $asset"
+  printf 'Verified SHA256 %s\n' "$expected"
 }
 
 path_contains() {
@@ -83,29 +110,33 @@ need_cmd uname
 need_cmd mktemp
 need_cmd chmod
 need_cmd mkdir
+need_cmd awk
 
 detect_asset
 
 if [ "$version" = "latest" ]; then
   base_url="https://github.com/$repo/releases/latest/download"
+  metadata_url="https://api.github.com/repos/$repo/releases/latest"
 else
   base_url="https://github.com/$repo/releases/download/$version"
+  metadata_url="https://api.github.com/repos/$repo/releases/tags/$version"
 fi
 
 url="$base_url/$asset"
-checksum_url="$base_url/$asset.sha256"
 
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "$tmp_dir"' EXIT HUP INT TERM
 
 tmp_bin="$tmp_dir/$asset"
-tmp_checksum="$tmp_dir/$asset.sha256"
+tmp_metadata="$tmp_dir/release.json"
 dest="$install_dir/$bin_name"
 
 printf 'Downloading %s from %s\n' "$bin_name" "$url"
 download "$url" "$tmp_bin"
-download "$checksum_url" "$tmp_checksum"
-verify_checksum "$tmp_checksum"
+download "$metadata_url" "$tmp_metadata"
+expected_digest="$(extract_asset_digest "$tmp_metadata")"
+[ "$expected_digest" ] || die "GitHub release metadata did not include a SHA256 digest for $asset"
+verify_digest "$expected_digest"
 chmod 0755 "$tmp_bin"
 
 mkdir -p "$install_dir"
