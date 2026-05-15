@@ -99,18 +99,27 @@ path_contains() {
   esac
 }
 
-if [ "${POCKER_INSTALL_DIR:-}" ]; then
-  install_dir="$POCKER_INSTALL_DIR"
-else
+default_install_dir() {
   [ "${HOME:-}" ] || die "HOME is not set; set POCKER_INSTALL_DIR to choose an install directory"
-  install_dir="$HOME/.local/bin"
-fi
+
+  if path_contains "$HOME/.local/bin"; then
+    printf '%s\n' "$HOME/.local/bin"
+  else
+    printf '%s\n' /usr/local/bin
+  fi
+}
 
 need_cmd uname
 need_cmd mktemp
 need_cmd chmod
 need_cmd mkdir
 need_cmd awk
+
+if [ "${POCKER_INSTALL_DIR:-}" ]; then
+  install_dir="$POCKER_INSTALL_DIR"
+else
+  install_dir="$(default_install_dir)"
+fi
 
 detect_asset
 
@@ -140,6 +149,8 @@ verify_digest "$expected_digest"
 chmod 0755 "$tmp_bin"
 
 mkdir -p "$install_dir"
+[ -w "$install_dir" ] || die "cannot write to $install_dir; run with sudo or set POCKER_INSTALL_DIR"
+
 if command -v install >/dev/null 2>&1; then
   install -m 0755 "$tmp_bin" "$dest"
 else
@@ -148,7 +159,3 @@ else
 fi
 
 printf 'Installed %s to %s\n' "$bin_name" "$dest"
-
-if ! path_contains "$install_dir"; then
-  printf 'Add %s to PATH to run %s from any directory.\n' "$install_dir" "$bin_name"
-fi
