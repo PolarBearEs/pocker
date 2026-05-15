@@ -53,6 +53,18 @@ download() {
   fi
 }
 
+verify_checksum() {
+  checksum_file="$1"
+
+  if command -v sha256sum >/dev/null 2>&1; then
+    (cd "$tmp_dir" && sha256sum -c "$checksum_file")
+  elif command -v shasum >/dev/null 2>&1; then
+    (cd "$tmp_dir" && shasum -a 256 -c "$checksum_file")
+  else
+    die "missing required command: sha256sum or shasum"
+  fi
+}
+
 path_contains() {
   case ":${PATH:-}:" in
     *":$1:"*) return 0 ;;
@@ -75,19 +87,25 @@ need_cmd mkdir
 detect_asset
 
 if [ "$version" = "latest" ]; then
-  url="https://github.com/$repo/releases/latest/download/$asset"
+  base_url="https://github.com/$repo/releases/latest/download"
 else
-  url="https://github.com/$repo/releases/download/$version/$asset"
+  base_url="https://github.com/$repo/releases/download/$version"
 fi
+
+url="$base_url/$asset"
+checksum_url="$base_url/$asset.sha256"
 
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "$tmp_dir"' EXIT HUP INT TERM
 
-tmp_bin="$tmp_dir/$bin_name"
+tmp_bin="$tmp_dir/$asset"
+tmp_checksum="$tmp_dir/$asset.sha256"
 dest="$install_dir/$bin_name"
 
 printf 'Downloading %s from %s\n' "$bin_name" "$url"
 download "$url" "$tmp_bin"
+download "$checksum_url" "$tmp_checksum"
+verify_checksum "$tmp_checksum"
 chmod 0755 "$tmp_bin"
 
 mkdir -p "$install_dir"

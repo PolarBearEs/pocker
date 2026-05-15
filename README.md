@@ -17,13 +17,13 @@ It pulls images directly from registries, resumes interrupted downloads from a l
 Install the latest prebuilt binary:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/PolarBearEs/pocker/master/install.sh | sh
+curl -fsSL https://github.com/PolarBearEs/pocker/releases/latest/download/install.sh | sh
 ```
 
 To install a specific release or install somewhere else:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/PolarBearEs/pocker/master/install.sh | \
+curl -fsSL https://github.com/PolarBearEs/pocker/releases/download/v0.1.3/install.sh | \
   POCKER_VERSION=v0.1.3 POCKER_INSTALL_DIR=/usr/local/bin sh
 ```
 

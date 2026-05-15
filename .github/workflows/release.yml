@@ -64,11 +64,24 @@ jobs:
         shell: bash
         run: |
           cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" "${{ matrix.asset }}"
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "${{ matrix.asset }}" > "${{ matrix.asset }}.sha256"
+          else
+            shasum -a 256 "${{ matrix.asset }}" > "${{ matrix.asset }}.sha256"
+          fi
 
       - name: Upload release asset
         uses: softprops/action-gh-release@v2
         with:
-          files: ${{ matrix.asset }}
+          files: |
+            ${{ matrix.asset }}
+            ${{ matrix.asset }}.sha256
+
+      - name: Upload install script
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: install.sh
 
   build-armv7:
     name: Build Linux armv7
@@ -95,8 +108,11 @@ jobs:
         run: |
           cp target/armv7-unknown-linux-gnueabihf/release/pocker \
             pocker-linux-armv7
+          sha256sum pocker-linux-armv7 > pocker-linux-armv7.sha256
 
       - name: Upload release asset
         uses: softprops/action-gh-release@v2
         with:
-          files: pocker-linux-armv7
+          files: |
+            pocker-linux-armv7
+            pocker-linux-armv7.sha256
