@@ -100,12 +100,15 @@ path_contains() {
 }
 
 default_install_dir() {
-  if [ "$(id -u)" -eq 0 ]; then
-    printf '%s\n' /usr/local/bin
+  [ "${HOME:-}" ] || die "HOME is not set; set POCKER_INSTALL_DIR to choose an install directory"
+
+  if path_contains "$HOME/.local/bin"; then
+    printf '%s\n' "$HOME/.local/bin"
   elif [ -w /usr/local/bin ]; then
     printf '%s\n' /usr/local/bin
+  elif [ "$(id -u)" -eq 0 ]; then
+    printf '%s\n' /usr/local/bin
   else
-    [ "${HOME:-}" ] || die "HOME is not set; set POCKER_INSTALL_DIR to choose an install directory"
     printf '%s\n' "$HOME/.local/bin"
   fi
 }
