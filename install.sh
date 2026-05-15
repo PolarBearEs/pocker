@@ -104,16 +104,11 @@ default_install_dir() {
 
   if path_contains "$HOME/.local/bin"; then
     printf '%s\n' "$HOME/.local/bin"
-  elif [ -w /usr/local/bin ]; then
-    printf '%s\n' /usr/local/bin
-  elif [ "$(id -u)" -eq 0 ]; then
-    printf '%s\n' /usr/local/bin
   else
-    printf '%s\n' "$HOME/.local/bin"
+    printf '%s\n' /usr/local/bin
   fi
 }
 
-need_cmd id
 need_cmd uname
 need_cmd mktemp
 need_cmd chmod
@@ -154,6 +149,8 @@ verify_digest "$expected_digest"
 chmod 0755 "$tmp_bin"
 
 mkdir -p "$install_dir"
+[ -w "$install_dir" ] || die "cannot write to $install_dir; run with sudo or set POCKER_INSTALL_DIR"
+
 if command -v install >/dev/null 2>&1; then
   install -m 0755 "$tmp_bin" "$dest"
 else
@@ -162,7 +159,3 @@ else
 fi
 
 printf 'Installed %s to %s\n' "$bin_name" "$dest"
-
-if ! path_contains "$install_dir"; then
-  printf 'Add %s to PATH to run %s from any directory.\n' "$install_dir" "$bin_name"
-fi
