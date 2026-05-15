@@ -122,6 +122,7 @@ jobs:
       fail-fast: false
       matrix:
         target:
+          - x86_64-unknown-linux-gnu
           - aarch64-unknown-linux-gnu
           - armv7-unknown-linux-gnueabihf
 
@@ -131,6 +132,8 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
 
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@v2
@@ -138,8 +141,11 @@ jobs:
           cache-targets: true
           shared-key: ${{ matrix.target }}
 
-      - name: Install cross
-        uses: taiki-e/install-action@cross
+      - name: Install Zig
+        uses: goto-bus-stop/setup-zig@v2
 
-      - name: Build Linux release target with cross
-        run: cross build --locked --target ${{ matrix.target }}
+      - name: Install cargo-zigbuild
+        uses: taiki-e/install-action@cargo-zigbuild
+
+      - name: Build Linux release target with zigbuild
+        run: cargo zigbuild --locked --target ${{ matrix.target }}.2.17

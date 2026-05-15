@@ -7,7 +7,7 @@
 - Added an experimental local registry load mode for importing pulled images into Docker without using Docker's archive load path.
 - Switched Docker image loads to stream archives instead of buffering the full image archive first.
 - Added a `curl | sh` installer for prebuilt Linux and macOS release binaries.
-- Linux release binaries are now built consistently with `cross` to avoid depending on the GitHub runner's host glibc version.
+- Linux release binaries now target a glibc 2.17 baseline with `cargo-zigbuild` to avoid depending on the GitHub runner's host glibc version.
 
 ## New Commands and Flags
 
@@ -47,7 +47,7 @@ curl -fsSL https://github.com/PolarBearEs/pocker/releases/download/v0.1.4/instal
 
 Installer downloads are verified against the SHA256 digest GitHub publishes for each release asset before the binary is installed. The installer queries GitHub release metadata for the selected asset, reads the asset's `sha256` digest, computes the local SHA256 of the downloaded binary, and installs only when the digests match.
 
-Linux assets are built with `cross` to avoid glibc version mismatches caused by native GitHub runner builds on newer distributions.
+Linux assets are built with `cargo-zigbuild` against a glibc 2.17 baseline to avoid glibc version mismatches caused by native GitHub runner builds on newer distributions.
 
 ## Release Assets
 
