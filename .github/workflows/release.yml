@@ -9,6 +9,52 @@ permissions:
   contents: write
 
 jobs:
+  build-linux:
+    name: Build ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86_64
+            target: x86_64-unknown-linux-gnu
+            asset: pocker-linux-x86_64
+          - name: Linux arm64
+            target: aarch64-unknown-linux-gnu
+            asset: pocker-linux-arm64
+          - name: Linux armv7
+            target: armv7-unknown-linux-gnueabihf
+            asset: pocker-linux-armv7
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: true
+          shared-key: ${{ matrix.target }}
+
+      - name: Install cross
+        uses: taiki-e/install-action@cross
+
+      - name: Build release binary
+        run: cross build --locked --release --target ${{ matrix.target }}
+
+      - name: Prepare release asset
+        shell: bash
+        run: |
+          cp "target/${{ matrix.target }}/release/pocker" "${{ matrix.asset }}"
+
+      - name: Upload release asset
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.asset }}
+
   build-native:
     name: Build ${{ matrix.name }}
     runs-on: ${{ matrix.runs_on }}
@@ -16,16 +62,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: Linux x86_64
-            runs_on: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            asset: pocker-linux-x86_64
-            binary: pocker
-          - name: Linux arm64
-            runs_on: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
-            asset: pocker-linux-arm64
-            binary: pocker
           - name: macOS arm64
             runs_on: macos-latest
             target: aarch64-apple-darwin
@@ -70,39 +106,18 @@ jobs:
         with:
           files: ${{ matrix.asset }}
 
-      - name: Upload install script
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
-        uses: softprops/action-gh-release@v2
-        with:
-          files: install.sh
-
-  build-armv7:
-    name: Build Linux armv7
+  upload-install-script:
+    name: Upload install script
     runs-on: ubuntu-latest
+    needs:
+      - build-linux
+      - build-native
 
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache Rust build artifacts
-        uses: Swatinem/rust-cache@v2
-
-      - name: Install cross
-        uses: taiki-e/install-action@cross
-
-      - name: Build release binary
-        run: cross build --locked --release --target armv7-unknown-linux-gnueabihf
-
-      - name: Prepare release asset
-        shell: bash
-        run: |
-          cp target/armv7-unknown-linux-gnueabihf/release/pocker \
-            pocker-linux-armv7
-
-      - name: Upload release asset
+      - name: Upload install script
         uses: softprops/action-gh-release@v2
         with:
-          files: pocker-linux-armv7
+          files: install.sh
