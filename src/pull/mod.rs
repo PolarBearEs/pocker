@@ -23,7 +23,7 @@ pub struct PullContext {
     pub registry: Arc<RegistryClient>,
     pub stop: Arc<AtomicBool>,
     pub ui: Arc<Ui>,
-    pub blob_retry_limit: u32,
+    pub blob_retry_limit: Option<u32>,
 }
 
 #[derive(Debug, Clone)]

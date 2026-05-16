@@ -38,8 +38,8 @@ struct PullRequestOptions {
     platform: Option<String>,
     concurrency: usize,
     image_concurrency: usize,
-    blob_retries: u32,
-    request_retries: u32,
+    blob_retry_limit: Option<u32>,
+    request_retry_limit: Option<u32>,
     no_load: bool,
     keep_layer_blobs: bool,
     load_mode: pull::LoadMode,
@@ -62,8 +62,8 @@ impl PullRequestOptions {
                 platform: args.platform,
                 concurrency: args.concurrency,
                 image_concurrency: 1,
-                blob_retries: args.blob_retries,
-                request_retries: args.request_retries,
+                blob_retry_limit: retry_limit(args.blob_retries, args.retry_forever),
+                request_retry_limit: retry_limit(args.request_retries, args.retry_forever),
                 no_load: args.no_load,
                 keep_layer_blobs: args.keep_layer_blobs,
                 load_mode: args.load_mode,
@@ -85,8 +85,8 @@ impl PullRequestOptions {
             platform: args.platform,
             concurrency: args.concurrency,
             image_concurrency: args.image_concurrency,
-            blob_retries: args.blob_retries,
-            request_retries: args.request_retries,
+            blob_retry_limit: retry_limit(args.blob_retries, args.retry_forever),
+            request_retry_limit: retry_limit(args.request_retries, args.retry_forever),
             no_load: args.no_load,
             keep_layer_blobs: args.keep_layer_blobs,
             load_mode: args.load_mode,
@@ -108,9 +108,13 @@ struct SharedPullState {
     store: Arc<Store>,
     registry: Arc<RegistryClient>,
     stop: Arc<AtomicBool>,
-    blob_retry_limit: u32,
+    blob_retry_limit: Option<u32>,
     options: PullOptions,
     ui_group: UiGroup,
+}
+
+fn retry_limit(retries: u32, retry_forever: bool) -> Option<u32> {
+    if retry_forever { None } else { Some(retries) }
 }
 
 #[tokio::main]
@@ -171,7 +175,7 @@ async fn run() -> Result<()> {
                 )?,
                 auth,
                 args.plain_http,
-                args.request_retries,
+                retry_limit(args.request_retries, args.retry_forever),
             ));
             let quiet = cli.global.quiet || args.quiet;
             if !quiet {
@@ -190,7 +194,7 @@ async fn run() -> Result<()> {
                 store,
                 registry: client,
                 pull_missing: args.pull_missing,
-                blob_retry_limit: args.blob_retries,
+                blob_retry_limit: retry_limit(args.blob_retries, args.retry_forever),
                 concurrency: args.concurrency.max(1),
                 quiet,
             })
@@ -327,7 +331,7 @@ async fn pull_references(
         )?,
         auth,
         request.plain_http,
-        request.request_retries,
+        request.request_retry_limit,
         request.cache_from,
         request.cache_only,
     ));
@@ -346,7 +350,7 @@ async fn pull_references(
             registry: client,
             stop,
             ui,
-            blob_retry_limit: request.blob_retries,
+            blob_retry_limit: request.blob_retry_limit,
         };
         let puller = Puller::new(context);
         for reference in references {
@@ -360,7 +364,7 @@ async fn pull_references(
         store,
         registry: client,
         stop,
-        blob_retry_limit: request.blob_retries,
+        blob_retry_limit: request.blob_retry_limit,
         options,
         ui_group: UiGroup::new(quiet, false),
     };

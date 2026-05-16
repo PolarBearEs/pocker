@@ -31,7 +31,7 @@ pub struct ServeConfig {
     pub store: Arc<Store>,
     pub registry: Arc<RegistryClient>,
     pub pull_missing: bool,
-    pub blob_retry_limit: u32,
+    pub blob_retry_limit: Option<u32>,
     pub concurrency: usize,
     pub quiet: bool,
 }
@@ -65,7 +65,7 @@ impl TemporaryCacheRegistry {
             store,
             registry,
             pull_missing: false,
-            blob_retry_limit: 1,
+            blob_retry_limit: Some(1),
             quiet: true,
             downloads: Arc::new(Semaphore::new(1)),
         });
@@ -139,7 +139,7 @@ struct ServeState {
     store: Arc<Store>,
     registry: Arc<RegistryClient>,
     pull_missing: bool,
-    blob_retry_limit: u32,
+    blob_retry_limit: Option<u32>,
     quiet: bool,
     downloads: Arc<Semaphore>,
 }
@@ -904,7 +904,7 @@ mod tests {
                 .expect("client should build"),
             Arc::new(AuthResolver::new(None).expect("auth resolver should build")),
             true,
-            0,
+            Some(0),
             Some(
                 format!("http://{address}")
                     .parse()
@@ -917,7 +917,7 @@ mod tests {
             registry,
             stop: Arc::new(AtomicBool::new(false)),
             ui: Arc::new(Ui::new(true, false)),
-            blob_retry_limit: 1,
+            blob_retry_limit: Some(1),
         });
 
         puller
@@ -962,13 +962,13 @@ mod tests {
                 .expect("client should build"),
             Arc::new(AuthResolver::new(None).expect("auth resolver should build")),
             true,
-            0,
+            Some(0),
         ));
         let state = Arc::new(ServeState {
             store,
             registry,
             pull_missing,
-            blob_retry_limit: 1,
+            blob_retry_limit: Some(1),
             quiet: true,
             downloads: Arc::new(Semaphore::new(1)),
         });

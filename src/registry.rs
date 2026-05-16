@@ -30,7 +30,7 @@ pub struct RegistryClient {
     auth: Arc<AuthResolver>,
     token_cache: Arc<Mutex<HashMap<String, String>>>,
     plain_http: bool,
-    request_retry_limit: u32,
+    request_retry_limit: Option<u32>,
     cache_from: Option<Url>,
     cache_only: bool,
 }
@@ -107,7 +107,7 @@ impl RegistryClient {
         client: Client,
         auth: Arc<AuthResolver>,
         plain_http: bool,
-        request_retry_limit: u32,
+        request_retry_limit: Option<u32>,
     ) -> Self {
         Self::new_with_cache_from(client, auth, plain_http, request_retry_limit, None, false)
     }
@@ -116,7 +116,7 @@ impl RegistryClient {
         client: Client,
         auth: Arc<AuthResolver>,
         plain_http: bool,
-        request_retry_limit: u32,
+        request_retry_limit: Option<u32>,
         cache_from: Option<Url>,
         cache_only: bool,
     ) -> Self {
@@ -800,15 +800,14 @@ fn retry_after_delay(value: Option<&HeaderValue>) -> Option<Duration> {
     retry_at.duration_since(std::time::SystemTime::now()).ok()
 }
 
-fn request_retry_limit_exhausted(retries: u32, retry_limit: u32) -> bool {
-    retry_limit != 0 && retries >= retry_limit
+fn request_retry_limit_exhausted(retries: u32, retry_limit: Option<u32>) -> bool {
+    retry_limit.is_some_and(|limit| retries >= limit)
 }
 
-fn format_retry_budget(next_retry: u32, retry_limit: u32) -> String {
-    if retry_limit == 0 {
-        format!("{next_retry}/unlimited")
-    } else {
-        format!("{next_retry}/{retry_limit}")
+fn format_retry_budget(next_retry: u32, retry_limit: Option<u32>) -> String {
+    match retry_limit {
+        Some(limit) => format!("{next_retry}/{limit}"),
+        None => format!("{next_retry}/unlimited"),
     }
 }
 
@@ -893,7 +892,7 @@ mod tests {
                 .expect("client should build"),
             Arc::new(AuthResolver::new(None).expect("auth resolver should build")),
             true,
-            DEFAULT_REQUEST_RETRIES,
+            Some(DEFAULT_REQUEST_RETRIES),
         );
         let reference = ImageReference::parse(&format!("{address}/sample:latest"))
             .expect("reference should parse");
@@ -1021,7 +1020,7 @@ mod tests {
                 .expect("client should build"),
             Arc::new(AuthResolver::new(None).expect("auth resolver should build")),
             true,
-            DEFAULT_REQUEST_RETRIES,
+            Some(DEFAULT_REQUEST_RETRIES),
         );
         let reference = ImageReference::parse(&format!("{address}/sample:latest"))
             .expect("reference should parse");
@@ -1144,7 +1143,7 @@ mod tests {
                 .expect("client should build"),
             Arc::new(AuthResolver::new(None).expect("auth resolver should build")),
             true,
-            DEFAULT_REQUEST_RETRIES,
+            Some(DEFAULT_REQUEST_RETRIES),
             Some(
                 format!("http://{cache}")
                     .parse()
