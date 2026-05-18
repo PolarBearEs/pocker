@@ -56,13 +56,14 @@ download() {
 extract_asset_digest() {
   metadata_file="$1"
 
-  sed -n \
-    "/\"name\"[[:space:]]*:[[:space:]]*\"$asset\"/,/\"browser_download_url\"/ {
-      s/.*\"digest\"[[:space:]]*:[[:space:]]*\"sha256:\([0-9A-Fa-f][0-9A-Fa-f]*\)\".*/\1/p
-    }" \
-    "$metadata_file" |
-    sed -n '1p' |
-    tr 'A-F' 'a-f'
+  jq -r --arg asset "$asset" '
+    .assets[]
+    | select(.name == $asset)
+    | .digest // empty
+    | select(test("^sha256:[0-9A-Fa-f]+$"))
+    | sub("^sha256:"; "")
+    | ascii_downcase
+  ' "$metadata_file"
 }
 
 file_sha256() {
@@ -106,8 +107,7 @@ need_cmd uname
 need_cmd mktemp
 need_cmd chmod
 need_cmd mkdir
-need_cmd sed
-need_cmd tr
+need_cmd jq
 
 if [ "${POCKER_INSTALL_DIR:-}" ]; then
   install_dir="$POCKER_INSTALL_DIR"
