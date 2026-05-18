@@ -56,29 +56,22 @@ download() {
 extract_asset_digest() {
   metadata_file="$1"
 
-  awk -v wanted="$asset" '
-    $0 ~ "\"name\"[[:space:]]*:" {
-      in_asset = ($0 ~ "\"name\"[[:space:]]*:[[:space:]]*\"" wanted "\"")
-    }
-    in_asset && $0 ~ "\"digest\"[[:space:]]*:" {
-      if (match($0, /"digest"[[:space:]]*:[[:space:]]*"sha256:[0-9A-Fa-f]+"/)) {
-        digest = substr($0, RSTART, RLENGTH)
-        sub(/^.*sha256:/, "", digest)
-        sub(/"$/, "", digest)
-        print tolower(digest)
-        exit
-      }
-    }
-  ' "$metadata_file"
+  sed -n \
+    "/\"name\"[[:space:]]*:[[:space:]]*\"$asset\"/,/\"browser_download_url\"/ {
+      s/.*\"digest\"[[:space:]]*:[[:space:]]*\"sha256:\([0-9A-Fa-f][0-9A-Fa-f]*\)\".*/\1/p
+    }" \
+    "$metadata_file" |
+    sed -n '1p' |
+    tr 'A-F' 'a-f'
 }
 
 file_sha256() {
   file="$1"
 
   if command -v sha256sum >/dev/null 2>&1; then
-    sha256sum "$file" | awk '{ print $1 }'
+    sha256sum "$file" | sed 's/[[:space:]].*//'
   elif command -v shasum >/dev/null 2>&1; then
-    shasum -a 256 "$file" | awk '{ print $1 }'
+    shasum -a 256 "$file" | sed 's/[[:space:]].*//'
   else
     die "missing required command: sha256sum or shasum"
   fi
@@ -113,7 +106,8 @@ need_cmd uname
 need_cmd mktemp
 need_cmd chmod
 need_cmd mkdir
-need_cmd awk
+need_cmd sed
+need_cmd tr
 
 if [ "${POCKER_INSTALL_DIR:-}" ]; then
   install_dir="$POCKER_INSTALL_DIR"
