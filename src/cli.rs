@@ -66,7 +66,7 @@ pub enum ComposeCommands {
     #[command(about = "Print resolved Compose configuration")]
     Config(ComposeConfigArgs),
     #[command(about = "Pull images referenced by Compose services")]
-    Pull(ComposePullArgs),
+    Pull(Box<ComposePullArgs>),
 }
 
 #[derive(Debug, Clone, Args)]

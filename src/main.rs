@@ -179,7 +179,7 @@ async fn run() -> Result<()> {
                 }
                 print_compose_pull_plan(&resolved, cli.global.quiet || pull_args.quiet);
                 let images = compose::unique_images(&resolved.images);
-                let request = PullRequestOptions::from_compose_pull_args(pull_args);
+                let request = PullRequestOptions::from_compose_pull_args(*pull_args);
                 pull_references(&cli.global.cache_dir, cli.global.quiet, images, request).await?;
             }
         },
