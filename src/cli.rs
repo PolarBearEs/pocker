@@ -118,6 +118,7 @@ pub struct ComposePullArgs {
     pub request_retries: u32,
     #[arg(
         long,
+        conflicts_with_all = ["blob_retries", "request_retries"],
         help_heading = "Retry options",
         help = "Retry retryable blob downloads and registry requests forever"
     )]
@@ -234,6 +235,7 @@ pub struct ServeArgs {
     pub request_retries: u32,
     #[arg(
         long,
+        conflicts_with_all = ["blob_retries", "request_retries"],
         help_heading = "Retry options",
         help = "Retry retryable blob downloads and registry requests forever"
     )]
@@ -367,6 +369,7 @@ pub struct PullArgs {
     pub request_retries: u32,
     #[arg(
         long,
+        conflicts_with_all = ["blob_retries", "request_retries"],
         help_heading = "Retry options",
         help = "Retry retryable blob downloads and registry requests forever"
     )]
@@ -543,6 +546,23 @@ mod tests {
     }
 
     #[test]
+    fn pull_rejects_retry_forever_with_explicit_retry_counts() {
+        for retry_arg in ["--blob-retries", "--request-retries"] {
+            let error = Cli::try_parse_from([
+                "pocker",
+                "pull",
+                retry_arg,
+                "1",
+                "--retry-forever",
+                "alpine:latest",
+            ])
+            .expect_err("retry-forever should conflict with explicit retry counts");
+
+            assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+        }
+    }
+
+    #[test]
     fn pull_accepts_request_retries_flag() {
         let cli = Cli::parse_from(["pocker", "pull", "--request-retries", "12", "alpine:latest"]);
         let Commands::Pull(args) = cli.command else {
@@ -652,6 +672,16 @@ mod tests {
     }
 
     #[test]
+    fn serve_rejects_retry_forever_with_explicit_retry_counts() {
+        for retry_arg in ["--blob-retries", "--request-retries"] {
+            let error = Cli::try_parse_from(["pocker", "serve", retry_arg, "1", "--retry-forever"])
+                .expect_err("retry-forever should conflict with explicit retry counts");
+
+            assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+        }
+    }
+
+    #[test]
     fn pull_accepts_zero_request_retries() {
         let cli = Cli::parse_from(["pocker", "pull", "--request-retries", "0", "alpine:latest"]);
         let Commands::Pull(args) = cli.command else {
@@ -705,6 +735,23 @@ mod tests {
         };
 
         assert!(pull.quiet);
+    }
+
+    #[test]
+    fn compose_pull_rejects_retry_forever_with_explicit_retry_counts() {
+        for retry_arg in ["--blob-retries", "--request-retries"] {
+            let error = Cli::try_parse_from([
+                "pocker",
+                "compose",
+                "pull",
+                retry_arg,
+                "1",
+                "--retry-forever",
+            ])
+            .expect_err("retry-forever should conflict with explicit retry counts");
+
+            assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+        }
     }
 
     #[test]
