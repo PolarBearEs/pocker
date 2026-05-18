@@ -5,9 +5,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use url::Url;
 
 use crate::platform::Platform;
-use crate::pull::DEFAULT_BLOB_RETRIES;
 use crate::pull::LoadMode;
-use crate::registry::DEFAULT_REQUEST_RETRIES;
 
 #[derive(Debug, Parser)]
 #[command(name = "pocker")]
@@ -104,21 +102,20 @@ pub struct ComposePullArgs {
     pub image_concurrency: usize,
     #[arg(
         long = "blob-retries",
-        default_value_t = DEFAULT_BLOB_RETRIES,
+        value_name = "N",
         help_heading = "Retry options",
-        help = "Maximum retries for interrupted blob downloads; use 0 to disable"
+        help = "Maximum retries for interrupted blob downloads; use 0 to disable [default: 8]"
     )]
-    pub blob_retries: u32,
+    pub blob_retries: Option<u32>,
     #[arg(
         long = "request-retries",
-        default_value_t = DEFAULT_REQUEST_RETRIES,
+        value_name = "N",
         help_heading = "Retry options",
-        help = "Maximum retries for registry requests before any response or on retryable HTTP status; use 0 to disable"
+        help = "Maximum retries for registry requests before any response or on retryable HTTP status; use 0 to disable [default: 5]"
     )]
-    pub request_retries: u32,
+    pub request_retries: Option<u32>,
     #[arg(
         long,
-        conflicts_with_all = ["blob_retries", "request_retries"],
         help_heading = "Retry options",
         help = "Retry retryable blob downloads and registry requests forever"
     )]
@@ -221,21 +218,20 @@ pub struct ServeArgs {
     pub concurrency: usize,
     #[arg(
         long = "blob-retries",
-        default_value_t = DEFAULT_BLOB_RETRIES,
+        value_name = "N",
         help_heading = "Retry options",
-        help = "Maximum retries for interrupted blob downloads; use 0 to disable"
+        help = "Maximum retries for interrupted blob downloads; use 0 to disable [default: 8]"
     )]
-    pub blob_retries: u32,
+    pub blob_retries: Option<u32>,
     #[arg(
         long = "request-retries",
-        default_value_t = DEFAULT_REQUEST_RETRIES,
+        value_name = "N",
         help_heading = "Retry options",
-        help = "Maximum retries for registry requests before any response or on retryable HTTP status; use 0 to disable"
+        help = "Maximum retries for registry requests before any response or on retryable HTTP status; use 0 to disable [default: 5]"
     )]
-    pub request_retries: u32,
+    pub request_retries: Option<u32>,
     #[arg(
         long,
-        conflicts_with_all = ["blob_retries", "request_retries"],
         help_heading = "Retry options",
         help = "Retry retryable blob downloads and registry requests forever"
     )]
@@ -355,21 +351,20 @@ pub struct PullArgs {
     pub concurrency: usize,
     #[arg(
         long = "blob-retries",
-        default_value_t = DEFAULT_BLOB_RETRIES,
+        value_name = "N",
         help_heading = "Retry options",
-        help = "Maximum retries for interrupted blob downloads; use 0 to disable"
+        help = "Maximum retries for interrupted blob downloads; use 0 to disable [default: 8]"
     )]
-    pub blob_retries: u32,
+    pub blob_retries: Option<u32>,
     #[arg(
         long = "request-retries",
-        default_value_t = DEFAULT_REQUEST_RETRIES,
+        value_name = "N",
         help_heading = "Retry options",
-        help = "Maximum retries for registry requests before any response or on retryable HTTP status; use 0 to disable"
+        help = "Maximum retries for registry requests before any response or on retryable HTTP status; use 0 to disable [default: 5]"
     )]
-    pub request_retries: u32,
+    pub request_retries: Option<u32>,
     #[arg(
         long,
-        conflicts_with_all = ["blob_retries", "request_retries"],
         help_heading = "Retry options",
         help = "Retry retryable blob downloads and registry requests forever"
     )]
@@ -522,7 +517,7 @@ mod tests {
             panic!("expected pull command");
         };
 
-        assert_eq!(args.blob_retries, 32);
+        assert_eq!(args.blob_retries, Some(32));
     }
 
     #[test]
@@ -532,7 +527,7 @@ mod tests {
             panic!("expected pull command");
         };
 
-        assert_eq!(args.blob_retries, 0);
+        assert_eq!(args.blob_retries, Some(0));
     }
 
     #[test]
@@ -546,20 +541,21 @@ mod tests {
     }
 
     #[test]
-    fn pull_rejects_retry_forever_with_explicit_retry_counts() {
-        for retry_arg in ["--blob-retries", "--request-retries"] {
-            let error = Cli::try_parse_from([
-                "pocker",
-                "pull",
-                retry_arg,
-                "1",
-                "--retry-forever",
-                "alpine:latest",
-            ])
-            .expect_err("retry-forever should conflict with explicit retry counts");
+    fn pull_accepts_retry_forever_with_explicit_retry_count_override() {
+        let cli = Cli::parse_from([
+            "pocker",
+            "pull",
+            "--blob-retries",
+            "1",
+            "--retry-forever",
+            "alpine:latest",
+        ]);
+        let Commands::Pull(args) = cli.command else {
+            panic!("expected pull command");
+        };
 
-            assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
-        }
+        assert_eq!(args.blob_retries, Some(1));
+        assert!(args.retry_forever);
     }
 
     #[test]
@@ -569,7 +565,7 @@ mod tests {
             panic!("expected pull command");
         };
 
-        assert_eq!(args.request_retries, 12);
+        assert_eq!(args.request_retries, Some(12));
     }
 
     #[test]
@@ -672,13 +668,20 @@ mod tests {
     }
 
     #[test]
-    fn serve_rejects_retry_forever_with_explicit_retry_counts() {
-        for retry_arg in ["--blob-retries", "--request-retries"] {
-            let error = Cli::try_parse_from(["pocker", "serve", retry_arg, "1", "--retry-forever"])
-                .expect_err("retry-forever should conflict with explicit retry counts");
+    fn serve_accepts_retry_forever_with_explicit_retry_count_override() {
+        let cli = Cli::parse_from([
+            "pocker",
+            "serve",
+            "--request-retries",
+            "1",
+            "--retry-forever",
+        ]);
+        let Commands::Serve(args) = cli.command else {
+            panic!("expected serve command");
+        };
 
-            assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
-        }
+        assert_eq!(args.request_retries, Some(1));
+        assert!(args.retry_forever);
     }
 
     #[test]
@@ -688,7 +691,7 @@ mod tests {
             panic!("expected pull command");
         };
 
-        assert_eq!(args.request_retries, 0);
+        assert_eq!(args.request_retries, Some(0));
     }
 
     #[test]
@@ -738,20 +741,24 @@ mod tests {
     }
 
     #[test]
-    fn compose_pull_rejects_retry_forever_with_explicit_retry_counts() {
-        for retry_arg in ["--blob-retries", "--request-retries"] {
-            let error = Cli::try_parse_from([
-                "pocker",
-                "compose",
-                "pull",
-                retry_arg,
-                "1",
-                "--retry-forever",
-            ])
-            .expect_err("retry-forever should conflict with explicit retry counts");
+    fn compose_pull_accepts_retry_forever_with_explicit_retry_count_override() {
+        let cli = Cli::parse_from([
+            "pocker",
+            "compose",
+            "pull",
+            "--blob-retries",
+            "1",
+            "--retry-forever",
+        ]);
+        let Commands::Compose(args) = cli.command else {
+            panic!("expected compose command");
+        };
+        let ComposeCommands::Pull(pull) = args.command else {
+            panic!("expected compose pull command");
+        };
 
-            assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
-        }
+        assert_eq!(pull.blob_retries, Some(1));
+        assert!(pull.retry_forever);
     }
 
     #[test]

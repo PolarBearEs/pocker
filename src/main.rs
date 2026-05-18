@@ -27,8 +27,8 @@ use error::{DockerPullError, Result};
 use http::build_http_client;
 use platform::Platform;
 use pocker_compose as compose;
-use pull::{PullContext, PullOptions, Puller};
-use registry::RegistryClient;
+use pull::{DEFAULT_BLOB_RETRIES, PullContext, PullOptions, Puller};
+use registry::{DEFAULT_REQUEST_RETRIES, RegistryClient};
 use store::Store;
 use tokio::task::JoinSet;
 use tracing_subscriber::EnvFilter;
@@ -62,8 +62,16 @@ impl PullRequestOptions {
                 platform: args.platform,
                 concurrency: args.concurrency,
                 image_concurrency: 1,
-                blob_retry_limit: retry_limit(args.blob_retries, args.retry_forever),
-                request_retry_limit: retry_limit(args.request_retries, args.retry_forever),
+                blob_retry_limit: retry_limit(
+                    args.blob_retries,
+                    args.retry_forever,
+                    DEFAULT_BLOB_RETRIES,
+                ),
+                request_retry_limit: retry_limit(
+                    args.request_retries,
+                    args.retry_forever,
+                    DEFAULT_REQUEST_RETRIES,
+                ),
                 no_load: args.no_load,
                 keep_layer_blobs: args.keep_layer_blobs,
                 load_mode: args.load_mode,
@@ -85,8 +93,16 @@ impl PullRequestOptions {
             platform: args.platform,
             concurrency: args.concurrency,
             image_concurrency: args.image_concurrency,
-            blob_retry_limit: retry_limit(args.blob_retries, args.retry_forever),
-            request_retry_limit: retry_limit(args.request_retries, args.retry_forever),
+            blob_retry_limit: retry_limit(
+                args.blob_retries,
+                args.retry_forever,
+                DEFAULT_BLOB_RETRIES,
+            ),
+            request_retry_limit: retry_limit(
+                args.request_retries,
+                args.retry_forever,
+                DEFAULT_REQUEST_RETRIES,
+            ),
             no_load: args.no_load,
             keep_layer_blobs: args.keep_layer_blobs,
             load_mode: args.load_mode,
@@ -113,8 +129,12 @@ struct SharedPullState {
     ui_group: UiGroup,
 }
 
-fn retry_limit(retries: u32, retry_forever: bool) -> Option<u32> {
-    if retry_forever { None } else { Some(retries) }
+fn retry_limit(retries: Option<u32>, retry_forever: bool, default_retries: u32) -> Option<u32> {
+    match (retries, retry_forever) {
+        (Some(retries), _) => Some(retries),
+        (None, true) => None,
+        (None, false) => Some(default_retries),
+    }
 }
 
 #[tokio::main]
@@ -175,7 +195,11 @@ async fn run() -> Result<()> {
                 )?,
                 auth,
                 args.plain_http,
-                retry_limit(args.request_retries, args.retry_forever),
+                retry_limit(
+                    args.request_retries,
+                    args.retry_forever,
+                    DEFAULT_REQUEST_RETRIES,
+                ),
             ));
             let quiet = cli.global.quiet || args.quiet;
             if !quiet {
@@ -194,7 +218,11 @@ async fn run() -> Result<()> {
                 store,
                 registry: client,
                 pull_missing: args.pull_missing,
-                blob_retry_limit: retry_limit(args.blob_retries, args.retry_forever),
+                blob_retry_limit: retry_limit(
+                    args.blob_retries,
+                    args.retry_forever,
+                    DEFAULT_BLOB_RETRIES,
+                ),
                 concurrency: args.concurrency.max(1),
                 quiet,
             })
