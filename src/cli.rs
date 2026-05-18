@@ -5,9 +5,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use url::Url;
 
 use crate::platform::Platform;
-use crate::pull::DEFAULT_BLOB_RETRIES;
 use crate::pull::LoadMode;
-use crate::registry::DEFAULT_REQUEST_RETRIES;
 
 #[derive(Debug, Parser)]
 #[command(name = "pocker")]
@@ -68,7 +66,7 @@ pub enum ComposeCommands {
     #[command(about = "Print resolved Compose configuration")]
     Config(ComposeConfigArgs),
     #[command(about = "Pull images referenced by Compose services")]
-    Pull(ComposePullArgs),
+    Pull(Box<ComposePullArgs>),
 }
 
 #[derive(Debug, Clone, Args)]
@@ -85,40 +83,52 @@ pub struct ComposeConfigArgs {
 pub struct ComposePullArgs {
     #[arg(value_name = "SERVICE", help = "Compose service to pull")]
     pub services: Vec<String>,
-    #[arg(long, help = platform_help())]
+    #[arg(long, help_heading = "Download options", help = platform_help())]
     pub platform: Option<String>,
     #[arg(
         long = "max-parallel-downloads",
         visible_alias = "concurrency",
         default_value_t = 4,
+        help_heading = "Download options",
         help = "Maximum concurrent layer downloads"
     )]
     pub concurrency: usize,
     #[arg(
         long = "max-parallel-images",
         default_value_t = 2,
+        help_heading = "Download options",
         help = "Maximum concurrent image pulls"
     )]
     pub image_concurrency: usize,
     #[arg(
         long = "blob-retries",
-        default_value_t = DEFAULT_BLOB_RETRIES,
-        help = "Maximum retries for interrupted blob downloads; use 0 for unlimited retries"
+        value_name = "N",
+        help_heading = "Retry options",
+        help = "Maximum retries for interrupted blob downloads; use 0 to disable [default: 8]"
     )]
-    pub blob_retries: u32,
+    pub blob_retries: Option<u32>,
     #[arg(
         long = "request-retries",
-        default_value_t = DEFAULT_REQUEST_RETRIES,
-        help = "Maximum retries for registry requests before any response or on retryable HTTP status; use 0 for unlimited retries"
+        value_name = "N",
+        help_heading = "Retry options",
+        help = "Maximum retries for registry requests before any response or on retryable HTTP status; use 0 to disable [default: 5]"
     )]
-    pub request_retries: u32,
+    pub request_retries: Option<u32>,
     #[arg(
         long,
+        help_heading = "Retry options",
+        help = "Retry retryable blob downloads and registry requests forever"
+    )]
+    pub retry_forever: bool,
+    #[arg(
+        long,
+        help_heading = "Import options",
         help = "Download into the local cache without importing into Docker"
     )]
     pub no_load: bool,
     #[arg(
         long,
+        help_heading = "Import options",
         help = "Keep downloaded layer blobs in the cache after packaging/loading"
     )]
     pub keep_layer_blobs: bool,
@@ -126,33 +136,58 @@ pub struct ComposePullArgs {
         long = "load-mode",
         value_enum,
         default_value = "stream",
+        help_heading = "Import options",
         help = "Docker import mode to use after downloading; registry is experimental and local-daemon only"
     )]
     pub load_mode: LoadMode,
-    #[arg(long, help = "Use plain HTTP instead of HTTPS for registry requests")]
+    #[arg(
+        long,
+        help_heading = "Registry options",
+        help = "Use plain HTTP instead of HTTPS for registry requests"
+    )]
     pub plain_http: bool,
     #[arg(
         long,
+        help_heading = "Registry options",
         help = "Disable TLS certificate verification for registry requests"
     )]
     pub insecure_skip_tls_verify: bool,
-    #[arg(long, help = "Additional CA certificate bundle in PEM format")]
+    #[arg(
+        long,
+        help_heading = "Registry options",
+        help = "Additional CA certificate bundle in PEM format"
+    )]
     pub ca_file: Option<PathBuf>,
-    #[arg(long, help = "Registry username; requires --password-stdin")]
+    #[arg(
+        long,
+        help_heading = "Registry options",
+        help = "Registry username; requires --password-stdin"
+    )]
     pub username: Option<String>,
-    #[arg(long, help = "Read the registry password from stdin")]
+    #[arg(
+        long,
+        help_heading = "Registry options",
+        help = "Read the registry password from stdin"
+    )]
     pub password_stdin: bool,
-    #[arg(long, help = "Suppress progress and status output")]
+    #[arg(
+        long,
+        short = 'q',
+        help_heading = "Output options",
+        help = "Suppress progress and status output"
+    )]
     pub quiet: bool,
     #[arg(
         long,
         value_name = "URL",
+        help_heading = "Cache options",
         help = "Prefer a pocker cache registry, falling back to upstream on cache misses"
     )]
     pub cache_from: Option<Url>,
     #[arg(
         long,
         requires = "cache_from",
+        help_heading = "Cache options",
         help = "Require --cache-from content and do not fall back to upstream"
     )]
     pub cache_only: bool,
@@ -160,10 +195,16 @@ pub struct ComposePullArgs {
 
 #[derive(Debug, Clone, Args)]
 pub struct ServeArgs {
-    #[arg(long, default_value = "127.0.0.1:5000", help = "Address to listen on")]
+    #[arg(
+        long,
+        default_value = "127.0.0.1:5000",
+        help_heading = "Serve options",
+        help = "Address to listen on"
+    )]
     pub listen: SocketAddr,
     #[arg(
         long,
+        help_heading = "Serve options",
         help = "Fetch missing manifests and blobs from upstream registries"
     )]
     pub pull_missing: bool,
@@ -171,38 +212,66 @@ pub struct ServeArgs {
         long = "max-parallel-downloads",
         visible_alias = "concurrency",
         default_value_t = 4,
+        help_heading = "Serve options",
         help = "Maximum concurrent layer downloads"
     )]
     pub concurrency: usize,
     #[arg(
         long = "blob-retries",
-        default_value_t = DEFAULT_BLOB_RETRIES,
-        help = "Maximum retries for interrupted blob downloads; use 0 for unlimited retries"
+        value_name = "N",
+        help_heading = "Retry options",
+        help = "Maximum retries for interrupted blob downloads; use 0 to disable [default: 8]"
     )]
-    pub blob_retries: u32,
+    pub blob_retries: Option<u32>,
     #[arg(
         long = "request-retries",
-        default_value_t = DEFAULT_REQUEST_RETRIES,
-        help = "Maximum retries for registry requests before any response or on retryable HTTP status; use 0 for unlimited retries"
+        value_name = "N",
+        help_heading = "Retry options",
+        help = "Maximum retries for registry requests before any response or on retryable HTTP status; use 0 to disable [default: 5]"
     )]
-    pub request_retries: u32,
+    pub request_retries: Option<u32>,
     #[arg(
         long,
+        help_heading = "Retry options",
+        help = "Retry retryable blob downloads and registry requests forever"
+    )]
+    pub retry_forever: bool,
+    #[arg(
+        long,
+        help_heading = "Registry options",
         help = "Use plain HTTP instead of HTTPS for upstream registry requests"
     )]
     pub plain_http: bool,
     #[arg(
         long,
+        help_heading = "Registry options",
         help = "Disable TLS certificate verification for upstream registry requests"
     )]
     pub insecure_skip_tls_verify: bool,
-    #[arg(long, help = "Additional upstream CA certificate bundle in PEM format")]
+    #[arg(
+        long,
+        help_heading = "Registry options",
+        help = "Additional upstream CA certificate bundle in PEM format"
+    )]
     pub ca_file: Option<PathBuf>,
-    #[arg(long, help = "Upstream registry username; requires --password-stdin")]
+    #[arg(
+        long,
+        help_heading = "Registry options",
+        help = "Upstream registry username; requires --password-stdin"
+    )]
     pub username: Option<String>,
-    #[arg(long, help = "Read the upstream registry password from stdin")]
+    #[arg(
+        long,
+        help_heading = "Registry options",
+        help = "Read the upstream registry password from stdin"
+    )]
     pub password_stdin: bool,
-    #[arg(long, help = "Suppress status output")]
+    #[arg(
+        long,
+        short = 'q',
+        help_heading = "Output options",
+        help = "Suppress status output"
+    )]
     pub quiet: bool,
 }
 
@@ -270,34 +339,45 @@ pub struct ImageLoadArgs {
 pub struct PullArgs {
     #[arg(help = "Image reference to pull")]
     pub reference: String,
-    #[arg(long, help = platform_help())]
+    #[arg(long, help_heading = "Download options", help = platform_help())]
     pub platform: Option<String>,
     #[arg(
         long = "max-parallel-downloads",
         visible_alias = "concurrency",
         default_value_t = 4,
+        help_heading = "Download options",
         help = "Maximum concurrent layer downloads"
     )]
     pub concurrency: usize,
     #[arg(
         long = "blob-retries",
-        default_value_t = DEFAULT_BLOB_RETRIES,
-        help = "Maximum retries for interrupted blob downloads; use 0 for unlimited retries"
+        value_name = "N",
+        help_heading = "Retry options",
+        help = "Maximum retries for interrupted blob downloads; use 0 to disable [default: 8]"
     )]
-    pub blob_retries: u32,
+    pub blob_retries: Option<u32>,
     #[arg(
         long = "request-retries",
-        default_value_t = DEFAULT_REQUEST_RETRIES,
-        help = "Maximum retries for registry requests before any response or on retryable HTTP status; use 0 for unlimited retries"
+        value_name = "N",
+        help_heading = "Retry options",
+        help = "Maximum retries for registry requests before any response or on retryable HTTP status; use 0 to disable [default: 5]"
     )]
-    pub request_retries: u32,
+    pub request_retries: Option<u32>,
     #[arg(
         long,
+        help_heading = "Retry options",
+        help = "Retry retryable blob downloads and registry requests forever"
+    )]
+    pub retry_forever: bool,
+    #[arg(
+        long,
+        help_heading = "Import options",
         help = "Download into the local cache without importing into Docker"
     )]
     pub no_load: bool,
     #[arg(
         long,
+        help_heading = "Import options",
         help = "Keep downloaded layer blobs in the cache after packaging/loading"
     )]
     pub keep_layer_blobs: bool,
@@ -305,35 +385,64 @@ pub struct PullArgs {
         long = "load-mode",
         value_enum,
         default_value = "stream",
+        help_heading = "Import options",
         help = "Docker import mode to use after downloading; registry is experimental and local-daemon only"
     )]
     pub load_mode: LoadMode,
-    #[arg(long, help = "Use plain HTTP instead of HTTPS for registry requests")]
+    #[arg(
+        long,
+        help_heading = "Registry options",
+        help = "Use plain HTTP instead of HTTPS for registry requests"
+    )]
     pub plain_http: bool,
     #[arg(
         long,
+        help_heading = "Registry options",
         help = "Disable TLS certificate verification for registry requests"
     )]
     pub insecure_skip_tls_verify: bool,
-    #[arg(long, help = "Additional CA certificate bundle in PEM format")]
+    #[arg(
+        long,
+        help_heading = "Registry options",
+        help = "Additional CA certificate bundle in PEM format"
+    )]
     pub ca_file: Option<PathBuf>,
-    #[arg(long, help = "Registry username; requires --password-stdin")]
+    #[arg(
+        long,
+        help_heading = "Registry options",
+        help = "Registry username; requires --password-stdin"
+    )]
     pub username: Option<String>,
-    #[arg(long, help = "Read the registry password from stdin")]
+    #[arg(
+        long,
+        help_heading = "Registry options",
+        help = "Read the registry password from stdin"
+    )]
     pub password_stdin: bool,
-    #[arg(long, help = "Suppress progress and status output")]
+    #[arg(
+        long,
+        short = 'q',
+        help_heading = "Output options",
+        help = "Suppress progress and status output"
+    )]
     pub quiet: bool,
-    #[arg(long, help = "Disable animated progress output during pull")]
+    #[arg(
+        long,
+        help_heading = "Output options",
+        help = "Disable animated progress output during pull"
+    )]
     pub no_animations: bool,
     #[arg(
         long,
         value_name = "URL",
+        help_heading = "Cache options",
         help = "Prefer a pocker cache registry, falling back to upstream on cache misses"
     )]
     pub cache_from: Option<Url>,
     #[arg(
         long,
         requires = "cache_from",
+        help_heading = "Cache options",
         help = "Require --cache-from content and do not fall back to upstream"
     )]
     pub cache_only: bool,
@@ -382,6 +491,16 @@ mod tests {
     }
 
     #[test]
+    fn pull_accepts_quiet_short_flag() {
+        let cli = Cli::parse_from(["pocker", "pull", "-q", "alpine:latest"]);
+        let Commands::Pull(args) = cli.command else {
+            panic!("expected pull command");
+        };
+
+        assert!(args.quiet);
+    }
+
+    #[test]
     fn pull_accepts_registry_load_mode() {
         let cli = Cli::parse_from(["pocker", "pull", "--load-mode", "registry", "alpine:latest"]);
         let Commands::Pull(args) = cli.command else {
@@ -398,17 +517,45 @@ mod tests {
             panic!("expected pull command");
         };
 
-        assert_eq!(args.blob_retries, 32);
+        assert_eq!(args.blob_retries, Some(32));
     }
 
     #[test]
-    fn pull_accepts_unlimited_blob_retries_with_zero() {
+    fn pull_accepts_zero_blob_retries() {
         let cli = Cli::parse_from(["pocker", "pull", "--blob-retries", "0", "alpine:latest"]);
         let Commands::Pull(args) = cli.command else {
             panic!("expected pull command");
         };
 
-        assert_eq!(args.blob_retries, 0);
+        assert_eq!(args.blob_retries, Some(0));
+    }
+
+    #[test]
+    fn pull_accepts_retry_forever_flag() {
+        let cli = Cli::parse_from(["pocker", "pull", "--retry-forever", "alpine:latest"]);
+        let Commands::Pull(args) = cli.command else {
+            panic!("expected pull command");
+        };
+
+        assert!(args.retry_forever);
+    }
+
+    #[test]
+    fn pull_accepts_retry_forever_with_explicit_retry_count_override() {
+        let cli = Cli::parse_from([
+            "pocker",
+            "pull",
+            "--blob-retries",
+            "1",
+            "--retry-forever",
+            "alpine:latest",
+        ]);
+        let Commands::Pull(args) = cli.command else {
+            panic!("expected pull command");
+        };
+
+        assert_eq!(args.blob_retries, Some(1));
+        assert!(args.retry_forever);
     }
 
     #[test]
@@ -418,7 +565,7 @@ mod tests {
             panic!("expected pull command");
         };
 
-        assert_eq!(args.request_retries, 12);
+        assert_eq!(args.request_retries, Some(12));
     }
 
     #[test]
@@ -511,13 +658,40 @@ mod tests {
     }
 
     #[test]
-    fn pull_accepts_unlimited_request_retries_with_zero() {
+    fn serve_accepts_quiet_short_flag() {
+        let cli = Cli::parse_from(["pocker", "serve", "-q"]);
+        let Commands::Serve(args) = cli.command else {
+            panic!("expected serve command");
+        };
+
+        assert!(args.quiet);
+    }
+
+    #[test]
+    fn serve_accepts_retry_forever_with_explicit_retry_count_override() {
+        let cli = Cli::parse_from([
+            "pocker",
+            "serve",
+            "--request-retries",
+            "1",
+            "--retry-forever",
+        ]);
+        let Commands::Serve(args) = cli.command else {
+            panic!("expected serve command");
+        };
+
+        assert_eq!(args.request_retries, Some(1));
+        assert!(args.retry_forever);
+    }
+
+    #[test]
+    fn pull_accepts_zero_request_retries() {
         let cli = Cli::parse_from(["pocker", "pull", "--request-retries", "0", "alpine:latest"]);
         let Commands::Pull(args) = cli.command else {
             panic!("expected pull command");
         };
 
-        assert_eq!(args.request_retries, 0);
+        assert_eq!(args.request_retries, Some(0));
     }
 
     #[test]
@@ -551,6 +725,40 @@ mod tests {
 
         assert_eq!(args.file.len(), 2);
         assert_eq!(pull.services, vec!["app"]);
+    }
+
+    #[test]
+    fn compose_pull_accepts_quiet_short_flag() {
+        let cli = Cli::parse_from(["pocker", "compose", "pull", "-q"]);
+        let Commands::Compose(args) = cli.command else {
+            panic!("expected compose command");
+        };
+        let ComposeCommands::Pull(pull) = args.command else {
+            panic!("expected compose pull command");
+        };
+
+        assert!(pull.quiet);
+    }
+
+    #[test]
+    fn compose_pull_accepts_retry_forever_with_explicit_retry_count_override() {
+        let cli = Cli::parse_from([
+            "pocker",
+            "compose",
+            "pull",
+            "--blob-retries",
+            "1",
+            "--retry-forever",
+        ]);
+        let Commands::Compose(args) = cli.command else {
+            panic!("expected compose command");
+        };
+        let ComposeCommands::Pull(pull) = args.command else {
+            panic!("expected compose pull command");
+        };
+
+        assert_eq!(pull.blob_retries, Some(1));
+        assert!(pull.retry_forever);
     }
 
     #[test]
@@ -607,5 +815,8 @@ mod tests {
         let help = String::from_utf8(help).expect("help should be utf8");
 
         assert!(help.contains(&platform_help()));
+        assert!(help.contains("Download options"));
+        assert!(help.contains("Retry options"));
+        assert!(help.contains("--retry-forever"));
     }
 }

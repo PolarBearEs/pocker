@@ -86,7 +86,7 @@ pocker pull --blob-retries 32 ghcr.io/example/app:latest
 Retry indefinitely on unstable links:
 
 ```bash
-pocker pull --blob-retries 0 ghcr.io/example/app:latest
+pocker pull --retry-forever ghcr.io/example/app:latest
 ```
 
 Increase registry request retries for flaky pre-response failures:
@@ -167,9 +167,9 @@ pocker image --help
 - Use `--cache-dir` to override the default local cache location
 - Use `pocker serve` with `pocker pull --cache-from` to pull through another pocker cache
 - Use `pocker cache clean` to wipe and recreate the local cache directory
-- Use `--blob-retries` to raise the retry budget for unstable connections; `0` means unlimited retries
-- Use `--request-retries` to raise the retry budget for request/connect/503-style failures; `0` means unlimited retries
-- Registry retries are bounded by default; setting a retry flag to `0` makes that retry path unlimited
+- Use `--blob-retries` to set the retry budget for unstable blob downloads; `0` disables blob retries
+- Use `--request-retries` to set the retry budget for request/connect/503-style failures; `0` disables request retries
+- Use `--retry-forever` to retry retryable blob downloads and registry requests indefinitely
 - `pocker serve` is cache-only by default; `--pull-missing` explicitly allows upstream registry requests
 - Upstream auth for `pocker serve --pull-missing` is resolved on the serving instance, not forwarded by clients
 - `--load-mode registry` is experimental and requires the Docker daemon to reach pocker on `127.0.0.1`; use the default `stream` mode for remote Docker daemons or unsupported environments

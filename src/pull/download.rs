@@ -256,7 +256,10 @@ fn register_retry(
 ) -> Result<u32> {
     let detail = detail.into();
     let next_retry = retries + 1;
-    if context.blob_retry_limit != 0 && next_retry > context.blob_retry_limit {
+    if context
+        .blob_retry_limit
+        .is_some_and(|limit| next_retry > limit)
+    {
         return Err(DockerPullError::RetryLimitExceeded {
             operation: format!("blob download {digest}"),
             retries,
@@ -264,10 +267,9 @@ fn register_retry(
         });
     }
 
-    let retry_budget = if context.blob_retry_limit == 0 {
-        format!("{next_retry}/unlimited")
-    } else {
-        format!("{next_retry}/{}", context.blob_retry_limit)
+    let retry_budget = match context.blob_retry_limit {
+        Some(limit) => format!("{next_retry}/{limit}"),
+        None => format!("{next_retry}/unlimited"),
     };
     context.ui.warn(format!(
         "{detail} for {digest}; retrying in {:?} ({retry_budget})",
