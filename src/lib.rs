@@ -1,3 +1,10 @@
+//! Internal library backing the `pocker` binary and its tests.
+//!
+//! This crate is not published to crates.io and does not provide a stable
+//! public API: module layout, items, and signatures may change between
+//! releases without notice. The modules are `pub` only so the binary
+//! target and future integration tests can reach them.
+
 pub mod auth;
 pub mod cli;
 pub mod docker;
