@@ -390,7 +390,7 @@ where
 
 #[cfg(any(test, windows))]
 pub(crate) fn parse_response_head(bytes: &[u8]) -> Result<(StatusCode, Vec<(String, String)>)> {
-    let mut headers = [httparse::EMPTY_HEADER; 64];
+    let mut headers = [httparse::EMPTY_HEADER; 128];
     let mut response = httparse::Response::new(&mut headers);
     let parsed = response.parse(bytes).map_err(|error| {
         DockerPullError::BadResponse(format!("invalid docker API headers: {error}"))
