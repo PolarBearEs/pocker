@@ -30,6 +30,39 @@ function Invoke-Docker {
     }
 }
 
+function Test-DockerDaemon {
+    & docker version --format "{{.Server.Os}}" *> $null
+    return $LASTEXITCODE -eq 0
+}
+
+function Wait-DockerDaemon {
+    for ($i = 0; $i -lt 60; $i++) {
+        if (Test-DockerDaemon) {
+            return
+        }
+        Start-Sleep -Seconds 2
+    }
+
+    throw "Docker daemon did not become reachable"
+}
+
+function Ensure-DockerDaemon {
+    if (Test-DockerDaemon) {
+        return
+    }
+
+    $service = Get-Service -Name docker -ErrorAction SilentlyContinue
+    if ($service) {
+        if ($service.Status -ne "Running") {
+            Start-Service -Name docker
+        }
+        Wait-DockerDaemon
+        return
+    }
+
+    throw "Docker daemon is not reachable and no docker service is installed"
+}
+
 function Select-SmokeImage {
     $serverOs = (docker version --format "{{.Server.Os}}").Trim()
     if ($LASTEXITCODE -ne 0) {
@@ -54,6 +87,7 @@ function Select-SmokeImage {
 }
 
 Require-Command docker
+Ensure-DockerDaemon
 
 Write-Host "smoke: Docker daemon is reachable"
 Invoke-Docker -DockerArgs @("version", "--format", "{{.Server.Os}}") | Out-Null
