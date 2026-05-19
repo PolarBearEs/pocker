@@ -1,5 +1,7 @@
 #[cfg(windows)]
 use std::path::{Path, PathBuf};
+#[cfg(windows)]
+use std::time::Duration;
 
 #[cfg(windows)]
 use futures_util::StreamExt;
@@ -17,6 +19,13 @@ use crate::error::{DockerPullError, Result};
 use super::{DockerResponse, ensure_success_status};
 #[cfg(windows)]
 use tokio::io::DuplexStream;
+
+#[cfg(windows)]
+const ERROR_PIPE_BUSY: i32 = 231;
+#[cfg(windows)]
+const NAMED_PIPE_OPEN_RETRIES: usize = 20;
+#[cfg(windows)]
+const NAMED_PIPE_OPEN_RETRY_DELAY: Duration = Duration::from_millis(50);
 
 #[cfg(windows)]
 pub(super) fn normalize_named_pipe_path(path: &str) -> Result<PathBuf> {
@@ -42,7 +51,7 @@ pub(super) async fn request_bytes(
     path: &str,
     body: Vec<u8>,
 ) -> Result<DockerResponse> {
-    let mut pipe = ClientOptions::new().open(pipe_path)?;
+    let mut pipe = open_named_pipe(pipe_path).await?;
     let headers = format!(
         "{method} {path} HTTP/1.1\r\nHost: docker\r\nUser-Agent: pocker/{}\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
         env!("CARGO_PKG_VERSION"),
@@ -63,7 +72,7 @@ pub(super) async fn request_file(
     mut file: tokio::fs::File,
     len: u64,
 ) -> Result<DockerResponse> {
-    let mut pipe = ClientOptions::new().open(pipe_path)?;
+    let mut pipe = open_named_pipe(pipe_path).await?;
     let headers = format!(
         "{method} {path} HTTP/1.1\r\nHost: docker\r\nUser-Agent: pocker/{}\r\nConnection: close\r\nContent-Type: {content_type}\r\nContent-Length: {len}\r\n\r\n",
         env!("CARGO_PKG_VERSION")
@@ -82,7 +91,7 @@ pub(super) async fn request_chunked_stream(
     content_type: &str,
     mut stream: ReaderStream<DuplexStream>,
 ) -> Result<DockerResponse> {
-    let mut pipe = ClientOptions::new().open(pipe_path)?;
+    let mut pipe = open_named_pipe(pipe_path).await?;
     let headers = format!(
         "{method} {path} HTTP/1.1\r\nHost: docker\r\nUser-Agent: pocker/{}\r\nConnection: close\r\nContent-Type: {content_type}\r\nTransfer-Encoding: chunked\r\n\r\n",
         env!("CARGO_PKG_VERSION")
@@ -108,7 +117,7 @@ pub(super) async fn request_to_file(
     output: &Path,
     action: &str,
 ) -> Result<()> {
-    let mut pipe = ClientOptions::new().open(pipe_path)?;
+    let mut pipe = open_named_pipe(pipe_path).await?;
     let headers = format!(
         "{method} {path} HTTP/1.1\r\nHost: docker\r\nUser-Agent: pocker/{}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
         env!("CARGO_PKG_VERSION")
@@ -126,6 +135,26 @@ pub(super) async fn request_to_file(
     write_body_to_file(&mut pipe, &headers, body_start, &mut file).await?;
     file.flush().await?;
     Ok(())
+}
+
+#[cfg(windows)]
+async fn open_named_pipe(
+    pipe_path: &Path,
+) -> Result<tokio::net::windows::named_pipe::NamedPipeClient> {
+    for attempt in 0..=NAMED_PIPE_OPEN_RETRIES {
+        match ClientOptions::new().open(pipe_path) {
+            Ok(pipe) => return Ok(pipe),
+            Err(error)
+                if error.raw_os_error() == Some(ERROR_PIPE_BUSY)
+                    && attempt < NAMED_PIPE_OPEN_RETRIES =>
+            {
+                tokio::time::sleep(NAMED_PIPE_OPEN_RETRY_DELAY).await;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+
+    unreachable!("named pipe retry loop either returns or propagates the last open error")
 }
 
 #[cfg(windows)]
@@ -423,7 +452,7 @@ mod tests {
     use tempfile::tempdir;
     use tokio::io::AsyncWriteExt;
 
-    use super::write_chunked_body_to_file;
+    use super::{decode_chunked_body, write_chunked_body_to_file};
 
     #[tokio::test]
     async fn chunked_body_is_streamed_to_file() {
@@ -448,5 +477,13 @@ mod tests {
         drop(file);
 
         assert_eq!(std::fs::read(path).expect("file should read"), b"pocker");
+    }
+
+    #[test]
+    fn zero_length_chunk_ends_decoding() {
+        let body = decode_chunked_body(b"0\r\n\r\nignored")
+            .expect("zero-length chunk should finish the body");
+
+        assert!(body.is_empty());
     }
 }
