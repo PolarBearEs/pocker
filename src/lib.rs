@@ -7,12 +7,14 @@ mod error;
 mod export;
 mod http;
 mod image;
+mod image_view;
 mod platform;
 mod pull;
 mod reference;
 mod registry;
 mod runtime;
 mod serve_registry;
+mod signal;
 mod store;
 mod ui;
 

@@ -262,6 +262,43 @@ fn docker_hub_aliases(registry: &str) -> impl Iterator<Item = &'static str> {
     aliases.iter().copied()
 }
 
+pub(crate) fn read_credentials(
+    username: Option<String>,
+    password_stdin: bool,
+) -> Result<Option<Credentials>> {
+    let password = if password_stdin {
+        Some(read_password_stdin()?)
+    } else {
+        None
+    };
+
+    credentials_from_parts(username, password)
+}
+
+fn read_password_stdin() -> Result<String> {
+    use std::io::Read;
+
+    let mut password = String::new();
+    std::io::stdin().read_to_string(&mut password)?;
+    Ok(password.trim_end_matches(['\n', '\r']).to_string())
+}
+
+fn credentials_from_parts(
+    username: Option<String>,
+    password: Option<String>,
+) -> Result<Option<Credentials>> {
+    match (username, password) {
+        (Some(username), Some(password)) => Ok(Some(Credentials::Basic { username, password })),
+        (None, None) => Ok(None),
+        (Some(_), None) => Err(DockerPullError::InvalidInput(
+            "`--username` requires `--password-stdin`".into(),
+        )),
+        (None, Some(_)) => Err(DockerPullError::InvalidInput(
+            "`--password-stdin` requires `--username`".into(),
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::ffi::OsString;
@@ -276,7 +313,30 @@ mod tests {
 
     #[cfg(unix)]
     use super::invoke_helper_command;
-    use super::{AuthResolver, Credentials, load_docker_config, registry_keys};
+    use super::{
+        AuthResolver, Credentials, credentials_from_parts, load_docker_config, registry_keys,
+    };
+    use crate::error::DockerPullError;
+
+    #[test]
+    fn credentials_reject_username_without_password_stdin() {
+        let error = credentials_from_parts(Some("alice".into()), None)
+            .expect_err("username without password should fail");
+
+        assert!(
+            matches!(error, DockerPullError::InvalidInput(message) if message == "`--username` requires `--password-stdin`")
+        );
+    }
+
+    #[test]
+    fn credentials_reject_password_stdin_without_username() {
+        let error = credentials_from_parts(None, Some("secret".into()))
+            .expect_err("password without username should fail");
+
+        assert!(
+            matches!(error, DockerPullError::InvalidInput(message) if message == "`--password-stdin` requires `--username`")
+        );
+    }
 
     fn docker_config_env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
