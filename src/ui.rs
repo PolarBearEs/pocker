@@ -8,12 +8,12 @@ use std::time::Duration;
 use anstyle::{AnsiColor, Style};
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 
-pub const GREEN: Style = AnsiColor::Green.on_default();
-pub const YELLOW: Style = AnsiColor::Yellow.on_default();
-pub const CYAN: Style = AnsiColor::Cyan.on_default();
-pub const DIM: Style = Style::new().dimmed();
+pub(crate) const GREEN: Style = AnsiColor::Green.on_default();
+pub(crate) const YELLOW: Style = AnsiColor::Yellow.on_default();
+pub(crate) const CYAN: Style = AnsiColor::Cyan.on_default();
+pub(crate) const DIM: Style = Style::new().dimmed();
 
-pub fn paint(value: &str, style: Style) -> String {
+pub(crate) fn paint(value: &str, style: Style) -> String {
     if should_color_stderr() {
         format!("{style}{value}{style:#}")
     } else {
@@ -601,7 +601,7 @@ fn layer_progress_char(layer: &AggregateLayer) -> char {
     PERCENT_CHARS[index as usize]
 }
 
-pub fn should_color_stderr() -> bool {
+pub(crate) fn should_color_stderr() -> bool {
     std::io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none()
 }
 
