@@ -184,11 +184,11 @@ pocker image --help
 | --- | --- | --- |
 | Linux x86_64 + Docker | Supported | Built, unit-tested, and smoke-tested in CI |
 | Linux arm64 + Docker | Supported | Built, unit-tested, and smoke-tested in CI |
-| Linux armv7 | Build-checked | Built in CI with `cross`, but not native runtime-validated |
+| Linux armv7 | Build-checked | Built in CI with `cargo-zigbuild`, but not native runtime-validated |
 | macOS arm64 | CI-checked | Built and unit-tested in CI, but not runtime-validated |
 | macOS x86_64 | CI-checked | Built and unit-tested in CI, but not runtime-validated |
-| Windows x64 | CI-checked | Built and unit-tested in CI, but not runtime-validated |
-| Windows arm64 | CI-checked | Built and unit-tested in CI, but not runtime-validated |
+| Windows x64 | CI-checked | Built and unit-tested in CI |
+| Windows arm64 | CI-checked | Built and unit-tested in CI |
 
 ## Runtime Requirements
 

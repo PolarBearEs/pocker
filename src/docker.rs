@@ -707,7 +707,6 @@ fn docker_endpoint_from_host(host: &str) -> Result<DockerEndpoint> {
         return Ok(DockerEndpoint::Unix(PathBuf::from(path)));
     }
 
-    #[cfg(windows)]
     if host.starts_with("npipe://") {
         return Err(DockerPullError::InvalidInput(
             "docker named pipes are not supported; set DOCKER_HOST to a tcp://, http://, or https:// endpoint".into(),
@@ -874,14 +873,22 @@ mod tests {
         );
     }
 
-    #[cfg(windows)]
     #[test]
-    fn docker_host_default_named_pipe_reports_actionable_error() {
-        let error = docker_endpoint_from_host(DEFAULT_DOCKER_HOST)
-            .expect_err("windows named pipe host should be rejected explicitly");
+    fn docker_host_named_pipe_reports_actionable_error_on_all_hosts() {
+        let error = docker_endpoint_from_host("npipe:////./pipe/docker_engine")
+            .expect_err("named pipe host should be rejected explicitly");
         assert_eq!(
             error.to_string(),
             "docker named pipes are not supported; set DOCKER_HOST to a tcp://, http://, or https:// endpoint"
+        );
+    }
+
+    #[test]
+    fn docker_host_trims_trailing_slashes() {
+        let endpoint = docker_endpoint_from_host("https://docker.example.test///")
+            .expect("https docker host should parse");
+        assert!(
+            matches!(endpoint, super::DockerEndpoint::Http(base) if base == "https://docker.example.test")
         );
     }
 
