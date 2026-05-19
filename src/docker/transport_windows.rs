@@ -186,13 +186,13 @@ where
             ));
         }
         buffer.extend_from_slice(&chunk[..read]);
+        if let Some(index) = find_bytes(&buffer, b"\r\n\r\n") {
+            break index + 4;
+        }
         if buffer.len() > MAX_RESPONSE_HEAD_BYTES {
             return Err(DockerPullError::BadResponse(
                 "docker API response headers are too large".into(),
             ));
-        }
-        if let Some(index) = find_bytes(&buffer, b"\r\n\r\n") {
-            break index + 4;
         }
     };
 
