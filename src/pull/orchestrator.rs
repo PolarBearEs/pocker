@@ -21,7 +21,7 @@ pub(crate) struct PullRequestOptions {
     concurrency: usize,
     image_concurrency: usize,
     blob_retry_limit: Option<u32>,
-    pub(crate) request_retry_limit: Option<u32>,
+    request_retry_limit: Option<u32>,
     no_load: bool,
     keep_layer_blobs: bool,
     load_mode: LoadMode,

@@ -78,14 +78,14 @@ pub(crate) async fn print_image_inspect(reference: &str) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn split_repo_tag(value: &str) -> (&str, &str) {
+fn split_repo_tag(value: &str) -> (&str, &str) {
     match value.rsplit_once(':') {
         Some((repository, tag)) if !tag.contains('/') => (repository, tag),
         _ => (value, "<none>"),
     }
 }
 
-pub(crate) fn short_image_id(value: &str) -> &str {
+fn short_image_id(value: &str) -> &str {
     let value = value.strip_prefix("sha256:").unwrap_or(value);
     let end = value
         .char_indices()
@@ -116,7 +116,7 @@ pub(crate) fn format_size(size: Option<u64>) -> String {
     }
 }
 
-pub(crate) fn format_created(created: Option<i64>) -> String {
+fn format_created(created: Option<i64>) -> String {
     let Some(created) = created else {
         return "<unknown>".into();
     };
