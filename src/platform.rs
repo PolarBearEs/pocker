@@ -30,7 +30,17 @@ impl Platform {
             .ok_or_else(|| {
                 DockerPullError::InvalidInput("platform architecture is required".into())
             })?;
-        let variant = parts.next().map(ToString::to_string);
+        let variant = parts
+            .next()
+            .map(|part| {
+                if part.is_empty() {
+                    return Err(DockerPullError::InvalidInput(
+                        "platform variant cannot be empty".into(),
+                    ));
+                }
+                Ok(part.to_string())
+            })
+            .transpose()?;
         if parts.next().is_some() {
             return Err(DockerPullError::InvalidInput(
                 "platform must use os/arch[/variant] format".into(),
@@ -95,8 +105,26 @@ mod tests {
 
     #[test]
     fn normalizes_common_architecture_aliases() {
-        let platform = Platform::parse("linux/x86_64").expect("platform should parse");
-        assert_eq!(platform.architecture, "amd64");
+        for (input, expected) in [
+            ("linux/x86_64", "amd64"),
+            ("linux/x86", "386"),
+            ("linux/i386", "386"),
+            ("linux/i586", "386"),
+            ("linux/i686", "386"),
+            ("linux/aarch64", "arm64"),
+            ("linux/armv7l", "arm"),
+            ("linux/armv7", "arm"),
+        ] {
+            let platform = Platform::parse(input).expect("platform should parse");
+            assert_eq!(platform.architecture, expected, "{input} should normalize");
+        }
+    }
+
+    #[test]
+    fn normalizes_macos_to_oci_darwin() {
+        let platform = Platform::parse("macos/aarch64").expect("platform should parse");
+
+        assert_eq!(platform.as_string(), "darwin/arm64");
     }
 
     #[test]
@@ -107,5 +135,12 @@ mod tests {
             error.to_string(),
             "platform must use os/arch[/variant] format"
         );
+    }
+
+    #[test]
+    fn rejects_empty_platform_variant() {
+        let error = Platform::parse("linux/amd64/")
+            .expect_err("platform with empty variant should be rejected");
+        assert_eq!(error.to_string(), "platform variant cannot be empty");
     }
 }
