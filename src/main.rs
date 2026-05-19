@@ -273,7 +273,7 @@ fn print_compose_pull_plan(resolved: &compose::ComposeImages, quiet: bool) {
     let images = compose::unique_images(&resolved.images);
     eprintln!(
         "{} {} service(s), {} unique image(s)",
-        color("Compose pull plan:", Color::Cyan),
+        ui::paint("Compose pull plan:", ui::CYAN),
         resolved.services.len(),
         images.len()
     );
@@ -284,50 +284,29 @@ fn print_compose_pull_plan(resolved: &compose::ComposeImages, quiet: bool) {
             if let Some(first_service) = first_service_by_image.get(image) {
                 eprintln!(
                     "  {} {} {} {}",
-                    color(&service.service, Color::Green),
-                    color("->", Color::Dim),
+                    ui::paint(&service.service, ui::GREEN),
+                    ui::paint("->", ui::DIM),
                     image,
-                    color(&format!("(shared with {first_service})"), Color::Dim)
+                    ui::paint(&format!("(shared with {first_service})"), ui::DIM)
                 );
             } else {
                 first_service_by_image.insert(image.clone(), service.service.clone());
                 eprintln!(
                     "  {} {} {}",
-                    color(&service.service, Color::Green),
-                    color("->", Color::Dim),
+                    ui::paint(&service.service, ui::GREEN),
+                    ui::paint("->", ui::DIM),
                     image
                 );
             }
         } else if service.build_only {
             eprintln!(
                 "  {} {} {}",
-                color(&service.service, Color::Green),
-                color("->", Color::Dim),
-                color("build-only (skipped)", Color::Yellow)
+                ui::paint(&service.service, ui::GREEN),
+                ui::paint("->", ui::DIM),
+                ui::paint("build-only (skipped)", ui::YELLOW)
             );
         }
     }
-}
-
-#[derive(Copy, Clone)]
-enum Color {
-    Green,
-    Yellow,
-    Cyan,
-    Dim,
-}
-
-fn color(value: &str, color: Color) -> String {
-    if !ui::should_color_stderr() {
-        return value.to_string();
-    }
-    let code = match color {
-        Color::Green => "32",
-        Color::Yellow => "33",
-        Color::Cyan => "36",
-        Color::Dim => "2",
-    };
-    format!("\x1b[{code}m{value}\x1b[0m")
 }
 
 async fn pull_references(
