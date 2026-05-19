@@ -65,9 +65,6 @@ function Ensure-DockerDaemon {
 
 function Select-SmokeImage {
     $serverOs = (docker version --format "{{.Server.Os}}").Trim()
-    if ($LASTEXITCODE -ne 0) {
-        throw "docker daemon is not reachable"
-    }
     if ($serverOs -eq "linux") {
         return "registry.k8s.io/pause:3.9"
     }

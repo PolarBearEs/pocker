@@ -19,6 +19,7 @@ use reqwest_transport::ReqwestTransport;
 pub(super) const DEFAULT_DOCKER_HOST: &str = "npipe:////./pipe/docker_engine";
 #[cfg(not(windows))]
 pub(super) const DEFAULT_DOCKER_HOST: &str = "unix:///var/run/docker.sock";
+
 #[derive(Debug, Clone)]
 pub(super) enum DockerEndpoint {
     #[cfg(unix)]
