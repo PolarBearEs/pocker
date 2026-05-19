@@ -17,7 +17,7 @@ function Invoke-Pocker {
 
     & $Bin @PockerArgs
     if ($LASTEXITCODE -ne 0) {
-        throw "pocker failed with exit code $LASTEXITCODE: $Bin $($PockerArgs -join ' ')"
+        throw "pocker failed with exit code ${LASTEXITCODE}: $Bin $($PockerArgs -join ' ')"
     }
 }
 
@@ -26,7 +26,7 @@ function Invoke-Docker {
 
     & docker @DockerArgs
     if ($LASTEXITCODE -ne 0) {
-        throw "docker failed with exit code $LASTEXITCODE: docker $($DockerArgs -join ' ')"
+        throw "docker failed with exit code ${LASTEXITCODE}: docker $($DockerArgs -join ' ')"
     }
 }
 
