@@ -1,20 +1,16 @@
 use std::collections::{HashMap, HashSet};
-use std::env;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
-use futures_util::StreamExt;
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
-use reqwest::{Client, Response, StatusCode};
+use reqwest::StatusCode;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 use tar::Archive;
 use tempfile::{NamedTempFile, TempDir};
-use tokio::io::AsyncWriteExt;
 use tokio::io::DuplexStream;
 use tokio::task::JoinSet;
 use tokio_util::io::{ReaderStream, SyncIoBridge};
@@ -27,12 +23,10 @@ use crate::image::LayerSpec;
 use crate::reference::{ImageReference, ReferenceTarget};
 use crate::store::{Store, StoredReference};
 
-#[cfg(windows)]
-const DEFAULT_DOCKER_HOST: &str = "npipe:////./pipe/docker_engine";
-#[cfg(not(windows))]
-const DEFAULT_DOCKER_HOST: &str = "unix:///var/run/docker.sock";
-#[cfg(unix)]
-const DEFAULT_DOCKER_BASE_URL: &str = "http://docker";
+mod transport;
+
+use transport::{DockerTransport, ensure_success_status};
+
 const PATH_SEGMENT_ENCODE_SET: &AsciiSet = &CONTROLS
     .add(b' ')
     .add(b'"')
@@ -57,83 +51,43 @@ const DAEMON_INSPECT_CONCURRENCY: usize = 8;
 const LOAD_ARCHIVE_STREAM_BUFFER_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone)]
-enum DockerEndpoint {
-    #[cfg(unix)]
-    Unix(PathBuf),
-    Http(String),
-}
-
-#[derive(Debug, Clone)]
 struct DockerDaemon {
-    client: Client,
-    base_url: String,
+    transport: DockerTransport,
 }
 
 impl DockerDaemon {
     fn connect() -> Result<Self> {
-        let endpoint = docker_endpoint()?;
-        let builder = Client::builder()
-            .connect_timeout(Duration::from_secs(20))
-            .user_agent(format!("pocker/{}", env!("CARGO_PKG_VERSION")))
-            .http1_only();
-
-        #[cfg(unix)]
-        let (client, base_url) = match endpoint {
-            DockerEndpoint::Unix(path) => (
-                builder.unix_socket(path).build()?,
-                DEFAULT_DOCKER_BASE_URL.to_string(),
-            ),
-            DockerEndpoint::Http(base_url) => (builder.build()?, base_url),
-        };
-
-        #[cfg(not(unix))]
-        let (client, base_url) = match endpoint {
-            DockerEndpoint::Http(base_url) => (builder.build()?, base_url),
-        };
-
-        Ok(Self { client, base_url })
+        Ok(Self {
+            transport: DockerTransport::connect()?,
+        })
     }
 
     async fn load_archive(&self, path: &Path) -> Result<()> {
-        let file = tokio::fs::File::open(path).await?;
-        let body = reqwest::Body::wrap_stream(ReaderStream::new(file));
-        let response = self
-            .client
-            .post(self.url("/images/load?quiet=1"))
-            .header(reqwest::header::CONTENT_TYPE, "application/x-tar")
-            .body(body)
-            .send()
-            .await?;
-        self.ensure_success(response, "docker image load").await?;
-        Ok(())
+        self.transport.load_archive(path).await
     }
 
     async fn load_archive_stream(&self, stream: ReaderStream<DuplexStream>) -> Result<()> {
-        let body = reqwest::Body::wrap_stream(stream);
-        let response = self
-            .client
-            .post(self.url("/images/load?quiet=1"))
-            .header(reqwest::header::CONTENT_TYPE, "application/x-tar")
-            .body(body)
-            .send()
-            .await?;
-        self.ensure_success(response, "docker image load").await?;
-        Ok(())
+        self.transport.load_archive_stream(stream).await
     }
 
     async fn inspect_image(&self, image: &str) -> Result<Option<DaemonImage>> {
         let response = self
-            .client
-            .get(self.url(&format!("/images/{}/json", encode_path_segment(image))))
-            .send()
+            .transport
+            .request_bytes(
+                "GET",
+                &format!("/images/{}/json", encode_path_segment(image)),
+                None,
+            )
             .await?;
-        if response.status() == StatusCode::NOT_FOUND {
+        if response.status == StatusCode::NOT_FOUND {
             return Ok(None);
         }
-        let response = self
-            .ensure_success(response, "docker image inspect")
-            .await?;
-        Ok(Some(response.json().await?))
+        ensure_success_status(
+            response.status,
+            response.body.clone(),
+            "docker image inspect",
+        )?;
+        Ok(Some(serde_json::from_slice(&response.body)?))
     }
 
     async fn list_image_summaries(&self) -> Result<Vec<DaemonImageSummary>> {
@@ -141,94 +95,76 @@ impl DockerDaemon {
     }
 
     async fn save_image(&self, image: &str, path: &Path) -> Result<()> {
-        let response = self
-            .client
-            .get(self.url(&format!("/images/{}/get", encode_path_segment(image))))
-            .send()
-            .await?;
-        let response = self.ensure_success(response, "docker image save").await?;
-        let mut file = tokio::fs::File::create(path).await?;
-        let mut stream = response.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            file.write_all(&chunk?).await?;
-        }
-        file.flush().await?;
-        Ok(())
+        self.transport
+            .save_response_to_file(
+                &format!("/images/{}/get", encode_path_segment(image)),
+                path,
+                "docker image save",
+            )
+            .await
     }
 
     async fn pull_image(&self, reference: &str) -> Result<()> {
         let (repository, tag) = split_tagged_reference(reference)?;
         let response = self
-            .client
-            .post(self.url(&format!(
-                "/images/create?fromImage={}&tag={}",
-                encode_query_value(repository),
-                encode_query_value(tag)
-            )))
-            .send()
+            .transport
+            .request_bytes(
+                "POST",
+                &format!(
+                    "/images/create?fromImage={}&tag={}",
+                    encode_query_value(repository),
+                    encode_query_value(tag)
+                ),
+                None,
+            )
             .await?;
-        let response = self.ensure_success(response, "docker image pull").await?;
-        ensure_json_stream_success(response.text().await?, "docker image pull")
+        ensure_success_status(response.status, response.body.clone(), "docker image pull")?;
+        ensure_json_stream_success(
+            String::from_utf8_lossy(&response.body).into_owned(),
+            "docker image pull",
+        )
     }
 
     async fn tag_image(&self, source: &str, target: &str) -> Result<()> {
         let (repository, tag) = split_tagged_reference(target)?;
         let response = self
-            .client
-            .post(self.url(&format!(
-                "/images/{}/tag?repo={}&tag={}",
-                encode_path_segment(source),
-                encode_query_value(repository),
-                encode_query_value(tag)
-            )))
-            .send()
+            .transport
+            .request_bytes(
+                "POST",
+                &format!(
+                    "/images/{}/tag?repo={}&tag={}",
+                    encode_path_segment(source),
+                    encode_query_value(repository),
+                    encode_query_value(tag)
+                ),
+                None,
+            )
             .await?;
-        self.ensure_success(response, "docker image tag").await?;
-        Ok(())
+        ensure_success_status(response.status, response.body, "docker image tag")
     }
 
     async fn remove_image_tag(&self, reference: &str) -> Result<()> {
         let response = self
-            .client
-            .delete(self.url(&format!(
-                "/images/{}?force=1&noprune=1",
-                encode_path_segment(reference)
-            )))
-            .send()
+            .transport
+            .request_bytes(
+                "DELETE",
+                &format!(
+                    "/images/{}?force=1&noprune=1",
+                    encode_path_segment(reference)
+                ),
+                None,
+            )
             .await?;
-        self.ensure_success(response, "docker image remove").await?;
-        Ok(())
+        ensure_success_status(response.status, response.body, "docker image remove")
     }
 
     async fn get_json<T>(&self, path: &str, action: &str) -> Result<T>
     where
         T: DeserializeOwned,
     {
-        let response = self.client.get(self.url(path)).send().await?;
-        let response = self.ensure_success(response, action).await?;
-        response.json().await.map_err(Into::into)
-    }
-
-    async fn ensure_success(&self, response: Response, action: &str) -> Result<Response> {
-        if response.status().is_success() {
-            return Ok(response);
-        }
-
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        let body = body.trim();
-        let detail = if body.is_empty() {
-            format!("status {status}")
-        } else {
-            format!("status {status}: {body}")
-        };
-        Err(DockerPullError::CommandFailed(format!(
-            "{action} failed: {detail}"
-        )))
-    }
-
-    fn url(&self, path: &str) -> String {
-        format!("{}{}", self.base_url, path)
+        let response = self.transport.request_bytes("GET", path, None).await?;
+        ensure_success_status(response.status, response.body.clone(), action)?;
+        serde_json::from_slice(&response.body).map_err(Into::into)
     }
 }
 
@@ -415,17 +351,22 @@ pub async fn remove_image_tag(reference: &str) -> Result<()> {
 pub async fn inspect_image(reference: &str) -> Result<Option<Value>> {
     let daemon = DockerDaemon::connect()?;
     let response = daemon
-        .client
-        .get(daemon.url(&format!("/images/{}/json", encode_path_segment(reference))))
-        .send()
+        .transport
+        .request_bytes(
+            "GET",
+            &format!("/images/{}/json", encode_path_segment(reference)),
+            None,
+        )
         .await?;
-    if response.status() == StatusCode::NOT_FOUND {
+    if response.status == StatusCode::NOT_FOUND {
         return Ok(None);
     }
-    let response = daemon
-        .ensure_success(response, "docker image inspect")
-        .await?;
-    Ok(Some(response.json().await?))
+    ensure_success_status(
+        response.status,
+        response.body.clone(),
+        "docker image inspect",
+    )?;
+    Ok(Some(serde_json::from_slice(&response.body)?))
 }
 
 pub async fn list_images() -> Result<Vec<ImageSummary>> {
@@ -689,46 +630,6 @@ fn copy_archive_entry_with_digest<R: Read>(
     Ok(())
 }
 
-fn docker_endpoint() -> Result<DockerEndpoint> {
-    match env::var("DOCKER_HOST") {
-        Ok(host) if !host.trim().is_empty() => docker_endpoint_from_host(&host),
-        _ => docker_endpoint_from_host(DEFAULT_DOCKER_HOST),
-    }
-}
-
-fn docker_endpoint_from_host(host: &str) -> Result<DockerEndpoint> {
-    #[cfg(unix)]
-    if let Some(path) = host.strip_prefix("unix://") {
-        if path.is_empty() {
-            return Err(DockerPullError::InvalidInput(
-                "docker host unix socket path is empty".into(),
-            ));
-        }
-        return Ok(DockerEndpoint::Unix(PathBuf::from(path)));
-    }
-
-    if host.starts_with("npipe://") {
-        return Err(DockerPullError::InvalidInput(
-            "docker named pipes are not supported; set DOCKER_HOST to a tcp://, http://, or https:// endpoint".into(),
-        ));
-    }
-
-    if let Some(address) = host.strip_prefix("tcp://") {
-        return Ok(DockerEndpoint::Http(format!(
-            "http://{}",
-            address.trim_end_matches('/')
-        )));
-    }
-
-    if host.starts_with("http://") || host.starts_with("https://") {
-        return Ok(DockerEndpoint::Http(host.trim_end_matches('/').to_string()));
-    }
-
-    Err(DockerPullError::InvalidInput(format!(
-        "unsupported docker host `{host}`"
-    )))
-}
-
 fn encode_path_segment(value: &str) -> String {
     utf8_percent_encode(value, PATH_SEGMENT_ENCODE_SET).to_string()
 }
@@ -787,11 +688,9 @@ mod tests {
     #[cfg(unix)]
     use std::path::Path;
 
-    #[cfg(any(unix, windows))]
-    use super::DEFAULT_DOCKER_HOST;
-    use super::{
-        daemon_inspect_target, docker_endpoint_from_host, encode_path_segment, encode_query_value,
-    };
+    use super::transport::windows::{decode_chunked_body, header_value, parse_response_head};
+    use super::transport::{DEFAULT_DOCKER_HOST, DockerEndpoint, docker_endpoint_from_host};
+    use super::{daemon_inspect_target, encode_path_segment, encode_query_value};
     use super::{ordered_unique_image_ids, split_tagged_reference};
     use crate::reference::ImageReference;
 
@@ -860,7 +759,7 @@ mod tests {
         let endpoint = docker_endpoint_from_host(DEFAULT_DOCKER_HOST)
             .expect("default docker host should parse");
         assert!(
-            matches!(endpoint, super::DockerEndpoint::Unix(path) if path == Path::new("/var/run/docker.sock"))
+            matches!(endpoint, DockerEndpoint::Unix(path) if path == Path::new("/var/run/docker.sock"))
         );
     }
 
@@ -868,11 +767,10 @@ mod tests {
     fn docker_host_supports_tcp() {
         let endpoint = docker_endpoint_from_host("tcp://127.0.0.1:2375")
             .expect("tcp docker host should parse");
-        assert!(
-            matches!(endpoint, super::DockerEndpoint::Http(base) if base == "http://127.0.0.1:2375")
-        );
+        assert!(matches!(endpoint, DockerEndpoint::Http(base) if base == "http://127.0.0.1:2375"));
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn docker_host_named_pipe_reports_actionable_error_on_all_hosts() {
         let error = docker_endpoint_from_host("npipe:////./pipe/docker_engine")
@@ -883,13 +781,44 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn docker_host_supports_windows_named_pipe() {
+        let endpoint = docker_endpoint_from_host(DEFAULT_DOCKER_HOST)
+            .expect("windows named pipe host should parse");
+        assert!(
+            matches!(endpoint, DockerEndpoint::NamedPipe(path) if path == std::path::Path::new(r"\\.\pipe\docker_engine"))
+        );
+    }
+
     #[test]
     fn docker_host_trims_trailing_slashes() {
         let endpoint = docker_endpoint_from_host("https://docker.example.test///")
             .expect("https docker host should parse");
         assert!(
-            matches!(endpoint, super::DockerEndpoint::Http(base) if base == "https://docker.example.test")
+            matches!(endpoint, DockerEndpoint::Http(base) if base == "https://docker.example.test")
         );
+    }
+
+    #[test]
+    fn docker_api_response_head_parses_status_and_headers() {
+        let (status, headers) =
+            parse_response_head(b"HTTP/1.1 201 Created\r\nContent-Type: application/json\r\n\r\n")
+                .expect("response head should parse");
+
+        assert_eq!(status, reqwest::StatusCode::CREATED);
+        assert_eq!(
+            header_value(&headers, "content-type"),
+            Some("application/json")
+        );
+    }
+
+    #[test]
+    fn docker_api_chunked_body_decodes() {
+        let body = decode_chunked_body(b"4\r\npock\r\n2\r\ner\r\n0\r\n\r\n")
+            .expect("chunked body should decode");
+
+        assert_eq!(body, b"pocker");
     }
 
     #[test]
