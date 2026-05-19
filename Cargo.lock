@@ -874,6 +874,7 @@ dependencies = [
  "futures-util",
  "hex",
  "http",
+ "httparse",
  "httpdate",
  "indicatif",
  "percent-encoding",
