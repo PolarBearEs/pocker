@@ -5,7 +5,21 @@ use std::io::IsTerminal;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use anstyle::{AnsiColor, Style};
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
+
+pub(crate) const GREEN: Style = AnsiColor::Green.on_default();
+pub(crate) const YELLOW: Style = AnsiColor::Yellow.on_default();
+pub(crate) const CYAN: Style = AnsiColor::Cyan.on_default();
+pub(crate) const DIM: Style = Style::new().dimmed();
+
+pub(crate) fn paint(value: &str, style: Style) -> String {
+    if should_color_stderr() {
+        format!("{style}{value}{style:#}")
+    } else {
+        value.to_string()
+    }
+}
 
 #[derive(Clone)]
 pub struct Ui {
@@ -457,7 +471,7 @@ impl ProgressUiInner {
         };
         self.image.set_message(format!(
             "{image} [{}]{bytes} {status}",
-            success_color(&strip)
+            paint(&strip, GREEN)
         ));
     }
 }
@@ -585,14 +599,6 @@ fn layer_progress_char(layer: &AggregateLayer) -> char {
     let percent = layer.position.saturating_mul(100) / layer.total;
     let index = (PERCENT_CHARS.len() as u64 - 1) * percent.min(100) / 100;
     PERCENT_CHARS[index as usize]
-}
-
-fn success_color(value: &str) -> String {
-    if should_color_stderr() {
-        format!("\x1b[32m{value}\x1b[0m")
-    } else {
-        value.to_string()
-    }
 }
 
 pub(crate) fn should_color_stderr() -> bool {
