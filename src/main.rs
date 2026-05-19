@@ -1,37 +1,26 @@
-mod auth;
-mod cli;
-mod docker;
-mod error;
-mod export;
-mod http;
-mod image;
-mod platform;
-mod pull;
-mod reference;
-mod registry;
-mod serve_registry;
-mod store;
-mod ui;
-
 use std::io::Read;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use auth::{AuthResolver, Credentials};
 use clap::Parser;
+use pocker::{
+    auth, cli, docker, error, http, platform, pull, reference, registry, serve_registry, store, ui,
+};
+use pocker_compose as compose;
+use tokio::task::JoinSet;
+use tracing_subscriber::EnvFilter;
+
+use auth::{AuthResolver, Credentials};
 use cli::{
     CacheCommands, Cli, Commands, ComposeCommands, ComposePullArgs, ImageCommands, PullArgs,
 };
 use error::{DockerPullError, Result};
 use http::build_http_client;
 use platform::Platform;
-use pocker_compose as compose;
 use pull::{DEFAULT_BLOB_RETRIES, PullContext, PullOptions, Puller};
 use registry::{DEFAULT_REQUEST_RETRIES, RegistryClient};
 use store::Store;
-use tokio::task::JoinSet;
-use tracing_subscriber::EnvFilter;
 use ui::{Ui, UiGroup};
 
 struct PullRequestOptions {
@@ -689,7 +678,7 @@ fn format_created(created: Option<i64>) -> String {
 #[cfg(test)]
 mod tests {
     use super::credentials_from_parts;
-    use crate::error::DockerPullError;
+    use pocker::error::DockerPullError;
 
     #[test]
     fn credentials_reject_username_without_password_stdin() {
