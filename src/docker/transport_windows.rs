@@ -444,6 +444,7 @@ mod tests {
         write_chunked_body_to_file(&mut reader, b"4\r\npo".to_vec(), &mut file)
             .await
             .expect("chunked body should stream");
+        file.flush().await.expect("file should flush");
         drop(file);
 
         assert_eq!(std::fs::read(path).expect("file should read"), b"pocker");

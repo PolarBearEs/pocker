@@ -116,7 +116,7 @@ jobs:
         run: cargo build --locked
 
       - name: Run Windows Docker smoke test
-        if: runner.os == 'Windows'
+        if: matrix.name == 'Windows x64'
         shell: pwsh
         run: ./ci/smoke-windows.ps1 target/debug/pocker.exe
 
