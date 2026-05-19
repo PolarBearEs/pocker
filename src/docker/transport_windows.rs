@@ -26,6 +26,8 @@ const ERROR_PIPE_BUSY: i32 = 231;
 const NAMED_PIPE_OPEN_RETRIES: usize = 20;
 #[cfg(windows)]
 const NAMED_PIPE_OPEN_RETRY_DELAY: Duration = Duration::from_millis(50);
+#[cfg(windows)]
+const MAX_RESPONSE_HEAD_BYTES: usize = 64 * 1024;
 
 #[cfg(windows)]
 pub(super) fn normalize_named_pipe_path(path: &str) -> Result<PathBuf> {
@@ -184,6 +186,11 @@ where
             ));
         }
         buffer.extend_from_slice(&chunk[..read]);
+        if buffer.len() > MAX_RESPONSE_HEAD_BYTES {
+            return Err(DockerPullError::BadResponse(
+                "docker API response headers are too large".into(),
+            ));
+        }
         if let Some(index) = find_bytes(&buffer, b"\r\n\r\n") {
             break index + 4;
         }
@@ -239,21 +246,7 @@ where
         let content_length = content_length.parse::<usize>().map_err(|error| {
             DockerPullError::BadResponse(format!("invalid docker API content length: {error}"))
         })?;
-        let initial_len = body_start.len().min(content_length);
-        file.write_all(&body_start[..initial_len]).await?;
-        let mut remaining = content_length - initial_len;
-        let mut buffer = [0_u8; 8192];
-        while remaining > 0 {
-            let limit = remaining.min(buffer.len());
-            let read = reader.read(&mut buffer[..limit]).await?;
-            if read == 0 {
-                return Err(DockerPullError::BadResponse(
-                    "docker API response ended before content length".into(),
-                ));
-            }
-            file.write_all(&buffer[..read]).await?;
-            remaining -= read;
-        }
+        write_content_length_body_to_file(reader, body_start, file, content_length).await?;
         return Ok(());
     }
 
@@ -266,6 +259,34 @@ where
         }
         file.write_all(&buffer[..read]).await?;
     }
+}
+
+#[cfg(windows)]
+async fn write_content_length_body_to_file<R>(
+    reader: &mut R,
+    body_start: Vec<u8>,
+    file: &mut tokio::fs::File,
+    content_length: usize,
+) -> Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let initial_len = body_start.len().min(content_length);
+    file.write_all(&body_start[..initial_len]).await?;
+    let mut remaining = content_length - initial_len;
+    let mut buffer = [0_u8; 8192];
+    while remaining > 0 {
+        let limit = remaining.min(buffer.len());
+        let read = reader.read(&mut buffer[..limit]).await?;
+        if read == 0 {
+            return Err(DockerPullError::BadResponse(
+                "docker API response ended before content length".into(),
+            ));
+        }
+        file.write_all(&buffer[..read]).await?;
+        remaining -= read;
+    }
+    Ok(())
 }
 
 #[cfg(any(test, windows))]
@@ -369,31 +390,34 @@ where
 
 #[cfg(any(test, windows))]
 pub(crate) fn parse_response_head(bytes: &[u8]) -> Result<(StatusCode, Vec<(String, String)>)> {
-    let text = std::str::from_utf8(bytes).map_err(|error| {
+    let mut headers = [httparse::EMPTY_HEADER; 64];
+    let mut response = httparse::Response::new(&mut headers);
+    let parsed = response.parse(bytes).map_err(|error| {
         DockerPullError::BadResponse(format!("invalid docker API headers: {error}"))
     })?;
-    let mut lines = text.split("\r\n");
-    let status_line = lines
-        .next()
-        .ok_or_else(|| DockerPullError::BadResponse("docker API response is empty".into()))?;
-    let status = status_line
-        .split_whitespace()
-        .nth(1)
-        .ok_or_else(|| {
-            DockerPullError::BadResponse("docker API response is missing status".into())
-        })?
-        .parse::<u16>()
-        .map_err(|error| {
-            DockerPullError::BadResponse(format!("invalid docker API status: {error}"))
-        })?;
+    if parsed.is_partial() {
+        return Err(DockerPullError::BadResponse(
+            "docker API response headers are incomplete".into(),
+        ));
+    }
+
+    let status = response.code.ok_or_else(|| {
+        DockerPullError::BadResponse("docker API response is missing status".into())
+    })?;
     let status = StatusCode::from_u16(status).map_err(|error| {
         DockerPullError::BadResponse(format!("invalid docker API status: {error}"))
     })?;
 
-    let headers = lines
-        .filter_map(|line| line.split_once(':'))
-        .map(|(name, value)| (name.trim().to_ascii_lowercase(), value.trim().to_string()))
-        .collect();
+    let headers = response
+        .headers
+        .iter()
+        .map(|header| {
+            let value = std::str::from_utf8(header.value).map_err(|error| {
+                DockerPullError::BadResponse(format!("invalid docker API header value: {error}"))
+            })?;
+            Ok((header.name.to_ascii_lowercase(), value.trim().to_string()))
+        })
+        .collect::<Result<Vec<_>>>()?;
     Ok((status, headers))
 }
 

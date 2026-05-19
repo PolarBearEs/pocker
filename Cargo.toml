@@ -15,6 +15,7 @@ futures-util = "0.3.31"
 hex = "0.4.3"
 http = "1.3.1"
 httpdate = "1.0.3"
+httparse = "1.10.1"
 indicatif = "0.17.11"
 percent-encoding = "2.3.2"
 pocker-compose = { path = "crates/pocker-compose" }
