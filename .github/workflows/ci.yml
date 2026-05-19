@@ -115,6 +115,11 @@ jobs:
       - name: Build binary
         run: cargo build --locked
 
+      - name: Run Windows Docker smoke test
+        if: matrix.name == 'Windows x64'
+        shell: pwsh
+        run: ./ci/smoke-windows.ps1 target/debug/pocker.exe
+
   build-linux-release-targets:
     runs-on: ubuntu-latest
     needs: fmt
