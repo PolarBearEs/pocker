@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use assert_cmd::Command;
 use sha2::{Digest, Sha256};
@@ -39,8 +40,18 @@ async fn pulls_oci_image_from_fake_registry_into_cache() {
                 .expect("pocker binary should be built")
                 .arg("--cache-dir")
                 .arg(&cache)
-                .args(["pull", "--plain-http", "--no-load", "--quiet"])
+                .args([
+                    "pull",
+                    "--plain-http",
+                    "--no-load",
+                    "--quiet",
+                    "--request-retries",
+                    "0",
+                    "--blob-retries",
+                    "0",
+                ])
                 .arg(&reference)
+                .timeout(Duration::from_secs(30))
                 .assert()
                 .success();
         }
@@ -59,10 +70,19 @@ async fn pulls_oci_image_from_fake_registry_into_cache() {
         .join("blobs")
         .join("sha256")
         .join(&fixture.layer_digest);
+    let config_path = cache_dir
+        .path()
+        .join("blobs")
+        .join("sha256")
+        .join(&fixture.config_digest);
 
     assert!(
         manifest_path.exists(),
         "expected manifest blob at {manifest_path:?}"
+    );
+    assert!(
+        config_path.exists(),
+        "expected config blob at {config_path:?}"
     );
     assert!(layer_path.exists(), "expected layer blob at {layer_path:?}");
 }
