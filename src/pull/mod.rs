@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use futures_util::stream::{FuturesUnordered, StreamExt};
+use tracing::warn;
 
 use crate::docker;
 use crate::error::{DockerPullError, Result};
@@ -91,9 +92,16 @@ impl Puller {
             .collect::<Vec<_>>();
         self.context.ui.prepare_layers(&layer_digests);
         let daemon_layers = if options.load_mode == LoadMode::Stream {
-            docker::daemon_layer_coverage(&layers)
-                .await
-                .unwrap_or_default()
+            match docker::daemon_layer_coverage(&layers).await {
+                Ok(coverage) => coverage,
+                Err(error) => {
+                    warn!("failed to inspect Docker daemon layer coverage: {error}");
+                    self.context.ui.warn(format!(
+                        "could not inspect existing Docker layers; downloading all missing cache layers: {error}"
+                    ));
+                    Default::default()
+                }
+            }
         } else {
             Default::default()
         };
