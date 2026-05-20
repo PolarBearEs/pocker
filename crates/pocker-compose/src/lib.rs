@@ -72,7 +72,8 @@ pub fn resolve_images(files: &[PathBuf], working_dir: &Path) -> Result<ComposeIm
         files
             .iter()
             .map(|file| absolutize(working_dir, file))
-            .collect::<Vec<_>>()
+            .map(|file| normalize_path(&file))
+            .collect::<Result<Vec<_>>>()?
     };
     let project_dir = entry_files
         .first()
