@@ -10,6 +10,7 @@ use crate::pull::LoadMode;
 #[derive(Debug, Parser)]
 #[command(name = "pocker")]
 #[command(about = "Resumable OCI registry image puller")]
+#[command(version)]
 pub struct Cli {
     #[command(flatten)]
     pub global: GlobalArgs,
