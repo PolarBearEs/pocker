@@ -117,8 +117,6 @@ jobs:
   upload-install-script:
     name: Upload install script
     runs-on: ubuntu-latest
-    needs:
-      - build-linux
 
     steps:
       - name: Check out repository
