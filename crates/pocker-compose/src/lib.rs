@@ -769,6 +769,39 @@ services:
     }
 
     #[test]
+    fn interpolation_operators_match_compose_presence_rules() {
+        let values = HashMap::from([
+            ("SET".to_string(), "value".to_string()),
+            ("EMPTY".to_string(), String::new()),
+        ]);
+
+        let interpolated = interpolate(
+            concat!(
+                "default_empty: ${EMPTY:-fallback}\n",
+                "default_unset: ${UNSET-fallback}\n",
+                "keep_empty: ${EMPTY-fallback}\n",
+                "alt_set: ${SET:+enabled}\n",
+                "alt_empty: ${EMPTY+enabled}\n",
+                "plain_unset: ${UNSET}\n",
+            ),
+            &values,
+        )
+        .expect("compose interpolation should succeed");
+
+        assert_eq!(
+            interpolated,
+            concat!(
+                "default_empty: fallback\n",
+                "default_unset: fallback\n",
+                "keep_empty: \n",
+                "alt_set: enabled\n",
+                "alt_empty: enabled\n",
+                "plain_unset: \n",
+            )
+        );
+    }
+
+    #[test]
     fn required_variable_operator_wins_over_dash_in_message() {
         let error = interpolate("${REQUIRED?-must be set}", &HashMap::new())
             .expect_err("required operator should fail when variable is unset");
@@ -778,5 +811,99 @@ services:
             ComposeError::InvalidInput(message)
                 if message == "compose variable `REQUIRED` is required: -must be set"
         ));
+    }
+
+    #[test]
+    fn repeated_compose_files_merge_service_overrides() {
+        let dir = tempdir().expect("tempdir should be created");
+        let base = dir.path().join("compose.yml");
+        let override_file = dir.path().join("compose.override.yml");
+        fs::write(
+            &base,
+            r#"
+services:
+  app:
+    image: example/app:1.0
+  worker:
+    image: example/worker:1.0
+"#,
+        )
+        .expect("base compose should be written");
+        fs::write(
+            &override_file,
+            r#"
+services:
+  app:
+    image: example/app:2.0
+"#,
+        )
+        .expect("override compose should be written");
+
+        let resolved = resolve_images(&[base, override_file], dir.path())
+            .expect("compose files should resolve");
+
+        assert_eq!(
+            resolved.images,
+            vec![
+                "example/app:2.0".to_string(),
+                "example/worker:1.0".to_string()
+            ]
+        );
+        assert_eq!(resolved.services[0].service, "app");
+        assert_eq!(
+            resolved.services[0].image,
+            Some("example/app:2.0".to_string())
+        );
+    }
+
+    #[test]
+    fn yaml_merge_anchors_are_considered_when_resolving_images() {
+        let dir = tempdir().expect("tempdir should be created");
+        fs::write(dir.path().join(".env"), "TAG=3.1\n").expect("env should be written");
+        fs::write(
+            dir.path().join("compose.yml"),
+            r#"
+x-image-defaults: &image-defaults
+  image: example/app:${TAG:-latest}
+
+services:
+  app:
+    <<: *image-defaults
+"#,
+        )
+        .expect("compose should be written");
+
+        let resolved = resolve_images(&[], dir.path()).expect("compose file should resolve");
+
+        assert_eq!(resolved.images, vec!["example/app:3.1".to_string()]);
+        assert_eq!(resolved.services[0].service, "app");
+    }
+
+    #[test]
+    fn profiled_services_are_still_discovered_by_config_parser() {
+        let dir = tempdir().expect("tempdir should be created");
+        fs::write(
+            dir.path().join("compose.yml"),
+            r#"
+services:
+  default:
+    image: example/default:latest
+  optional:
+    profiles:
+      - tools
+    image: example/optional:latest
+"#,
+        )
+        .expect("compose should be written");
+
+        let resolved = resolve_images(&[], dir.path()).expect("compose file should resolve");
+
+        assert_eq!(
+            resolved.images,
+            vec![
+                "example/default:latest".to_string(),
+                "example/optional:latest".to_string(),
+            ]
+        );
     }
 }
