@@ -100,19 +100,20 @@ impl Store {
     }
 
     pub async fn save_blob_bytes(&self, descriptor: &Descriptor, bytes: &[u8]) -> Result<()> {
+        let expected_size = descriptor.expected_size()?;
         let path = self.blob_path(&descriptor.digest)?;
         if path.exists()
             && self
-                .ensure_blob_complete(&descriptor.digest, descriptor.expected_size()?)
+                .ensure_blob_complete(&descriptor.digest, expected_size)
                 .await?
         {
             return Ok(());
         }
-        if bytes.len() as u64 != descriptor.expected_size()? {
+        if bytes.len() as u64 != expected_size {
             return Err(DockerPullError::BadResponse(format!(
                 "blob {} size mismatch: expected {}, got {}",
                 descriptor.digest,
-                descriptor.size,
+                expected_size,
                 bytes.len()
             )));
         }
@@ -314,9 +315,9 @@ fn validated_digest_parts(digest: &str) -> Result<(&str, &str)> {
         DockerPullError::InvalidInput(format!("invalid digest format `{digest}`"))
     })?;
     if algorithm != "sha256" {
-        return Err(DockerPullError::InvalidInput(format!(
-            "unsupported digest algorithm `{algorithm}`"
-        )));
+        return Err(DockerPullError::UnsupportedDigestAlgorithm(
+            algorithm.to_string(),
+        ));
     }
     if value.len() != 64
         || !value
@@ -714,7 +715,11 @@ mod tests {
                 .blob_path(digest)
                 .expect_err("invalid digest should not produce a path");
             assert!(
-                matches!(error, DockerPullError::InvalidInput(_)),
+                matches!(
+                    error,
+                    DockerPullError::InvalidInput(_)
+                        | DockerPullError::UnsupportedDigestAlgorithm(_)
+                ),
                 "unexpected error for {digest}: {error}"
             );
         }

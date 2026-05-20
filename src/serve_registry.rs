@@ -8,6 +8,7 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Semaphore, oneshot};
 use tokio::task::JoinHandle;
+use tracing::warn;
 
 use crate::error::{DockerPullError, Result};
 use crate::platform::Platform;
@@ -405,6 +406,10 @@ async fn serve_manifest_blob(
     let size = match descriptor.expected_size() {
         Ok(size) => size,
         Err(error) => {
+            warn!(
+                "cannot serve cached manifest {} with invalid size {}: {}",
+                descriptor.digest, descriptor.size, error
+            );
             return RegistryResponse::text(500, "Internal Server Error", error.to_string());
         }
     };
