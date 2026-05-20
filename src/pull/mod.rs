@@ -1,4 +1,5 @@
 pub mod download;
+pub(crate) mod orchestrator;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
