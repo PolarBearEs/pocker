@@ -821,6 +821,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn malformed_blob_digest_is_not_served_from_cache_path() {
+        let dir = tempdir().expect("tempdir should create");
+        let store = Arc::new(
+            Store::open(dir.path().to_path_buf())
+                .await
+                .expect("store should open"),
+        );
+        let address = spawn_server(store, false).await;
+        let path = format!(
+            "http://{}/v2/{}/blobs/sha256:%2E%2E%2Foutside",
+            address,
+            cache_repository("registry-1.docker.io", "library/alpine"),
+        );
+
+        let response = reqwest::get(path).await.expect("request should succeed");
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
     async fn pull_missing_fetches_manifest_from_upstream() {
         let upstream_body = br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"digest":"sha256:2222222222222222222222222222222222222222222222222222222222222222"},"layers":[]}"#;
         let upstream = spawn_upstream_manifest(upstream_body).await;

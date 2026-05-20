@@ -986,6 +986,24 @@ mod tests {
     }
 
     #[test]
+    fn descriptor_expected_size_rejects_negative_values() {
+        let descriptor = crate::registry::Descriptor {
+            media_type: "application/octet-stream".into(),
+            digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .into(),
+            size: -1,
+            platform: None,
+            annotations: None,
+        };
+
+        let error = descriptor
+            .expected_size()
+            .expect_err("negative descriptor size should fail");
+
+        assert!(matches!(error, DockerPullError::InvalidInput(_)));
+    }
+
+    #[test]
     fn resource_url_encodes_path_segments_without_losing_base_path() {
         let url = resource_url(
             Url::parse("http://cache.example:5000/pocker?ignored=true")
