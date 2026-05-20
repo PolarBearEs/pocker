@@ -47,6 +47,17 @@ pub struct Descriptor {
     pub annotations: Option<HashMap<String, String>>,
 }
 
+impl Descriptor {
+    pub(crate) fn expected_size(&self) -> Result<u64> {
+        u64::try_from(self.size).map_err(|_| {
+            DockerPullError::InvalidInput(format!(
+                "descriptor {} has invalid negative size {}",
+                self.digest, self.size
+            ))
+        })
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct ManifestEnvelope {
     #[serde(rename = "schemaVersion")]

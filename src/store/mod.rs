@@ -81,13 +81,13 @@ impl Store {
             .join(format!("{}.json", reference_key(reference)))
     }
 
-    pub async fn ensure_blob_complete(&self, digest: &str, expected_size: i64) -> Result<bool> {
+    pub async fn ensure_blob_complete(&self, digest: &str, expected_size: u64) -> Result<bool> {
         let path = self.blob_path(digest)?;
         if !path.exists() {
             return Ok(false);
         }
         let metadata = tokio_fs::metadata(&path).await?;
-        if metadata.len() != expected_size as u64 {
+        if metadata.len() != expected_size {
             tokio_fs::remove_file(&path).await?;
             return Ok(false);
         }
@@ -103,10 +103,18 @@ impl Store {
         let path = self.blob_path(&descriptor.digest)?;
         if path.exists()
             && self
-                .ensure_blob_complete(&descriptor.digest, descriptor.size)
+                .ensure_blob_complete(&descriptor.digest, descriptor.expected_size()?)
                 .await?
         {
             return Ok(());
+        }
+        if bytes.len() as u64 != descriptor.expected_size()? {
+            return Err(DockerPullError::BadResponse(format!(
+                "blob {} size mismatch: expected {}, got {}",
+                descriptor.digest,
+                descriptor.size,
+                bytes.len()
+            )));
         }
         let actual_digest = digest_bytes(bytes);
         if actual_digest != descriptor.digest {
@@ -129,7 +137,7 @@ impl Store {
             return Ok(None);
         }
         let bytes = tokio_fs::read(&path).await?;
-        if bytes.len() != descriptor.size as usize {
+        if bytes.len() as u64 != descriptor.expected_size()? {
             tokio_fs::remove_file(&path).await?;
             return Ok(None);
         }
@@ -549,6 +557,29 @@ mod tests {
             .expect("cached config blob should be readable");
 
         assert_eq!(cached.as_deref(), Some(bytes.as_slice()));
+    }
+
+    #[tokio::test]
+    async fn save_blob_bytes_rejects_negative_descriptor_size() {
+        let dir = tempdir().expect("tempdir should create");
+        let store = Store::open(dir.path().to_path_buf())
+            .await
+            .expect("store should open");
+        let bytes = b"blob";
+        let descriptor = Descriptor {
+            media_type: "application/octet-stream".into(),
+            digest: super::digest_bytes(bytes),
+            size: -1,
+            platform: None,
+            annotations: None,
+        };
+
+        let error = store
+            .save_blob_bytes(&descriptor, bytes)
+            .await
+            .expect_err("negative descriptor sizes should be rejected");
+
+        assert!(matches!(error, DockerPullError::InvalidInput(_)));
     }
 
     #[tokio::test]

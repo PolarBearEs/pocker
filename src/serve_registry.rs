@@ -402,14 +402,10 @@ async fn serve_manifest_blob(
     } else {
         descriptor.media_type.clone()
     };
-    let size = if descriptor.size >= 0 {
-        descriptor.size as u64
-    } else {
-        match tokio::fs::metadata(&path).await {
-            Ok(metadata) => metadata.len(),
-            Err(error) => {
-                return RegistryResponse::text(500, "Internal Server Error", error.to_string());
-            }
+    let size = match descriptor.expected_size() {
+        Ok(size) => size,
+        Err(error) => {
+            return RegistryResponse::text(500, "Internal Server Error", error.to_string());
         }
     };
     RegistryResponse::file(200, "OK", content_type, path, size, headers_only)

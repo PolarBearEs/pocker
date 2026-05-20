@@ -23,7 +23,7 @@ pub async fn download_blob(
 ) -> Result<()> {
     if context
         .store
-        .ensure_blob_complete(&descriptor.digest, descriptor.size)
+        .ensure_blob_complete(&descriptor.digest, descriptor.expected_size()?)
         .await?
     {
         return Ok(());
@@ -33,7 +33,7 @@ pub async fn download_blob(
         .registry
         .head_blob(reference, &descriptor.digest)
         .await?;
-    let expected_size = head.size.unwrap_or(descriptor.size as u64);
+    let expected_size = head.size.unwrap_or(descriptor.expected_size()?);
     let mut plan = context
         .store
         .prepare_download(normalized_reference, &descriptor, expected_size)

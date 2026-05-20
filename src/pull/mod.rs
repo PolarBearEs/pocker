@@ -103,7 +103,7 @@ impl Puller {
             if self
                 .context
                 .store
-                .ensure_blob_complete(&layer.descriptor.digest, layer.descriptor.size)
+                .ensure_blob_complete(&layer.descriptor.digest, layer.descriptor.expected_size()?)
                 .await?
             {
                 self.context.ui.mark_layer_cached(&layer.descriptor.digest);
