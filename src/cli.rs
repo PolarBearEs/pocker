@@ -83,6 +83,26 @@ pub struct ComposeConfigArgs {
 pub struct ComposePullArgs {
     #[arg(value_name = "SERVICE", help = "Compose service to pull")]
     pub services: Vec<String>,
+    #[command(flatten)]
+    pub download: PullDownloadArgs,
+    #[command(flatten)]
+    pub compose_parallel: ComposeParallelArgs,
+    #[command(flatten)]
+    pub retry: RetryArgs,
+    #[command(flatten)]
+    pub import: ImportArgs,
+    #[command(flatten)]
+    pub registry: RegistryArgs,
+    #[command(flatten)]
+    pub auth: AuthArgs,
+    #[command(flatten)]
+    pub output: PullOutputArgs,
+    #[command(flatten)]
+    pub cache: CacheSourceArgs,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct PullDownloadArgs {
     #[arg(long, help_heading = "Download options", help = platform_help())]
     pub platform: Option<String>,
     #[arg(
@@ -93,6 +113,10 @@ pub struct ComposePullArgs {
         help = "Maximum concurrent layer downloads"
     )]
     pub concurrency: usize,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct ComposeParallelArgs {
     #[arg(
         long = "max-parallel-images",
         default_value_t = 2,
@@ -100,6 +124,10 @@ pub struct ComposePullArgs {
         help = "Maximum concurrent image pulls"
     )]
     pub image_concurrency: usize,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct RetryArgs {
     #[arg(
         long = "blob-retries",
         value_name = "N",
@@ -120,6 +148,10 @@ pub struct ComposePullArgs {
         help = "Retry retryable blob downloads and registry requests forever"
     )]
     pub retry_forever: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct ImportArgs {
     #[arg(
         long,
         help_heading = "Import options",
@@ -140,6 +172,10 @@ pub struct ComposePullArgs {
         help = "Docker import mode to use after downloading; registry is experimental and local-daemon only"
     )]
     pub load_mode: LoadMode,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct RegistryArgs {
     #[arg(
         long,
         help_heading = "Registry options",
@@ -158,6 +194,10 @@ pub struct ComposePullArgs {
         help = "Additional CA certificate bundle in PEM format"
     )]
     pub ca_file: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct AuthArgs {
     #[arg(
         long,
         help_heading = "Registry options",
@@ -170,6 +210,10 @@ pub struct ComposePullArgs {
         help = "Read the registry password from stdin"
     )]
     pub password_stdin: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct PullOutputArgs {
     #[arg(
         long,
         short = 'q',
@@ -177,6 +221,10 @@ pub struct ComposePullArgs {
         help = "Suppress progress and status output"
     )]
     pub quiet: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct CacheSourceArgs {
     #[arg(
         long,
         value_name = "URL",
@@ -339,113 +387,26 @@ pub struct ImageLoadArgs {
 pub struct PullArgs {
     #[arg(help = "Image reference to pull")]
     pub reference: String,
-    #[arg(long, help_heading = "Download options", help = platform_help())]
-    pub platform: Option<String>,
-    #[arg(
-        long = "max-parallel-downloads",
-        visible_alias = "concurrency",
-        default_value_t = 4,
-        help_heading = "Download options",
-        help = "Maximum concurrent layer downloads"
-    )]
-    pub concurrency: usize,
-    #[arg(
-        long = "blob-retries",
-        value_name = "N",
-        help_heading = "Retry options",
-        help = "Maximum retries for interrupted blob downloads; use 0 to disable [default: 8]"
-    )]
-    pub blob_retries: Option<u32>,
-    #[arg(
-        long = "request-retries",
-        value_name = "N",
-        help_heading = "Retry options",
-        help = "Maximum retries for registry requests before any response or on retryable HTTP status; use 0 to disable [default: 5]"
-    )]
-    pub request_retries: Option<u32>,
-    #[arg(
-        long,
-        help_heading = "Retry options",
-        help = "Retry retryable blob downloads and registry requests forever"
-    )]
-    pub retry_forever: bool,
-    #[arg(
-        long,
-        help_heading = "Import options",
-        help = "Download into the local cache without importing into Docker"
-    )]
-    pub no_load: bool,
-    #[arg(
-        long,
-        help_heading = "Import options",
-        help = "Keep downloaded layer blobs in the cache after packaging/loading"
-    )]
-    pub keep_layer_blobs: bool,
-    #[arg(
-        long = "load-mode",
-        value_enum,
-        default_value = "stream",
-        help_heading = "Import options",
-        help = "Docker import mode to use after downloading; registry is experimental and local-daemon only"
-    )]
-    pub load_mode: LoadMode,
-    #[arg(
-        long,
-        help_heading = "Registry options",
-        help = "Use plain HTTP instead of HTTPS for registry requests"
-    )]
-    pub plain_http: bool,
-    #[arg(
-        long,
-        help_heading = "Registry options",
-        help = "Disable TLS certificate verification for registry requests"
-    )]
-    pub insecure_skip_tls_verify: bool,
-    #[arg(
-        long,
-        help_heading = "Registry options",
-        help = "Additional CA certificate bundle in PEM format"
-    )]
-    pub ca_file: Option<PathBuf>,
-    #[arg(
-        long,
-        help_heading = "Registry options",
-        help = "Registry username; requires --password-stdin"
-    )]
-    pub username: Option<String>,
-    #[arg(
-        long,
-        help_heading = "Registry options",
-        help = "Read the registry password from stdin"
-    )]
-    pub password_stdin: bool,
-    #[arg(
-        long,
-        short = 'q',
-        help_heading = "Output options",
-        help = "Suppress progress and status output"
-    )]
-    pub quiet: bool,
+    #[command(flatten)]
+    pub download: PullDownloadArgs,
+    #[command(flatten)]
+    pub retry: RetryArgs,
+    #[command(flatten)]
+    pub import: ImportArgs,
+    #[command(flatten)]
+    pub registry: RegistryArgs,
+    #[command(flatten)]
+    pub auth: AuthArgs,
+    #[command(flatten)]
+    pub output: PullOutputArgs,
     #[arg(
         long,
         help_heading = "Output options",
         help = "Disable animated progress output during pull"
     )]
     pub no_animations: bool,
-    #[arg(
-        long,
-        value_name = "URL",
-        help_heading = "Cache options",
-        help = "Prefer a pocker cache registry, falling back to upstream on cache misses"
-    )]
-    pub cache_from: Option<Url>,
-    #[arg(
-        long,
-        requires = "cache_from",
-        help_heading = "Cache options",
-        help = "Require --cache-from content and do not fall back to upstream"
-    )]
-    pub cache_only: bool,
+    #[command(flatten)]
+    pub cache: CacheSourceArgs,
 }
 
 impl ValueEnum for LoadMode {
@@ -497,7 +458,7 @@ mod tests {
             panic!("expected pull command");
         };
 
-        assert!(args.quiet);
+        assert!(args.output.quiet);
     }
 
     #[test]
@@ -507,7 +468,7 @@ mod tests {
             panic!("expected pull command");
         };
 
-        assert_eq!(args.load_mode, LoadMode::Registry);
+        assert_eq!(args.import.load_mode, LoadMode::Registry);
     }
 
     #[test]
@@ -517,7 +478,7 @@ mod tests {
             panic!("expected pull command");
         };
 
-        assert_eq!(args.blob_retries, Some(32));
+        assert_eq!(args.retry.blob_retries, Some(32));
     }
 
     #[test]
@@ -527,7 +488,7 @@ mod tests {
             panic!("expected pull command");
         };
 
-        assert_eq!(args.blob_retries, Some(0));
+        assert_eq!(args.retry.blob_retries, Some(0));
     }
 
     #[test]
@@ -537,7 +498,7 @@ mod tests {
             panic!("expected pull command");
         };
 
-        assert!(args.retry_forever);
+        assert!(args.retry.retry_forever);
     }
 
     #[test]
@@ -554,8 +515,8 @@ mod tests {
             panic!("expected pull command");
         };
 
-        assert_eq!(args.blob_retries, Some(1));
-        assert!(args.retry_forever);
+        assert_eq!(args.retry.blob_retries, Some(1));
+        assert!(args.retry.retry_forever);
     }
 
     #[test]
@@ -565,7 +526,7 @@ mod tests {
             panic!("expected pull command");
         };
 
-        assert_eq!(args.request_retries, Some(12));
+        assert_eq!(args.retry.request_retries, Some(12));
     }
 
     #[test]
@@ -582,7 +543,7 @@ mod tests {
         };
 
         assert_eq!(
-            args.cache_from.as_ref().map(|url| url.as_str()),
+            args.cache.cache_from.as_ref().map(|url| url.as_str()),
             Some("http://127.0.0.1:5000/")
         );
     }
@@ -601,7 +562,7 @@ mod tests {
             panic!("expected pull command");
         };
 
-        assert!(args.cache_only);
+        assert!(args.cache.cache_only);
     }
 
     #[test]
@@ -691,7 +652,7 @@ mod tests {
             panic!("expected pull command");
         };
 
-        assert_eq!(args.request_retries, Some(0));
+        assert_eq!(args.retry.request_retries, Some(0));
     }
 
     #[test]
@@ -737,7 +698,7 @@ mod tests {
             panic!("expected compose pull command");
         };
 
-        assert!(pull.quiet);
+        assert!(pull.output.quiet);
     }
 
     #[test]
@@ -757,8 +718,8 @@ mod tests {
             panic!("expected compose pull command");
         };
 
-        assert_eq!(pull.blob_retries, Some(1));
-        assert!(pull.retry_forever);
+        assert_eq!(pull.retry.blob_retries, Some(1));
+        assert!(pull.retry.retry_forever);
     }
 
     #[test]
@@ -778,7 +739,7 @@ mod tests {
             panic!("expected compose pull command");
         };
 
-        assert!(pull.cache_only);
+        assert!(pull.cache.cache_only);
     }
 
     #[test]
