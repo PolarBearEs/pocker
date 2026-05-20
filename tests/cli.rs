@@ -18,6 +18,18 @@ fn version_subcommand_prints_name_and_version() {
 }
 
 #[test]
+fn version_flags_print_name_and_version() {
+    for flag in ["--version", "-V"] {
+        pocker()
+            .arg(flag)
+            .assert()
+            .success()
+            .stdout(contains(env!("CARGO_PKG_NAME")))
+            .stdout(contains(env!("CARGO_PKG_VERSION")));
+    }
+}
+
+#[test]
 fn help_flag_exits_success() {
     pocker().arg("--help").assert().success();
 }
