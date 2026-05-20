@@ -2,6 +2,7 @@
 
 mod auth;
 mod cli;
+mod digest;
 mod docker;
 mod error;
 mod export;

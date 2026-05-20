@@ -5,10 +5,11 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use tokio::fs as tokio_fs;
 
+use crate::digest::{digest_bytes_for_digest, digest_file_for_digest, parse_digest};
 use crate::error::{DockerPullError, Result};
 use crate::registry::Descriptor;
 use fs::{
-    atomic_write_bytes, atomic_write_json, digest_file, ensure_directory, read_json_if_exists,
+    atomic_write_bytes, atomic_write_json, ensure_directory, read_json_if_exists,
     reconcile_partial_file,
 };
 
@@ -91,7 +92,7 @@ impl Store {
             tokio_fs::remove_file(&path).await?;
             return Ok(false);
         }
-        let computed = digest_file(&path)?;
+        let computed = digest_file_for_digest(digest, &path)?;
         if computed != digest {
             tokio_fs::remove_file(&path).await?;
             return Ok(false);
@@ -117,7 +118,7 @@ impl Store {
                 bytes.len()
             )));
         }
-        let actual_digest = digest_bytes(bytes);
+        let actual_digest = digest_bytes_for_digest(&descriptor.digest, bytes)?;
         if actual_digest != descriptor.digest {
             return Err(DockerPullError::DigestMismatch {
                 digest: descriptor.digest.clone(),
@@ -142,7 +143,7 @@ impl Store {
             tokio_fs::remove_file(&path).await?;
             return Ok(None);
         }
-        let actual_digest = digest_bytes(&bytes);
+        let actual_digest = digest_bytes_for_digest(&descriptor.digest, &bytes)?;
         if actual_digest != descriptor.digest {
             tokio_fs::remove_file(&path).await?;
             return Ok(None);
@@ -224,7 +225,7 @@ impl Store {
                 partial,
             ));
         }
-        let computed = digest_file(&partial)?;
+        let computed = digest_file_for_digest(&descriptor.digest, &partial)?;
         if computed != descriptor.digest {
             return Err(DockerPullError::DigestMismatch {
                 digest: descriptor.digest.clone(),
@@ -306,37 +307,13 @@ impl Store {
 }
 
 fn digest_path(root: PathBuf, digest: &str) -> Result<PathBuf> {
-    let (algorithm, value) = validated_digest_parts(digest)?;
-    Ok(root.join(algorithm).join(value))
+    let parsed = parse_digest(digest)?;
+    Ok(root.join(parsed.algorithm.to_string()).join(parsed.value))
 }
 
-fn validated_digest_parts(digest: &str) -> Result<(&str, &str)> {
-    let (algorithm, value) = digest.split_once(':').ok_or_else(|| {
-        DockerPullError::InvalidInput(format!("invalid digest format `{digest}`"))
-    })?;
-    if algorithm != "sha256" {
-        return Err(DockerPullError::UnsupportedDigestAlgorithm(
-            algorithm.to_string(),
-        ));
-    }
-    if value.len() != 64
-        || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-    {
-        return Err(DockerPullError::InvalidInput(format!(
-            "invalid sha256 digest value `{value}`"
-        )));
-    }
-    Ok((algorithm, value))
-}
-
+#[cfg(test)]
 fn digest_bytes(bytes: &[u8]) -> String {
-    use sha2::{Digest as _, Sha256};
-
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    format!("sha256:{}", hex::encode(hasher.finalize()))
+    crate::digest::canonical_digest_bytes(bytes)
 }
 
 fn reference_key(reference: &str) -> String {
@@ -561,6 +538,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn save_and_read_blob_bytes_support_sha384_and_sha512() {
+        let dir = tempdir().expect("tempdir should create");
+        let store = Store::open(dir.path().to_path_buf())
+            .await
+            .expect("store should open");
+
+        for (algorithm, expected_hex_len) in [("sha384", 96), ("sha512", 128)] {
+            let bytes = format!("{algorithm} payload").into_bytes();
+            let digest = crate::digest::DigestAlgorithm::parse(algorithm)
+                .expect("algorithm should parse")
+                .digest_bytes(&bytes);
+            let descriptor = Descriptor {
+                media_type: "application/octet-stream".into(),
+                digest: digest.clone(),
+                size: bytes.len() as i64,
+                platform: None,
+                annotations: None,
+            };
+
+            store
+                .save_blob_bytes(&descriptor, &bytes)
+                .await
+                .expect("blob should save");
+            let cached = store
+                .read_blob_bytes_if_complete(&descriptor)
+                .await
+                .expect("cached blob should read");
+
+            assert_eq!(cached.as_deref(), Some(bytes.as_slice()));
+            assert_eq!(
+                store.blob_path(&digest).expect("blob path"),
+                store.root().join("blobs").join(algorithm).join(
+                    digest
+                        .strip_prefix(&format!("{algorithm}:"))
+                        .expect("prefix")
+                )
+            );
+            assert_eq!(
+                digest
+                    .strip_prefix(&format!("{algorithm}:"))
+                    .expect("prefix")
+                    .len(),
+                expected_hex_len
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn save_blob_bytes_rejects_negative_descriptor_size() {
         let dir = tempdir().expect("tempdir should create");
         let store = Store::open(dir.path().to_path_buf())
@@ -705,11 +730,13 @@ mod tests {
             .expect("store should open");
 
         for digest in [
-            "sha512:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "sha256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
             "sha256:../../outside",
             "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaag",
+            "sha384:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "sha512:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "sha224:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         ] {
             let error = store
                 .blob_path(digest)

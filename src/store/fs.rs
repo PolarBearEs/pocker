@@ -1,5 +1,5 @@
-use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::Path;
 
 use serde::Serialize;
@@ -49,20 +49,4 @@ pub fn reconcile_partial_file(path: &Path, durable_offset: u64) -> Result<u64> {
         return Ok(durable_offset);
     }
     Ok(file_len)
-}
-
-pub fn digest_file(path: &Path) -> Result<String> {
-    use sha2::{Digest as _, Sha256};
-
-    let mut file = File::open(path)?;
-    let mut hasher = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let read = file.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-    }
-    Ok(format!("sha256:{}", hex::encode(hasher.finalize())))
 }
