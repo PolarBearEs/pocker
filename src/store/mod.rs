@@ -81,13 +81,13 @@ impl Store {
             .join(format!("{}.json", reference_key(reference)))
     }
 
-    pub async fn ensure_blob_complete(&self, digest: &str, expected_size: i64) -> Result<bool> {
+    pub async fn ensure_blob_complete(&self, digest: &str, expected_size: u64) -> Result<bool> {
         let path = self.blob_path(digest)?;
         if !path.exists() {
             return Ok(false);
         }
         let metadata = tokio_fs::metadata(&path).await?;
-        if metadata.len() != expected_size as u64 {
+        if metadata.len() != expected_size {
             tokio_fs::remove_file(&path).await?;
             return Ok(false);
         }
@@ -100,13 +100,22 @@ impl Store {
     }
 
     pub async fn save_blob_bytes(&self, descriptor: &Descriptor, bytes: &[u8]) -> Result<()> {
+        let expected_size = descriptor.expected_size()?;
         let path = self.blob_path(&descriptor.digest)?;
         if path.exists()
             && self
-                .ensure_blob_complete(&descriptor.digest, descriptor.size)
+                .ensure_blob_complete(&descriptor.digest, expected_size)
                 .await?
         {
             return Ok(());
+        }
+        if bytes.len() as u64 != expected_size {
+            return Err(DockerPullError::BadResponse(format!(
+                "blob {} size mismatch: expected {}, got {}",
+                descriptor.digest,
+                expected_size,
+                bytes.len()
+            )));
         }
         let actual_digest = digest_bytes(bytes);
         if actual_digest != descriptor.digest {
@@ -129,7 +138,7 @@ impl Store {
             return Ok(None);
         }
         let bytes = tokio_fs::read(&path).await?;
-        if bytes.len() != descriptor.size as usize {
+        if bytes.len() as u64 != descriptor.expected_size()? {
             tokio_fs::remove_file(&path).await?;
             return Ok(None);
         }
@@ -297,10 +306,29 @@ impl Store {
 }
 
 fn digest_path(root: PathBuf, digest: &str) -> Result<PathBuf> {
+    let (algorithm, value) = validated_digest_parts(digest)?;
+    Ok(root.join(algorithm).join(value))
+}
+
+fn validated_digest_parts(digest: &str) -> Result<(&str, &str)> {
     let (algorithm, value) = digest.split_once(':').ok_or_else(|| {
         DockerPullError::InvalidInput(format!("invalid digest format `{digest}`"))
     })?;
-    Ok(root.join(algorithm).join(value))
+    if algorithm != "sha256" {
+        return Err(DockerPullError::UnsupportedDigestAlgorithm(
+            algorithm.to_string(),
+        ));
+    }
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(DockerPullError::InvalidInput(format!(
+            "invalid sha256 digest value `{value}`"
+        )));
+    }
+    Ok((algorithm, value))
 }
 
 fn digest_bytes(bytes: &[u8]) -> String {
@@ -370,6 +398,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{ClearedCacheFile, Store, StoredReference, reference_key};
+    use crate::error::DockerPullError;
     use crate::registry::Descriptor;
 
     #[cfg(unix)]
@@ -532,6 +561,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn save_blob_bytes_rejects_negative_descriptor_size() {
+        let dir = tempdir().expect("tempdir should create");
+        let store = Store::open(dir.path().to_path_buf())
+            .await
+            .expect("store should open");
+        let bytes = b"blob";
+        let descriptor = Descriptor {
+            media_type: "application/octet-stream".into(),
+            digest: super::digest_bytes(bytes),
+            size: -1,
+            platform: None,
+            annotations: None,
+        };
+
+        let error = store
+            .save_blob_bytes(&descriptor, bytes)
+            .await
+            .expect_err("negative descriptor sizes should be rejected");
+
+        assert!(matches!(error, DockerPullError::InvalidInput(_)));
+    }
+
+    #[tokio::test]
     async fn clear_removes_cached_files_and_recreates_layout() {
         let dir = tempdir().expect("tempdir should create");
         let store = Store::open(dir.path().to_path_buf())
@@ -643,6 +695,34 @@ mod tests {
         assert_eq!(key.len(), 64);
         assert!(key.chars().all(|ch| ch.is_ascii_hexdigit()));
         assert_eq!(key, reference_key("registry.example:5000/team/app:latest"));
+    }
+
+    #[tokio::test]
+    async fn digest_paths_reject_unsupported_or_malformed_digests() {
+        let dir = tempdir().expect("tempdir should create");
+        let store = Store::open(dir.path().to_path_buf())
+            .await
+            .expect("store should open");
+
+        for digest in [
+            "sha512:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "sha256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "sha256:../../outside",
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaag",
+        ] {
+            let error = store
+                .blob_path(digest)
+                .expect_err("invalid digest should not produce a path");
+            assert!(
+                matches!(
+                    error,
+                    DockerPullError::InvalidInput(_)
+                        | DockerPullError::UnsupportedDigestAlgorithm(_)
+                ),
+                "unexpected error for {digest}: {error}"
+            );
+        }
     }
 
     #[test]

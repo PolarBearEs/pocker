@@ -10,6 +10,8 @@ pub enum DockerPullError {
     InvalidInput(String),
     #[error("unsupported media type `{0}`")]
     UnsupportedMediaType(String),
+    #[error("unsupported digest algorithm `{0}`; pocker currently supports sha256 digests only")]
+    UnsupportedDigestAlgorithm(String),
     #[error("manifest not found")]
     ManifestNotFound,
     #[error("blob not found: {0}")]

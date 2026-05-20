@@ -8,6 +8,7 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Semaphore, oneshot};
 use tokio::task::JoinHandle;
+use tracing::warn;
 
 use crate::error::{DockerPullError, Result};
 use crate::platform::Platform;
@@ -402,14 +403,14 @@ async fn serve_manifest_blob(
     } else {
         descriptor.media_type.clone()
     };
-    let size = if descriptor.size >= 0 {
-        descriptor.size as u64
-    } else {
-        match tokio::fs::metadata(&path).await {
-            Ok(metadata) => metadata.len(),
-            Err(error) => {
-                return RegistryResponse::text(500, "Internal Server Error", error.to_string());
-            }
+    let size = match descriptor.expected_size() {
+        Ok(size) => size,
+        Err(error) => {
+            warn!(
+                "cannot serve cached manifest {} with invalid size {}: {}",
+                descriptor.digest, descriptor.size, error
+            );
+            return RegistryResponse::text(500, "Internal Server Error", error.to_string());
         }
     };
     RegistryResponse::file(200, "OK", content_type, path, size, headers_only)
@@ -822,6 +823,26 @@ mod tests {
             .expect("range request should succeed");
 
         assert_eq!(response.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+    }
+
+    #[tokio::test]
+    async fn malformed_blob_digest_is_not_served_from_cache_path() {
+        let dir = tempdir().expect("tempdir should create");
+        let store = Arc::new(
+            Store::open(dir.path().to_path_buf())
+                .await
+                .expect("store should open"),
+        );
+        let address = spawn_server(store, false).await;
+        let path = format!(
+            "http://{}/v2/{}/blobs/sha256:%2E%2E%2Foutside",
+            address,
+            cache_repository("registry-1.docker.io", "library/alpine"),
+        );
+
+        let response = reqwest::get(path).await.expect("request should succeed");
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

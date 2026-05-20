@@ -47,6 +47,17 @@ pub struct Descriptor {
     pub annotations: Option<HashMap<String, String>>,
 }
 
+impl Descriptor {
+    pub(crate) fn expected_size(&self) -> Result<u64> {
+        u64::try_from(self.size).map_err(|_| {
+            DockerPullError::InvalidInput(format!(
+                "descriptor {} has invalid negative size {}",
+                self.digest, self.size
+            ))
+        })
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct ManifestEnvelope {
     #[serde(rename = "schemaVersion")]
@@ -425,13 +436,8 @@ impl RegistryClient {
         resource: &str,
         suffix: &str,
     ) -> Result<Url> {
-        Url::parse(&format!(
-            "{}://{}/v2/{}/{resource}/{suffix}",
-            self.scheme(),
-            reference.registry,
-            reference.repository
-        ))
-        .map_err(Into::into)
+        let base = Url::parse(&format!("{}://{}", self.scheme(), reference.registry))?;
+        resource_url(base, &reference.repository, resource, suffix)
     }
 
     fn scheme(&self) -> &'static str {
@@ -674,9 +680,26 @@ fn cache_url(
     resource: &str,
     suffix: &str,
 ) -> Result<Url> {
-    let base = base_url.as_str().trim_end_matches('/');
     let repository = cache_repository(&reference.registry, &reference.repository);
-    Url::parse(&format!("{base}/v2/{repository}/{resource}/{suffix}")).map_err(Into::into)
+    resource_url(base_url.clone(), &repository, resource, suffix)
+}
+
+fn resource_url(mut base_url: Url, repository: &str, resource: &str, suffix: &str) -> Result<Url> {
+    base_url.set_query(None);
+    base_url.set_fragment(None);
+    {
+        let display_base = base_url.to_string();
+        let mut segments = base_url.path_segments_mut().map_err(|_| {
+            DockerPullError::InvalidInput(format!("invalid registry URL base `{display_base}`"))
+        })?;
+        segments.push("v2");
+        for segment in repository.split('/') {
+            segments.push(segment);
+        }
+        segments.push(resource);
+        segments.push(suffix);
+    }
+    Ok(base_url)
 }
 
 fn token_cache_key(reference: &ImageReference) -> String {
@@ -854,10 +877,11 @@ mod tests {
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+    use url::Url;
 
     use super::{
         DEFAULT_REQUEST_RETRIES, RegistryClient, cache_repository, decode_cache_repository,
-        parse_www_authenticate, token_cache_key,
+        parse_www_authenticate, resource_url, token_cache_key,
     };
     use crate::auth::AuthResolver;
     use crate::error::DockerPullError;
@@ -959,6 +983,41 @@ mod tests {
         assert!(decode_cache_repository("registry.example").is_err());
         assert!(decode_cache_repository("/team/app").is_err());
         assert!(decode_cache_repository("registry.example/").is_err());
+    }
+
+    #[test]
+    fn descriptor_expected_size_rejects_negative_values() {
+        let descriptor = crate::registry::Descriptor {
+            media_type: "application/octet-stream".into(),
+            digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .into(),
+            size: -1,
+            platform: None,
+            annotations: None,
+        };
+
+        let error = descriptor
+            .expected_size()
+            .expect_err("negative descriptor size should fail");
+
+        assert!(matches!(error, DockerPullError::InvalidInput(_)));
+    }
+
+    #[test]
+    fn resource_url_encodes_path_segments_without_losing_base_path() {
+        let url = resource_url(
+            Url::parse("http://cache.example:5000/pocker?ignored=true")
+                .expect("base URL should parse"),
+            "registry-1.docker.io/library/alpine",
+            "manifests",
+            "release/with/slashes",
+        )
+        .expect("resource URL should build");
+
+        assert_eq!(
+            url.as_str(),
+            "http://cache.example:5000/pocker/v2/registry-1.docker.io/library/alpine/manifests/release%2Fwith%2Fslashes"
+        );
     }
 
     #[tokio::test]

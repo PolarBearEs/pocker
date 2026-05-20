@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use assert_cmd::Command;
+use predicates::str::contains;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -87,6 +88,69 @@ async fn pulls_oci_image_from_fake_registry_into_cache() {
     assert!(layer_path.exists(), "expected layer blob at {layer_path:?}");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pull_rejects_malformed_layer_digest_before_cache_path_use() {
+    let fixture = Arc::new(Fixture::build_with_layer_digest(
+        "sha256:../../outside".to_string(),
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("fake registry should bind");
+    let address = listener
+        .local_addr()
+        .expect("listener should expose address");
+
+    let server_fixture = Arc::clone(&fixture);
+    let server = tokio::spawn(async move {
+        loop {
+            let (stream, _peer) = match listener.accept().await {
+                Ok(pair) => pair,
+                Err(_) => return,
+            };
+            let request_fixture = Arc::clone(&server_fixture);
+            tokio::spawn(async move {
+                let _ = handle_connection(stream, request_fixture).await;
+            });
+        }
+    });
+
+    let cache_dir = tempfile::tempdir().expect("cache tempdir should create");
+    let reference = format!("{address}/library/test:latest");
+
+    let pocker_run = tokio::task::spawn_blocking({
+        let cache = cache_dir.path().to_path_buf();
+        move || {
+            Command::cargo_bin("pocker")
+                .expect("pocker binary should be built")
+                .arg("--cache-dir")
+                .arg(&cache)
+                .args([
+                    "pull",
+                    "--plain-http",
+                    "--no-load",
+                    "--quiet",
+                    "--request-retries",
+                    "0",
+                    "--blob-retries",
+                    "0",
+                ])
+                .arg(&reference)
+                .timeout(Duration::from_secs(30))
+                .assert()
+                .failure()
+                .stderr(contains("invalid sha256 digest value"));
+        }
+    });
+
+    pocker_run.await.expect("pocker subprocess should run");
+    server.abort();
+
+    assert!(
+        !cache_dir.path().join("outside").exists(),
+        "malformed digest must not create paths outside the digest cache"
+    );
+}
+
 struct Fixture {
     manifest_bytes: Vec<u8>,
     manifest_digest: String,
@@ -100,7 +164,12 @@ impl Fixture {
     fn build() -> Self {
         let layer_bytes = b"fake layer payload".to_vec();
         let layer_digest = sha256_hex(&layer_bytes);
+        Self::build_with_layer_digest(format!("sha256:{layer_digest}"))
+    }
 
+    fn build_with_layer_digest(layer_descriptor_digest: String) -> Self {
+        let layer_bytes = b"fake layer payload".to_vec();
+        let layer_digest = sha256_hex(&layer_bytes);
         let config_bytes = format!(
             r#"{{"architecture":"amd64","os":"linux","rootfs":{{"type":"layers","diff_ids":["sha256:{layer_digest}"]}}}}"#
         )
@@ -108,7 +177,7 @@ impl Fixture {
         let config_digest = sha256_hex(&config_bytes);
 
         let manifest_bytes = format!(
-            r#"{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:{config_digest}","size":{config_size}}},"layers":[{{"mediaType":"application/vnd.oci.image.layer.v1.tar","digest":"sha256:{layer_digest}","size":{layer_size}}}]}}"#,
+            r#"{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:{config_digest}","size":{config_size}}},"layers":[{{"mediaType":"application/vnd.oci.image.layer.v1.tar","digest":"{layer_descriptor_digest}","size":{layer_size}}}]}}"#,
             config_size = config_bytes.len(),
             layer_size = layer_bytes.len(),
         )
