@@ -297,10 +297,29 @@ impl Store {
 }
 
 fn digest_path(root: PathBuf, digest: &str) -> Result<PathBuf> {
+    let (algorithm, value) = validated_digest_parts(digest)?;
+    Ok(root.join(algorithm).join(value))
+}
+
+fn validated_digest_parts(digest: &str) -> Result<(&str, &str)> {
     let (algorithm, value) = digest.split_once(':').ok_or_else(|| {
         DockerPullError::InvalidInput(format!("invalid digest format `{digest}`"))
     })?;
-    Ok(root.join(algorithm).join(value))
+    if algorithm != "sha256" {
+        return Err(DockerPullError::InvalidInput(format!(
+            "unsupported digest algorithm `{algorithm}`"
+        )));
+    }
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(DockerPullError::InvalidInput(format!(
+            "invalid sha256 digest value `{value}`"
+        )));
+    }
+    Ok((algorithm, value))
 }
 
 fn digest_bytes(bytes: &[u8]) -> String {
@@ -370,6 +389,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{ClearedCacheFile, Store, StoredReference, reference_key};
+    use crate::error::DockerPullError;
     use crate::registry::Descriptor;
 
     #[cfg(unix)]
@@ -643,6 +663,30 @@ mod tests {
         assert_eq!(key.len(), 64);
         assert!(key.chars().all(|ch| ch.is_ascii_hexdigit()));
         assert_eq!(key, reference_key("registry.example:5000/team/app:latest"));
+    }
+
+    #[tokio::test]
+    async fn digest_paths_reject_unsupported_or_malformed_digests() {
+        let dir = tempdir().expect("tempdir should create");
+        let store = Store::open(dir.path().to_path_buf())
+            .await
+            .expect("store should open");
+
+        for digest in [
+            "sha512:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "sha256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "sha256:../../outside",
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaag",
+        ] {
+            let error = store
+                .blob_path(digest)
+                .expect_err("invalid digest should not produce a path");
+            assert!(
+                matches!(error, DockerPullError::InvalidInput(_)),
+                "unexpected error for {digest}: {error}"
+            );
+        }
     }
 
     #[test]
