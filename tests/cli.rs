@@ -56,6 +56,33 @@ fn compose_config_images_lists_unique_images_from_file() {
 }
 
 #[test]
+fn compose_config_does_not_interpolate_mapping_keys() {
+    let dir = tempfile::tempdir().expect("tempdir should create");
+    let compose_path = dir.path().join("docker-compose.yml");
+    fs::write(
+        &compose_path,
+        concat!(
+            "services:\n",
+            "  web:\n",
+            "    image: nginx:alpine\n",
+            "    labels:\n",
+            "      \"${REQUIRED?label keys should not interpolate}\": literal\n",
+        ),
+    )
+    .expect("compose file should write");
+
+    pocker()
+        .arg("compose")
+        .arg("-f")
+        .arg(&compose_path)
+        .arg("config")
+        .arg("--images")
+        .assert()
+        .success()
+        .stdout("nginx:alpine\n");
+}
+
+#[test]
 fn compose_config_json_prints_resolved_model() {
     let dir = tempfile::tempdir().expect("tempdir should create");
     let compose_path = dir.path().join("docker-compose.yml");

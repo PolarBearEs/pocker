@@ -359,3 +359,55 @@ fn interpolate_value(value: Value, env: &HashMap<String, String>) -> Result<Valu
         value => Ok(value),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use serde_yml::Value;
+
+    use super::interpolate_value;
+    use crate::yaml::{mapping_get, value_mapping};
+
+    #[test]
+    fn interpolate_value_interpolates_values_but_not_mapping_keys() {
+        let value = serde_yml::from_str::<Value>(
+            r#"
+services:
+  app:
+    image: ${REGISTRY}/app:${TAG}
+    labels:
+      "$REGISTRY.key": should_not_interpolate_key
+      interpolated.value: "$REGISTRY/value"
+"#,
+        )
+        .expect("yaml should parse");
+        let env = HashMap::from([
+            ("REGISTRY".to_string(), "example.com".to_string()),
+            ("TAG".to_string(), "1.2.3".to_string()),
+        ]);
+
+        let value = interpolate_value(value, &env).expect("interpolation should succeed");
+        let root = value_mapping(&value);
+        let services = mapping_get(root, "services").and_then(value_mapping);
+        let app = mapping_get(services, "app").and_then(value_mapping);
+        let labels = mapping_get(app, "labels").and_then(value_mapping);
+
+        assert_eq!(
+            mapping_get(app, "image").and_then(Value::as_str),
+            Some("example.com/app:1.2.3")
+        );
+        assert_eq!(
+            mapping_get(labels, "$REGISTRY.key").and_then(Value::as_str),
+            Some("should_not_interpolate_key")
+        );
+        assert_eq!(
+            mapping_get(labels, "interpolated.value").and_then(Value::as_str),
+            Some("example.com/value")
+        );
+        assert!(
+            mapping_get(labels, "example.com.key").is_none(),
+            "mapping keys must not be interpolated"
+        );
+    }
+}

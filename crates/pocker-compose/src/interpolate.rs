@@ -45,6 +45,8 @@ pub(super) fn interpolate(text: &str, values: &HashMap<String, String>) -> Resul
 fn collect_braced_expression(
     chars: &mut std::iter::Peekable<std::str::CharIndices<'_>>,
 ) -> Result<String> {
+    // Keep the expression body raw; operator extras are intentionally handed
+    // back to `interpolate` later so bare $VAR and $$ use the same rules.
     let mut expr = String::new();
     let mut nested_depth = 0usize;
 
