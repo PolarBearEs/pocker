@@ -2,6 +2,7 @@ use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
 use reqwest::StatusCode;
+use reqwest::header::{CONTENT_RANGE, HeaderMap};
 use tokio::fs::{self, OpenOptions};
 use tokio::io::AsyncWriteExt;
 use tracing::warn;
@@ -105,7 +106,7 @@ pub async fn download_blob(
             tokio::time::sleep(delay).await;
             continue;
         }
-        validate_blob_response_status(status, offset, &descriptor.digest)?;
+        validate_blob_response_status(status, response.headers(), offset, &descriptor.digest)?;
 
         let mut file = OpenOptions::new()
             .create(true)
@@ -186,7 +187,12 @@ pub async fn download_blob(
     Ok(())
 }
 
-fn validate_blob_response_status(status: StatusCode, offset: u64, digest: &str) -> Result<()> {
+fn validate_blob_response_status(
+    status: StatusCode,
+    headers: &HeaderMap,
+    offset: u64,
+    digest: &str,
+) -> Result<()> {
     if status == StatusCode::NOT_FOUND {
         return Err(DockerPullError::BlobNotFound(digest.to_string()));
     }
@@ -196,12 +202,35 @@ fn validate_blob_response_status(status: StatusCode, offset: u64, digest: &str) 
     }
 
     if offset > 0 && status == StatusCode::PARTIAL_CONTENT {
-        return Ok(());
+        let Some(start) = headers
+            .get(CONTENT_RANGE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(content_range_start)
+        else {
+            return Err(DockerPullError::BadResponse(format!(
+                "missing or invalid Content-Range for {digest} at offset {offset}"
+            )));
+        };
+        if start == offset {
+            return Ok(());
+        }
+        return Err(DockerPullError::BadResponse(format!(
+            "unexpected Content-Range start {start} for {digest} at offset {offset}"
+        )));
     }
 
     Err(DockerPullError::BadResponse(format!(
         "unexpected blob response status {status} for {digest} at offset {offset}"
     )))
+}
+
+fn content_range_start(value: &str) -> Option<u64> {
+    let value = value.strip_prefix("bytes ")?;
+    let (range, _) = value.split_once('/')?;
+    let (start, end) = range.split_once('-')?;
+    let start = start.parse::<u64>().ok()?;
+    let end = end.parse::<u64>().ok()?;
+    (start <= end).then_some(start)
 }
 
 async fn reset_download_state(
@@ -283,14 +312,17 @@ fn register_retry(
 #[cfg(test)]
 mod tests {
     use reqwest::StatusCode;
+    use reqwest::header::{CONTENT_RANGE, HeaderMap, HeaderValue};
 
     use super::validate_blob_response_status;
     use crate::error::DockerPullError;
 
     #[test]
     fn missing_blob_status_maps_to_not_found() {
-        let error = validate_blob_response_status(StatusCode::NOT_FOUND, 0, "sha256:deadbeef")
-            .expect_err("404 should not be treated as a streamable blob response");
+        let headers = HeaderMap::new();
+        let error =
+            validate_blob_response_status(StatusCode::NOT_FOUND, &headers, 0, "sha256:deadbeef")
+                .expect_err("404 should not be treated as a streamable blob response");
 
         assert!(
             matches!(error, DockerPullError::BlobNotFound(digest) if digest == "sha256:deadbeef")
@@ -299,21 +331,54 @@ mod tests {
 
     #[test]
     fn resumed_blob_download_requires_partial_content() {
-        let error = validate_blob_response_status(StatusCode::OK, 42, "sha256:deadbeef")
+        let headers = HeaderMap::new();
+        let error = validate_blob_response_status(StatusCode::OK, &headers, 42, "sha256:deadbeef")
             .expect_err("resumed downloads must not accept 200 responses without reset handling");
 
         assert!(matches!(error, DockerPullError::BadResponse(_)));
     }
 
     #[test]
+    fn resumed_blob_download_rejects_missing_content_range() {
+        let headers = HeaderMap::new();
+        let error = validate_blob_response_status(
+            StatusCode::PARTIAL_CONTENT,
+            &headers,
+            42,
+            "sha256:deadbeef",
+        )
+        .expect_err("resumed downloads must require Content-Range");
+
+        assert!(matches!(error, DockerPullError::BadResponse(_)));
+    }
+
+    #[test]
+    fn resumed_blob_download_rejects_mismatched_content_range() {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_RANGE, HeaderValue::from_static("bytes 40-99/100"));
+        let error = validate_blob_response_status(
+            StatusCode::PARTIAL_CONTENT,
+            &headers,
+            42,
+            "sha256:deadbeef",
+        )
+        .expect_err("resumed downloads must validate Content-Range start");
+
+        assert!(matches!(error, DockerPullError::BadResponse(_)));
+    }
+
+    #[test]
     fn fresh_blob_download_accepts_ok_response() {
-        validate_blob_response_status(StatusCode::OK, 0, "sha256:deadbeef")
+        let headers = HeaderMap::new();
+        validate_blob_response_status(StatusCode::OK, &headers, 0, "sha256:deadbeef")
             .expect("fresh downloads should accept 200 responses");
     }
 
     #[test]
     fn resumed_blob_download_accepts_partial_content() {
-        validate_blob_response_status(StatusCode::PARTIAL_CONTENT, 42, "sha256:deadbeef")
-            .expect("resumed downloads should accept 206 responses");
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_RANGE, HeaderValue::from_static("bytes 42-99/100"));
+        validate_blob_response_status(StatusCode::PARTIAL_CONTENT, &headers, 42, "sha256:deadbeef")
+            .expect("resumed downloads should accept matching 206 responses");
     }
 }
