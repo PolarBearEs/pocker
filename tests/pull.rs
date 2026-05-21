@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use assert_cmd::Command;
 use predicates::str::contains;
-use sha2::{Digest, Sha256, Sha512};
+use sha2::{Digest, Sha256, Sha384, Sha512};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -89,8 +89,17 @@ async fn pulls_oci_image_from_fake_registry_into_cache() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pulls_oci_image_with_sha384_layer_digest_into_cache() {
+    pulls_oci_image_with_layer_algorithm_into_cache("sha384").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pulls_oci_image_with_sha512_layer_digest_into_cache() {
-    let fixture = Arc::new(Fixture::build_with_layer_algorithm("sha512"));
+    pulls_oci_image_with_layer_algorithm_into_cache("sha512").await;
+}
+
+async fn pulls_oci_image_with_layer_algorithm_into_cache(algorithm: &'static str) {
+    let fixture = Arc::new(Fixture::build_with_layer_algorithm(algorithm));
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("fake registry should bind");
@@ -145,7 +154,7 @@ async fn pulls_oci_image_with_sha512_layer_digest_into_cache() {
     let layer_path = cache_dir
         .path()
         .join("blobs")
-        .join("sha512")
+        .join(algorithm)
         .join(&fixture.layer_digest);
 
     assert!(layer_path.exists(), "expected layer blob at {layer_path:?}");
@@ -232,6 +241,7 @@ impl Fixture {
         let layer_bytes = b"fake layer payload".to_vec();
         let layer_digest = match algorithm {
             "sha256" => sha256_hex(&layer_bytes),
+            "sha384" => sha384_hex(&layer_bytes),
             "sha512" => sha512_hex(&layer_bytes),
             other => panic!("unsupported test digest algorithm {other}"),
         };
@@ -272,6 +282,12 @@ impl Fixture {
 
 fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hex::encode(hasher.finalize())
+}
+
+fn sha384_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha384::new();
     hasher.update(bytes);
     hex::encode(hasher.finalize())
 }
