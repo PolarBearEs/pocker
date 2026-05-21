@@ -2,10 +2,11 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 
 use base64::Engine;
 use serde::Deserialize;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OnceCell};
 use tracing::warn;
 
 use crate::error::{DockerPullError, Result};
@@ -19,7 +20,7 @@ pub enum Credentials {
 pub struct AuthResolver {
     cli_credentials: Option<Credentials>,
     docker_config: Option<DockerConfig>,
-    resolved: Mutex<HashMap<String, Option<Credentials>>>,
+    resolved: Mutex<HashMap<String, Arc<OnceCell<Option<Credentials>>>>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -63,24 +64,27 @@ impl AuthResolver {
             return Ok(None);
         };
 
-        if let Some(credentials) = self.resolved.lock().await.get(registry).cloned() {
-            return Ok(credentials);
-        }
-
         let registry = registry.to_string();
-        let cache_key = registry.clone();
-        let resolved =
-            tokio::task::spawn_blocking(move || resolve_docker_config(&config, &registry))
-                .await
-                .map_err(|error| {
-                    DockerPullError::InvalidInput(format!("auth resolver task panicked: {error}"))
-                })??;
+        let cell = {
+            let mut resolved = self.resolved.lock().await;
+            resolved
+                .entry(registry.clone())
+                .or_insert_with(|| Arc::new(OnceCell::new()))
+                .clone()
+        };
 
-        self.resolved
-            .lock()
-            .await
-            .insert(cache_key, resolved.clone());
-        Ok(resolved)
+        let credentials = cell
+            .get_or_try_init(|| async move {
+                tokio::task::spawn_blocking(move || resolve_docker_config(&config, &registry))
+                    .await
+                    .map_err(|error| {
+                        DockerPullError::InvalidInput(format!(
+                            "auth resolver task panicked: {error}"
+                        ))
+                    })?
+            })
+            .await?;
+        Ok(credentials.clone())
     }
 }
 
@@ -518,8 +522,8 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[tokio::test(flavor = "current_thread")]
-    async fn docker_config_helper_resolution_is_cached() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_docker_config_helper_resolution_is_cached() {
         use std::os::unix::fs::PermissionsExt;
 
         let lock = lock_docker_config_env();
@@ -533,9 +537,8 @@ mod tests {
             format!(
                 r#"#!/bin/sh
 count_file="{}"
-count="$(cat "$count_file" 2>/dev/null || printf 0)"
-count="$((count + 1))"
-printf '%s' "$count" > "$count_file"
+printf x >> "$count_file"
+sleep 0.2
 printf '{{"Username":"helper-user","Secret":"helper-pass"}}'
 "#,
                 count_path.display()
@@ -570,14 +573,12 @@ printf '{{"Username":"helper-user","Secret":"helper-pass"}}'
         let mut docker_config = DockerConfigEnvGuard::new_with_lock(lock, dir.path());
         let resolver = AuthResolver::new(None).expect("resolver should build");
 
-        let first = resolver
-            .resolve("registry-1.docker.io")
-            .await
-            .expect("first auth resolution should succeed");
-        let second = resolver
-            .resolve("registry-1.docker.io")
-            .await
-            .expect("second auth resolution should succeed");
+        let (first, second) = tokio::join!(
+            resolver.resolve("registry-1.docker.io"),
+            resolver.resolve("registry-1.docker.io")
+        );
+        let first = first.expect("first auth resolution should succeed");
+        let second = second.expect("second auth resolution should succeed");
 
         docker_config.restore();
         restore_path_env(previous_path.as_deref());
@@ -594,8 +595,8 @@ printf '{{"Username":"helper-user","Secret":"helper-pass"}}'
         ));
         assert_eq!(
             fs::read_to_string(count_path).expect("count should read"),
-            "1",
-            "helper should only be invoked once for a cached registry"
+            "x",
+            "concurrent callers should share one in-flight helper invocation"
         );
     }
 
