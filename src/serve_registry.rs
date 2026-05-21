@@ -14,16 +14,12 @@ use crate::error::{DockerPullError, Result};
 use crate::platform::Platform;
 use crate::pull::{BlobDownloadLocks, PullContext, download};
 use crate::reference::{ImageReference, ReferenceTarget};
-use crate::registry::{Descriptor, RegistryClient, cache_repository, decode_cache_repository};
+use crate::registry::{
+    Descriptor, MANIFEST_ACCEPT, RegistryClient, cache_repository, decode_cache_repository,
+};
 use crate::store::{Store, StoredReference};
 use crate::ui::Ui;
 
-const MANIFEST_ACCEPT: &str = concat!(
-    "application/vnd.oci.image.index.v1+json,",
-    "application/vnd.docker.distribution.manifest.list.v2+json,",
-    "application/vnd.oci.image.manifest.v1+json,",
-    "application/vnd.docker.distribution.manifest.v2+json"
-);
 const DEFAULT_MANIFEST_CONTENT_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";
 const BLOB_CONTENT_TYPE: &str = "application/octet-stream";
 

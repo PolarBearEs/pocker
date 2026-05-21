@@ -4,24 +4,24 @@ use std::time::Duration;
 
 use reqwest::header::{ACCEPT, HeaderValue, RANGE, RETRY_AFTER, WWW_AUTHENTICATE};
 use reqwest::{Client, Method, Response, StatusCode};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use tokio::sync::Mutex;
 use tokio::time::sleep;
 use tracing::{debug, warn};
 use url::Url;
 
+use super::MANIFEST_ACCEPT;
+use super::cache::{cache_url, resource_url};
+use super::types::{
+    BlobMetadata, Descriptor, ImageIndex, ImageManifest, ManifestEnvelope, RawManifest,
+    ResolvedImage,
+};
 use crate::auth::{AuthResolver, Credentials};
 use crate::digest::canonical_digest_bytes;
 use crate::error::{DockerPullError, Result};
 use crate::platform::Platform;
 use crate::reference::ImageReference;
 
-const MANIFEST_ACCEPT: &str = concat!(
-    "application/vnd.oci.image.index.v1+json,",
-    "application/vnd.docker.distribution.manifest.list.v2+json,",
-    "application/vnd.oci.image.manifest.v1+json,",
-    "application/vnd.docker.distribution.manifest.v2+json"
-);
 pub const DEFAULT_REQUEST_RETRIES: u32 = 5;
 const MAX_AUTH_RETRIES: u32 = 2;
 
@@ -36,69 +36,6 @@ pub struct RegistryClient {
     cache_only: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Descriptor {
-    #[serde(rename = "mediaType", default)]
-    pub media_type: String,
-    pub digest: String,
-    pub size: i64,
-    #[serde(default)]
-    pub platform: Option<Platform>,
-    #[serde(default)]
-    pub annotations: Option<HashMap<String, String>>,
-}
-
-impl Descriptor {
-    pub(crate) fn expected_size(&self) -> Result<u64> {
-        u64::try_from(self.size).map_err(|_| {
-            DockerPullError::InvalidInput(format!(
-                "descriptor {} has invalid negative size {}",
-                self.digest, self.size
-            ))
-        })
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct ManifestEnvelope {
-    #[serde(rename = "schemaVersion")]
-    schema_version: u32,
-    #[serde(rename = "mediaType", default)]
-    media_type: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct ImageManifest {
-    #[serde(rename = "schemaVersion")]
-    _schema_version: u32,
-    #[serde(rename = "mediaType", default)]
-    media_type: String,
-    config: Descriptor,
-    layers: Vec<Descriptor>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ImageIndex {
-    #[serde(rename = "schemaVersion")]
-    _schema_version: u32,
-    #[serde(rename = "mediaType", default)]
-    _media_type: String,
-    manifests: Vec<Descriptor>,
-}
-
-#[derive(Debug, Clone)]
-pub struct ResolvedImage {
-    pub manifest: Descriptor,
-    pub manifest_bytes: Vec<u8>,
-    pub config: Descriptor,
-    pub layers: Vec<Descriptor>,
-}
-
-#[derive(Debug)]
-pub struct BlobMetadata {
-    pub size: Option<u64>,
-}
-
 struct RegistryRequest<'a> {
     method: Method,
     url: Url,
@@ -106,12 +43,6 @@ struct RegistryRequest<'a> {
     accept: Option<&'a str>,
     range: Option<&'a str>,
     allow_retry: bool,
-}
-
-#[derive(Debug, Clone)]
-pub struct RawManifest {
-    pub descriptor: Descriptor,
-    pub bytes: Vec<u8>,
 }
 
 impl RegistryClient {
@@ -653,56 +584,6 @@ async fn raw_manifest_from_response(response: Response) -> Result<RawManifest> {
     })
 }
 
-pub fn cache_repository(registry: &str, repository: &str) -> String {
-    format!("{registry}/{repository}")
-}
-
-pub fn decode_cache_repository(repository: &str) -> Result<(String, String)> {
-    let mut parts = repository.splitn(2, '/');
-    let Some(registry) = parts.next() else {
-        return Err(invalid_cache_repository(repository));
-    };
-    let Some(upstream_repository) = parts.next() else {
-        return Err(invalid_cache_repository(repository));
-    };
-    if registry.is_empty() || upstream_repository.is_empty() {
-        return Err(invalid_cache_repository(repository));
-    }
-    Ok((registry.to_string(), upstream_repository.to_string()))
-}
-
-fn invalid_cache_repository(repository: &str) -> DockerPullError {
-    DockerPullError::InvalidInput(format!("invalid pocker cache repository `{repository}`"))
-}
-
-fn cache_url(
-    base_url: &Url,
-    reference: &ImageReference,
-    resource: &str,
-    suffix: &str,
-) -> Result<Url> {
-    let repository = cache_repository(&reference.registry, &reference.repository);
-    resource_url(base_url.clone(), &repository, resource, suffix)
-}
-
-fn resource_url(mut base_url: Url, repository: &str, resource: &str, suffix: &str) -> Result<Url> {
-    base_url.set_query(None);
-    base_url.set_fragment(None);
-    {
-        let display_base = base_url.to_string();
-        let mut segments = base_url.path_segments_mut().map_err(|_| {
-            DockerPullError::InvalidInput(format!("invalid registry URL base `{display_base}`"))
-        })?;
-        segments.push("v2");
-        for segment in repository.split('/') {
-            segments.push(segment);
-        }
-        segments.push(resource);
-        segments.push(suffix);
-    }
-    Ok(base_url)
-}
-
 fn token_cache_key(reference: &ImageReference) -> String {
     format!("{}|{}", reference.registry, reference.repository_scope())
 }
@@ -876,10 +757,8 @@ mod tests {
     use tokio::net::TcpListener;
     use url::Url;
 
-    use super::{
-        DEFAULT_REQUEST_RETRIES, RegistryClient, cache_repository, decode_cache_repository,
-        parse_www_authenticate, resource_url, token_cache_key,
-    };
+    use super::super::cache::{cache_repository, decode_cache_repository, resource_url};
+    use super::{DEFAULT_REQUEST_RETRIES, RegistryClient, parse_www_authenticate, token_cache_key};
     use crate::auth::AuthResolver;
     use crate::error::DockerPullError;
     use crate::platform::Platform;
