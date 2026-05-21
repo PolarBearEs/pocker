@@ -200,6 +200,71 @@ services:
     }
 
     #[test]
+    fn uses_first_default_override_file_by_compose_preference() {
+        let dir = tempdir().expect("tempdir should be created");
+        fs::write(
+            dir.path().join("compose.yaml"),
+            r#"
+services:
+  app:
+    image: example/app:base
+"#,
+        )
+        .expect("base compose should be written");
+        fs::write(
+            dir.path().join("compose.override.yml"),
+            r#"
+services:
+  app:
+    image: example/app:yml
+"#,
+        )
+        .expect("preferred override should be written");
+        fs::write(
+            dir.path().join("compose.override.yaml"),
+            r#"
+services:
+  app:
+    image: example/app:yaml
+"#,
+        )
+        .expect("lower-priority override should be written");
+
+        let resolved = resolve_images(&[], dir.path()).expect("images should resolve");
+
+        assert_eq!(resolved.images, vec!["example/app:yml"]);
+    }
+
+    #[test]
+    fn discovers_default_compose_files_from_parent_directories() {
+        let dir = tempdir().expect("tempdir should be created");
+        let child = dir.path().join("nested").join("child");
+        fs::create_dir_all(&child).expect("child dir should be created");
+        fs::write(
+            dir.path().join("compose.yaml"),
+            r#"
+services:
+  app:
+    image: example/app:parent
+"#,
+        )
+        .expect("base compose should be written");
+        fs::write(
+            dir.path().join("compose.override.yml"),
+            r#"
+services:
+  app:
+    image: example/app:parent-override
+"#,
+        )
+        .expect("override compose should be written");
+
+        let resolved = resolve_images(&[], &child).expect("images should resolve");
+
+        assert_eq!(resolved.images, vec!["example/app:parent-override"]);
+    }
+
+    #[test]
     fn detects_build_only_services_from_yaml_merge_keys() {
         let dir = tempdir().expect("tempdir should be created");
         fs::write(
