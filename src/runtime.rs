@@ -49,7 +49,7 @@ pub async fn run() -> Result<()> {
             }
         },
         Commands::Serve(args) => {
-            let store = Arc::new(Store::open(cli.global.cache_dir.clone()).await?);
+            let store = Arc::new(Store::open_active(cli.global.cache_dir.clone()).await?);
             let credentials = read_credentials(args.username, args.password_stdin)?;
             let auth = Arc::new(AuthResolver::new(credentials)?);
             let client = Arc::new(RegistryClient::new(

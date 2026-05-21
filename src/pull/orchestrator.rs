@@ -134,7 +134,7 @@ pub(crate) async fn pull_references(
     request: PullRequestOptions,
 ) -> Result<()> {
     let references = unique_references(references);
-    let store = Arc::new(Store::open(cache_dir.to_path_buf()).await?);
+    let store = Arc::new(Store::open_active(cache_dir.to_path_buf()).await?);
     let quiet = global_quiet || request.quiet;
     let platform = request
         .platform

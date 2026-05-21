@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use serde_yml::Value;
 
+use crate::env::parse_env_file;
 use crate::interpolate::interpolate;
 use crate::yaml::{
     Service, collect_extends_files, collect_includes, collect_services, mapping_get,
@@ -328,29 +329,10 @@ fn load_compose_env(project_dir: &Path) -> Result<HashMap<String, String>> {
     let env_path = project_dir.join(".env");
     if env_path.is_file() {
         let text = std::fs::read_to_string(&env_path)?;
-        for line in text.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            let Some((key, value)) = line.split_once('=') else {
-                continue;
-            };
-            values.insert(key.trim().to_string(), unquote_env_value(value.trim()));
-        }
+        values.extend(parse_env_file(&text));
     }
     for (key, value) in env::vars() {
         values.insert(key, value);
     }
     Ok(values)
-}
-
-fn unquote_env_value(value: &str) -> String {
-    let quoted = (value.starts_with('"') && value.ends_with('"'))
-        || (value.starts_with('\'') && value.ends_with('\''));
-    if quoted && value.len() >= 2 {
-        value[1..value.len() - 1].to_string()
-    } else {
-        value.to_string()
-    }
 }

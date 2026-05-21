@@ -1,5 +1,6 @@
 mod fs;
 
+use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -16,6 +17,7 @@ use fs::{
 #[derive(Debug, Clone)]
 pub struct Store {
     root: PathBuf,
+    _shared_lock: Option<std::sync::Arc<File>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -53,13 +55,31 @@ struct DownloadCheckpoint {
 
 impl Store {
     pub async fn open(root: PathBuf) -> Result<Self> {
+        Self::open_with_lock(root, false).await
+    }
+
+    pub async fn open_active(root: PathBuf) -> Result<Self> {
+        Self::open_with_lock(root, true).await
+    }
+
+    async fn open_with_lock(root: PathBuf, shared_lock: bool) -> Result<Self> {
         ensure_directory(&root)?;
+        let lock = if shared_lock {
+            Some(std::sync::Arc::new(
+                acquire_shared_cache_lock(root.clone()).await?,
+            ))
+        } else {
+            None
+        };
         for algorithm in ["sha256", "sha384", "sha512"] {
             ensure_directory(&root.join("blobs").join(algorithm))?;
             ensure_directory(&root.join("partials").join(algorithm))?;
         }
         ensure_directory(&root.join("references"))?;
-        Ok(Self { root })
+        Ok(Self {
+            root,
+            _shared_lock: lock,
+        })
     }
 
     pub fn blob_path(&self, digest: &str) -> Result<PathBuf> {
@@ -281,6 +301,15 @@ impl Store {
 
     pub async fn clear(&self) -> Result<ClearedCache> {
         let root = self.root.clone();
+        let _exclusive_lock = tokio::task::spawn_blocking(move || {
+            let lock = open_lock_file(&root)?;
+            lock.lock()?;
+            Result::Ok(lock)
+        })
+        .await
+        .map_err(|e| DockerPullError::InvalidInput(format!("cache lock task panicked: {e}")))??;
+
+        let root = self.root.clone();
         let files = tokio::task::spawn_blocking(move || collect_cache_files(&root))
             .await
             .map_err(|e| {
@@ -304,6 +333,40 @@ impl Store {
     pub fn root(&self) -> &Path {
         &self.root
     }
+}
+
+async fn acquire_shared_cache_lock(root: PathBuf) -> Result<File> {
+    tokio::task::spawn_blocking(move || {
+        let lock = open_lock_file(&root)?;
+        lock.lock_shared()?;
+        Result::Ok(lock)
+    })
+    .await
+    .map_err(|e| DockerPullError::InvalidInput(format!("cache lock task panicked: {e}")))?
+}
+
+fn open_lock_file(root: &Path) -> Result<File> {
+    let path = cache_lock_path(root);
+    if let Some(parent) = path.parent() {
+        ensure_directory(parent)?;
+    }
+    OpenOptions::new()
+        .create(true)
+        .read(true)
+        .truncate(false)
+        .write(true)
+        .open(path)
+        .map_err(Into::into)
+}
+
+fn cache_lock_path(root: &Path) -> PathBuf {
+    let file_name = root
+        .file_name()
+        .map(|name| format!("{}.lock", name.to_string_lossy()))
+        .unwrap_or_else(|| ".pocker-cache.lock".to_string());
+    root.parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(file_name)
 }
 
 fn digest_path(root: PathBuf, digest: &str) -> Result<PathBuf> {
@@ -671,6 +734,35 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn clear_waits_for_active_cache_lock() {
+        let dir = tempdir().expect("tempdir should create");
+        let active_store = Store::open_active(dir.path().to_path_buf())
+            .await
+            .expect("active store should open");
+        let cleaner = Store::open(dir.path().to_path_buf())
+            .await
+            .expect("cleaner store should open");
+
+        let (sender, mut receiver) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let _ = sender.send(cleaner.clear().await);
+        });
+        tokio::time::timeout(std::time::Duration::from_millis(100), &mut receiver)
+            .await
+            .expect_err("clear should wait while active store holds shared lock");
+
+        drop(active_store);
+        let cleared = tokio::time::timeout(std::time::Duration::from_secs(2), receiver)
+            .await
+            .expect("clear should finish after active store is dropped")
+            .expect("clear task should send result")
+            .expect("clear should succeed");
+
+        assert!(cleared.files.is_empty());
+        assert!(dir.path().join("blobs").is_dir());
     }
 
     #[tokio::test]

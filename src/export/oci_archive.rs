@@ -401,8 +401,10 @@ mod tests {
 
     #[test]
     fn oci_ref_name_is_omitted_for_digest_references() {
-        let ref_name =
-            oci_ref_name("ghcr.io/acme/app@sha256:deadbeef").expect("reference should parse");
+        let ref_name = oci_ref_name(
+            "ghcr.io/acme/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+        .expect("reference should parse");
         assert!(ref_name.is_none());
     }
 

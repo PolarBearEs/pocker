@@ -1,3 +1,4 @@
+use crate::digest::parse_digest;
 use crate::error::{DockerPullError, Result};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,6 +43,8 @@ impl ImageReference {
         if repository.is_empty() {
             return Err(DockerPullError::InvalidInput("repository is empty".into()));
         }
+        validate_repository(&repository)?;
+        validate_target(&target)?;
 
         let repository = if registry == "registry-1.docker.io" && !repository.contains('/') {
             format!("library/{repository}")
@@ -122,9 +125,64 @@ fn split_tag(input: &str) -> Option<(&str, &str)> {
     }
 }
 
+fn validate_target(target: &ReferenceTarget) -> Result<()> {
+    match target {
+        ReferenceTarget::Tag(tag) => validate_tag(tag),
+        ReferenceTarget::Digest(digest) => parse_digest(digest).map(|_| ()),
+    }
+}
+
+fn validate_tag(tag: &str) -> Result<()> {
+    let valid = !tag.is_empty()
+        && tag.len() <= 128
+        && tag
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        && tag
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'));
+    if valid {
+        Ok(())
+    } else {
+        Err(DockerPullError::InvalidInput(format!(
+            "invalid image tag `{tag}`"
+        )))
+    }
+}
+
+fn validate_repository(repository: &str) -> Result<()> {
+    if repository
+        .split('/')
+        .all(|component| !component.is_empty() && valid_repository_component(component))
+    {
+        Ok(())
+    } else {
+        Err(DockerPullError::InvalidInput(format!(
+            "invalid repository `{repository}`"
+        )))
+    }
+}
+
+fn valid_repository_component(component: &str) -> bool {
+    component.bytes().all(|byte| {
+        byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'_' | b'-')
+    }) && component
+        .bytes()
+        .next()
+        .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        && component
+            .bytes()
+            .last()
+            .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{ImageReference, ReferenceTarget};
+
+    const VALID_SHA256: &str =
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
     #[test]
     fn docker_hub_defaults_are_applied() {
@@ -136,13 +194,13 @@ mod tests {
 
     #[test]
     fn digest_reference_is_preserved() {
-        let reference = ImageReference::parse("ghcr.io/acme/app@sha256:deadbeef")
+        let reference = ImageReference::parse(&format!("ghcr.io/acme/app@{VALID_SHA256}"))
             .expect("reference should parse");
         assert_eq!(reference.registry, "ghcr.io");
         assert_eq!(reference.repository, "acme/app");
         assert_eq!(
             reference.target,
-            ReferenceTarget::Digest("sha256:deadbeef".into())
+            ReferenceTarget::Digest(VALID_SHA256.into())
         );
     }
 
@@ -150,5 +208,36 @@ mod tests {
     fn docker_hub_display_name_is_short() {
         let reference = ImageReference::parse("alpine").expect("reference should parse");
         assert_eq!(reference.display_name(), "alpine:latest");
+    }
+
+    #[test]
+    fn rejects_empty_tag() {
+        ImageReference::parse("alpine:").expect_err("empty tag should be rejected");
+    }
+
+    #[test]
+    fn rejects_empty_digest() {
+        ImageReference::parse("alpine@").expect_err("empty digest should be rejected");
+    }
+
+    #[test]
+    fn rejects_malformed_digest() {
+        ImageReference::parse("alpine@sha256:deadbeef")
+            .expect_err("short digest should be rejected");
+    }
+
+    #[test]
+    fn rejects_invalid_repository_component() {
+        ImageReference::parse("ghcr.io/acme//app:latest")
+            .expect_err("empty repository component should be rejected");
+        ImageReference::parse("ghcr.io/Acme/app:latest")
+            .expect_err("uppercase repository component should be rejected");
+    }
+
+    #[test]
+    fn rejects_invalid_tag_characters() {
+        ImageReference::parse("ghcr.io/acme/app:bad/tag")
+            .expect_err("tag with slash should be rejected");
+        ImageReference::parse("alpine:-bad").expect_err("tag must start with word character");
     }
 }

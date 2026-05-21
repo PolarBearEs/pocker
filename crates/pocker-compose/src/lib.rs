@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 
+mod env;
 mod interpolate;
 mod project;
 mod yaml;

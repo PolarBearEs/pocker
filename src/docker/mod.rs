@@ -230,8 +230,10 @@ mod tests {
 
     #[test]
     fn inspect_target_uses_config_digest_for_digest_references() {
-        let reference =
-            ImageReference::parse("ghcr.io/acme/app@sha256:beef").expect("reference should parse");
+        let reference = ImageReference::parse(
+            "ghcr.io/acme/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+        .expect("reference should parse");
         assert_eq!(
             daemon_inspect_target(&reference, "sha256:deadbeef"),
             "sha256:deadbeef"
