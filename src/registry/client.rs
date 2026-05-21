@@ -258,6 +258,12 @@ impl RegistryClient {
         if response.status() == StatusCode::NOT_FOUND {
             return Err(DockerPullError::BlobNotFound(digest.to_string()));
         }
+        if !response.status().is_success() {
+            return Err(DockerPullError::BadResponse(format!(
+                "registry returned {} for blob {digest}",
+                response.status()
+            )));
+        }
         let size = response
             .headers()
             .get(reqwest::header::CONTENT_LENGTH)
@@ -1051,6 +1057,35 @@ mod tests {
             .expect("cache blob miss should fall back to upstream");
 
         assert_eq!(bytes, body);
+    }
+
+    #[tokio::test]
+    async fn head_blob_rejects_non_success_status() {
+        let registry = spawn_single_response(
+            b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
+        )
+        .await;
+        let client = RegistryClient::new(
+            reqwest::Client::builder()
+                .https_only(false)
+                .build()
+                .expect("client should build"),
+            Arc::new(AuthResolver::new(None).expect("auth resolver should build")),
+            true,
+            Some(DEFAULT_REQUEST_RETRIES),
+        );
+        let reference =
+            ImageReference::parse(&format!("{registry}/sample:latest")).expect("reference parse");
+
+        let error = client
+            .head_blob(
+                &reference,
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )
+            .await
+            .expect_err("non-success HEAD responses should fail");
+
+        assert!(matches!(error, DockerPullError::BadResponse(message) if message.contains("403")));
     }
 
     async fn spawn_single_response(response: Vec<u8>) -> std::net::SocketAddr {
