@@ -132,6 +132,133 @@ grep -q "compose service(s) not found: missing" <<<"${UNKNOWN_OUTPUT}" || {
 run_pocker --cache-dir "${WORKDIR}/cache-compose" compose -f "${COMPOSE_FILE}" pull --no-load target
 find "${WORKDIR}/cache-compose/blobs/sha256" -type f | grep -q .
 
+echo "smoke: compose parser oracle"
+ORACLE_DIR="${WORKDIR}/compose-oracle"
+mkdir -p "${ORACLE_DIR}/base" "${ORACLE_DIR}/include"
+cat > "${ORACLE_DIR}/.env" <<'EOF'
+REGISTRY=registry.example.com
+TAG=1.2.3
+EMPTY=
+FROM_ENV_FILE=dotenv
+EOF
+cat > "${ORACLE_DIR}/base/base.yml" <<'EOF'
+services:
+  base:
+    image: ${REGISTRY}/base:${BASE_TAG:-base-default}
+  nested:
+    image: ${REGISTRY}/nested:${NESTED_TAG:-${TAG:-fallback}}
+EOF
+cat > "${ORACLE_DIR}/include/included.yml" <<'EOF'
+services:
+  included:
+    image: ${REGISTRY}/included:${TAG}
+  included_build:
+    build: .
+EOF
+cat > "${ORACLE_DIR}/compose.yml" <<'EOF'
+include:
+  - path: include/included.yml
+
+x-image: &app_image ${REGISTRY}/app:${TAG}
+
+services:
+  app:
+    image: *app_image
+    labels:
+      "$REGISTRY.key": should_not_interpolate_key
+      interpolated.value: "$REGISTRY/value"
+
+  child:
+    extends:
+      file: base/base.yml
+      service: nested
+
+  override_me:
+    image: ${REGISTRY}/old:${TAG}
+
+  build_only:
+    build: .
+
+  both:
+    image: ${REGISTRY}/both:${FROM_ENV_FILE}
+    build: .
+EOF
+cat > "${ORACLE_DIR}/compose.override.yml" <<'EOF'
+services:
+  override_me:
+    image: ${REGISTRY}/new:${EMPTY:-override-default}
+EOF
+DOCKER_COMPOSE_CONFIG="$(
+  cd "${ORACLE_DIR}" && docker compose -f compose.yml -f compose.override.yml config --format json
+)"
+POCKER_COMPOSE_CONFIG="$(
+  run_pocker \
+    compose \
+    -f "${ORACLE_DIR}/compose.yml" \
+    -f "${ORACLE_DIR}/compose.override.yml" \
+    config \
+    --format json
+)"
+python3 - "${DOCKER_COMPOSE_CONFIG}" "${POCKER_COMPOSE_CONFIG}" <<'PY'
+import json
+import sys
+
+docker_config = json.loads(sys.argv[1])
+pocker_config = json.loads(sys.argv[2])
+
+docker_services = docker_config["services"]
+pocker_services = {service["name"]: service for service in pocker_config["services"]}
+
+expected_service_names = {
+    "app",
+    "child",
+    "override_me",
+    "build_only",
+    "both",
+    "included",
+    "included_build",
+}
+if set(pocker_services) != expected_service_names:
+    raise SystemExit(f"unexpected pocker services: {sorted(pocker_services)}")
+if set(docker_services) != expected_service_names:
+    raise SystemExit(f"unexpected docker services: {sorted(docker_services)}")
+
+expected_images = {
+    "app": "registry.example.com/app:1.2.3",
+    "child": "registry.example.com/nested:1.2.3",
+    "override_me": "registry.example.com/new:override-default",
+    "both": "registry.example.com/both:dotenv",
+    "included": "registry.example.com/included:1.2.3",
+}
+for service, image in expected_images.items():
+    docker_image = docker_services[service].get("image")
+    pocker_image = pocker_services[service].get("image")
+    if docker_image != image:
+        raise SystemExit(f"unexpected docker image for {service}: {docker_image}")
+    if pocker_image != image:
+        raise SystemExit(f"unexpected pocker image for {service}: {pocker_image}")
+    if pocker_services[service].get("build_only"):
+        raise SystemExit(f"pocker marked pullable service as build-only: {service}")
+
+for service in ["build_only", "included_build"]:
+    if pocker_services[service].get("image") is not None:
+        raise SystemExit(f"pocker assigned image to build-only service: {service}")
+    if not pocker_services[service].get("build_only"):
+        raise SystemExit(f"pocker did not mark build-only service: {service}")
+
+expected_image_list = list(expected_images.values())
+if pocker_config["images"] != expected_image_list:
+    raise SystemExit(f"unexpected pocker images: {pocker_config['images']}")
+if pocker_config["skipped_build_only"] != ["build_only", "included_build"]:
+    raise SystemExit(
+        f"unexpected pocker build-only services: {pocker_config['skipped_build_only']}"
+    )
+
+labels = docker_services["app"].get("labels", {})
+if "$REGISTRY.key" not in labels and "$$REGISTRY.key" not in labels:
+    raise SystemExit(f"docker unexpectedly interpolated label key: {labels}")
+PY
+
 echo "smoke: multi-platform pull selects linux/arm64 config"
 run_pocker --cache-dir "${WORKDIR}/cache-platform" pull --no-load --platform linux/arm64 "${PUBLIC_REF}"
 python3 - "${WORKDIR}/cache-platform" <<'PY'

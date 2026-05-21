@@ -1,5 +1,7 @@
 use std::collections::HashSet;
 
+use serde::Serialize;
+
 mod env;
 mod interpolate;
 mod project;
@@ -19,15 +21,16 @@ pub enum ComposeError {
     Yaml(#[from] serde_yml::Error),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ComposeImages {
+    pub services: Vec<ComposeServiceImage>,
     pub images: Vec<String>,
     pub skipped_build_only: Vec<String>,
-    pub services: Vec<ComposeServiceImage>,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
 pub struct ComposeServiceImage {
+    #[serde(rename = "name")]
     pub service: String,
     pub image: Option<String>,
     pub build_only: bool,
@@ -227,6 +230,42 @@ services:
     }
 
     #[test]
+    fn nested_interpolation_matches_compose_forms() {
+        let values = HashMap::from([
+            ("TAG".to_string(), "1.2.3".to_string()),
+            ("EMPTY".to_string(), String::new()),
+            ("OTHER".to_string(), "replacement".to_string()),
+            ("ERROR_MESSAGE".to_string(), "must be set".to_string()),
+        ]);
+
+        let interpolated = interpolate(
+            concat!(
+                "nested_default: ${NESTED_TAG:-${TAG:-fallback}}\n",
+                "nested_alternative: ${EMPTY:+${OTHER}}\n",
+                "nested_unset_alternative: ${UNSET+${OTHER}}\n",
+            ),
+            &values,
+        )
+        .expect("compose interpolation should succeed");
+
+        assert_eq!(
+            interpolated,
+            concat!(
+                "nested_default: 1.2.3\n",
+                "nested_alternative: \n",
+                "nested_unset_alternative: \n",
+            )
+        );
+
+        let error = interpolate("${REQUIRED?${ERROR_MESSAGE}}", &values)
+            .expect_err("required nested message should fail");
+        assert!(matches!(
+            error,
+            ComposeError::InvalidInput(message) if message == "compose variable `REQUIRED` is required: must be set"
+        ));
+    }
+
+    #[test]
     fn required_variable_operator_wins_over_dash_in_message() {
         let error = interpolate("${REQUIRED?-must be set}", &HashMap::new())
             .expect_err("required operator should fail when variable is unset");
@@ -278,6 +317,110 @@ services:
         assert_eq!(
             resolved.services[0].image,
             Some("example/app:2.0".to_string())
+        );
+    }
+
+    #[test]
+    fn interpolation_does_not_apply_to_mapping_keys() {
+        let dir = tempdir().expect("tempdir should be created");
+        fs::write(dir.path().join(".env"), "REGISTRY=example.com\nTAG=1.2.3\n")
+            .expect("env should be written");
+        fs::write(
+            dir.path().join("compose.yml"),
+            r#"
+services:
+  app:
+    image: ${REGISTRY}/app:${TAG}
+    labels:
+      "$REGISTRY.key": should_not_interpolate_key
+      interpolated.value: "$REGISTRY/value"
+"#,
+        )
+        .expect("compose should be written");
+
+        let resolved = resolve_images(&[], dir.path()).expect("compose file should resolve");
+
+        assert_eq!(resolved.images, vec!["example.com/app:1.2.3".to_string()]);
+    }
+
+    #[test]
+    fn repeated_compose_files_include_extends_and_build_only_services() {
+        let dir = tempdir().expect("tempdir should be created");
+        fs::create_dir_all(dir.path().join("base")).expect("base dir should be created");
+        fs::create_dir_all(dir.path().join("include")).expect("include dir should be created");
+        fs::write(
+            dir.path().join(".env"),
+            "REGISTRY=registry.example.com\nTAG=1.2.3\nEMPTY=\nFROM_ENV_FILE=dotenv\n",
+        )
+        .expect("env should be written");
+        fs::write(
+            dir.path().join("base/base.yml"),
+            r#"
+services:
+  nested:
+    image: ${REGISTRY}/nested:${NESTED_TAG:-${TAG:-fallback}}
+"#,
+        )
+        .expect("base compose should be written");
+        fs::write(
+            dir.path().join("include/included.yml"),
+            r#"
+services:
+  included:
+    image: ${REGISTRY}/included:${TAG}
+  included_build:
+    build: .
+"#,
+        )
+        .expect("included compose should be written");
+        let base = dir.path().join("compose.yml");
+        let override_file = dir.path().join("compose.override.yml");
+        fs::write(
+            &base,
+            r#"
+include:
+  - path: include/included.yml
+
+services:
+  child:
+    extends:
+      file: base/base.yml
+      service: nested
+  override_me:
+    image: ${REGISTRY}/old:${TAG}
+  build_only:
+    build: .
+  both:
+    image: ${REGISTRY}/both:${FROM_ENV_FILE}
+    build: .
+"#,
+        )
+        .expect("root compose should be written");
+        fs::write(
+            &override_file,
+            r#"
+services:
+  override_me:
+    image: ${REGISTRY}/new:${EMPTY:-override-default}
+"#,
+        )
+        .expect("override compose should be written");
+
+        let resolved = resolve_images(&[base, override_file], dir.path())
+            .expect("compose files should resolve");
+
+        assert_eq!(
+            resolved.images,
+            vec![
+                "registry.example.com/nested:1.2.3".to_string(),
+                "registry.example.com/new:override-default".to_string(),
+                "registry.example.com/both:dotenv".to_string(),
+                "registry.example.com/included:1.2.3".to_string(),
+            ]
+        );
+        assert_eq!(
+            resolved.skipped_build_only,
+            vec!["build_only".to_string(), "included_build".to_string()]
         );
     }
 

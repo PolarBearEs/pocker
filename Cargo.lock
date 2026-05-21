@@ -962,6 +962,7 @@ dependencies = [
 name = "pocker-compose"
 version = "0.1.3"
 dependencies = [
+ "serde",
  "serde_yml",
  "tempfile",
  "thiserror",

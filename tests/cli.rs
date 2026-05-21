@@ -54,3 +54,86 @@ fn compose_config_images_lists_unique_images_from_file() {
         .success()
         .stdout("nginx:alpine\n");
 }
+
+#[test]
+fn compose_config_json_prints_resolved_model() {
+    let dir = tempfile::tempdir().expect("tempdir should create");
+    let compose_path = dir.path().join("docker-compose.yml");
+    fs::write(
+        &compose_path,
+        concat!(
+            "services:\n",
+            "  web:\n",
+            "    image: nginx:alpine\n",
+            "  api:\n",
+            "    image: nginx:alpine\n",
+            "  builder:\n",
+            "    build: .\n",
+        ),
+    )
+    .expect("compose file should write");
+
+    let output = pocker()
+        .arg("compose")
+        .arg("-f")
+        .arg(&compose_path)
+        .arg("config")
+        .arg("--format")
+        .arg("json")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let value: serde_json::Value =
+        serde_json::from_slice(&output).expect("config output should be json");
+
+    assert_eq!(value["images"], serde_json::json!(["nginx:alpine"]));
+    assert_eq!(value["skipped_build_only"], serde_json::json!(["builder"]));
+    assert_eq!(
+        value["services"],
+        serde_json::json!([
+            {"name": "web", "image": "nginx:alpine", "build_only": false},
+            {"name": "api", "image": "nginx:alpine", "build_only": false},
+            {"name": "builder", "image": null, "build_only": true},
+        ])
+    );
+}
+
+#[test]
+fn compose_config_pull_plan_requires_explicit_flag() {
+    let dir = tempfile::tempdir().expect("tempdir should create");
+    let compose_path = dir.path().join("docker-compose.yml");
+    fs::write(
+        &compose_path,
+        "services:\n  web:\n    image: nginx:alpine\n",
+    )
+    .expect("compose file should write");
+
+    pocker()
+        .arg("compose")
+        .arg("-f")
+        .arg(&compose_path)
+        .arg("config")
+        .arg("--pull-plan")
+        .assert()
+        .success()
+        .stdout("")
+        .stderr(contains("Compose pull plan:"))
+        .stderr(contains("web"));
+}
+
+#[test]
+fn compose_config_output_modes_conflict() {
+    pocker()
+        .args(["compose", "config", "--images", "--pull-plan"])
+        .assert()
+        .failure()
+        .stderr(contains("cannot be used with"));
+
+    pocker()
+        .args(["compose", "config", "--images", "--format", "json"])
+        .assert()
+        .failure()
+        .stderr(contains("cannot be used with"));
+}

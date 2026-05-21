@@ -115,9 +115,17 @@ printf '%s' "$REGISTRY_PASSWORD" | \
 Inspect images referenced by a Compose project:
 
 ```bash
+pocker compose config --format json
 pocker compose config --images
+pocker compose config --services
+pocker compose config --pull-plan
 pocker compose -f docker-compose.prod.yml config --images api worker
 ```
+
+`pocker compose config --format json` prints pocker's resolved pull model, not
+Docker Compose's full canonical configuration. Build-only services without an
+`image` are listed as skipped because `pocker compose pull` only pulls registry
+images.
 
 Pull Compose service images:
 

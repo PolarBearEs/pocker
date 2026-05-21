@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::env;
 use std::path::{Path, PathBuf};
 
-use serde_yml::Value;
+use serde_yml::{Mapping, Value};
 
 use crate::env::parse_env_file;
 use crate::interpolate::interpolate;
@@ -156,13 +156,13 @@ impl ComposeProject {
                 file.display()
             ))
         })?;
-        let text = interpolate(&text, &self.env)?;
         let value: Value = serde_yml::from_str(&text).map_err(|error| {
             ComposeError::InvalidInput(format!(
                 "failed to parse compose file `{}`: {error}",
                 file.display()
             ))
         })?;
+        let value = interpolate_value(value, &self.env)?;
 
         self.documents.insert(
             file.clone(),
@@ -335,4 +335,27 @@ fn load_compose_env(project_dir: &Path) -> Result<HashMap<String, String>> {
         values.insert(key, value);
     }
     Ok(values)
+}
+
+fn interpolate_value(value: Value, env: &HashMap<String, String>) -> Result<Value> {
+    match value {
+        Value::String(value) => interpolate(&value, env).map(Value::String),
+        Value::Sequence(values) => values
+            .into_iter()
+            .map(|value| interpolate_value(value, env))
+            .collect::<Result<Vec<_>>>()
+            .map(Value::Sequence),
+        Value::Mapping(mapping) => {
+            let mut interpolated = Mapping::new();
+            for (key, value) in mapping {
+                interpolated.insert(key, interpolate_value(value, env)?);
+            }
+            Ok(Value::Mapping(interpolated))
+        }
+        Value::Tagged(tagged) => Ok(Value::Tagged(Box::new(serde_yml::value::TaggedValue {
+            tag: tagged.tag,
+            value: interpolate_value(tagged.value, env)?,
+        }))),
+        value => Ok(value),
+    }
 }

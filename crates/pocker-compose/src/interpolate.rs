@@ -21,20 +21,7 @@ pub(super) fn interpolate(text: &str, values: &HashMap<String, String>) -> Resul
         }
         if next == '{' {
             chars.next();
-            let mut expr = String::new();
-            let mut closed = false;
-            for (_, expr_ch) in chars.by_ref() {
-                if expr_ch == '}' {
-                    closed = true;
-                    break;
-                }
-                expr.push(expr_ch);
-            }
-            if !closed {
-                return Err(ComposeError::InvalidInput(
-                    "unterminated compose variable interpolation".into(),
-                ));
-            }
+            let expr = collect_braced_expression(&mut chars)?;
             output.push_str(&resolve_variable(&expr, values)?);
             continue;
         }
@@ -53,6 +40,35 @@ pub(super) fn interpolate(text: &str, values: &HashMap<String, String>) -> Resul
         output.push_str(&resolve_variable(&expr, values)?);
     }
     Ok(output)
+}
+
+fn collect_braced_expression(
+    chars: &mut std::iter::Peekable<std::str::CharIndices<'_>>,
+) -> Result<String> {
+    let mut expr = String::new();
+    let mut nested_depth = 0usize;
+
+    while let Some((_, ch)) = chars.next() {
+        if ch == '$' && chars.peek().is_some_and(|(_, next)| *next == '{') {
+            chars.next();
+            nested_depth += 1;
+            expr.push_str("${");
+            continue;
+        }
+
+        if ch == '}' {
+            if nested_depth == 0 {
+                return Ok(expr);
+            }
+            nested_depth -= 1;
+        }
+
+        expr.push(ch);
+    }
+
+    Err(ComposeError::InvalidInput(
+        "unterminated compose variable interpolation".into(),
+    ))
 }
 
 fn is_compose_variable_start(ch: char) -> bool {
@@ -83,16 +99,18 @@ fn resolve_variable_with_operator(
     let set = value.is_some();
     let non_empty = value.is_some_and(|value| !value.is_empty());
     match operator {
-        ":-" if !non_empty => Ok(extra.to_string()),
-        "-" if !set => Ok(extra.to_string()),
+        ":-" if !non_empty => interpolate(extra, values),
+        "-" if !set => interpolate(extra, values),
         ":?" if !non_empty => Err(ComposeError::InvalidInput(format!(
-            "compose variable `{name}` is required: {extra}"
+            "compose variable `{name}` is required: {}",
+            interpolate(extra, values)?
         ))),
         "?" if !set => Err(ComposeError::InvalidInput(format!(
-            "compose variable `{name}` is required: {extra}"
+            "compose variable `{name}` is required: {}",
+            interpolate(extra, values)?
         ))),
-        ":+" if non_empty => Ok(extra.to_string()),
-        "+" if set => Ok(extra.to_string()),
+        ":+" if non_empty => interpolate(extra, values),
+        "+" if set => interpolate(extra, values),
         _ => Ok(value.cloned().unwrap_or_default()),
     }
 }
