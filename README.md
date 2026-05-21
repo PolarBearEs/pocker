@@ -44,10 +44,11 @@ Prebuilt release binaries are published for the targets in the support matrix.
 
 ## Usage
 
-Pull an image into Docker:
+Pull one or more images into Docker:
 
 ```bash
 pocker pull alpine:latest
+pocker pull alpine:latest busybox:latest
 ```
 
 Pull a specific platform:
@@ -95,6 +96,12 @@ Increase registry request retries for flaky pre-response failures:
 pocker pull --request-retries 16 ghcr.io/example/app:latest
 ```
 
+Pull more than one image at a time:
+
+```bash
+pocker pull --max-parallel-images 4 alpine:latest busybox:latest
+```
+
 Pull a private image:
 
 ```bash
@@ -120,7 +127,7 @@ pocker compose -f docker-compose.prod.yml pull api worker
 pocker compose pull --cache-from http://cache.example:5000
 ```
 
-Pull more than one Compose image at a time:
+Resolve Compose service images and pull more than one unique image at a time:
 
 ```bash
 pocker compose pull --max-parallel-images 4

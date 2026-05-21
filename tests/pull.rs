@@ -89,6 +89,89 @@ async fn pulls_oci_image_from_fake_registry_into_cache() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pulls_multiple_oci_images_from_fake_registry_into_cache() {
+    let fixture = Arc::new(Fixture::build());
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("fake registry should bind");
+    let address = listener
+        .local_addr()
+        .expect("listener should expose address");
+
+    let server_fixture = Arc::clone(&fixture);
+    let server = tokio::spawn(async move {
+        loop {
+            let (stream, _peer) = match listener.accept().await {
+                Ok(pair) => pair,
+                Err(_) => return,
+            };
+            let request_fixture = Arc::clone(&server_fixture);
+            tokio::spawn(async move {
+                let _ = handle_connection(stream, request_fixture).await;
+            });
+        }
+    });
+
+    let cache_dir = tempfile::tempdir().expect("cache tempdir should create");
+    let first_reference = format!("{address}/library/test:first");
+    let second_reference = format!("{address}/library/test:second");
+
+    let pocker_run = tokio::task::spawn_blocking({
+        let cache = cache_dir.path().to_path_buf();
+        move || {
+            Command::cargo_bin("pocker")
+                .expect("pocker binary should be built")
+                .arg("--cache-dir")
+                .arg(&cache)
+                .args([
+                    "pull",
+                    "--plain-http",
+                    "--no-load",
+                    "--quiet",
+                    "--request-retries",
+                    "0",
+                    "--blob-retries",
+                    "0",
+                ])
+                .arg(&first_reference)
+                .arg(&second_reference)
+                .timeout(Duration::from_secs(30))
+                .assert()
+                .success();
+        }
+    });
+
+    pocker_run.await.expect("pocker subprocess should run");
+    server.abort();
+
+    let manifest_path = cache_dir
+        .path()
+        .join("blobs")
+        .join("sha256")
+        .join(&fixture.manifest_digest);
+    let layer_path = cache_dir
+        .path()
+        .join("blobs")
+        .join("sha256")
+        .join(&fixture.layer_digest);
+    let config_path = cache_dir
+        .path()
+        .join("blobs")
+        .join("sha256")
+        .join(&fixture.config_digest);
+
+    assert!(
+        manifest_path.exists(),
+        "expected manifest blob at {manifest_path:?}"
+    );
+    assert!(
+        config_path.exists(),
+        "expected config blob at {config_path:?}"
+    );
+    assert!(layer_path.exists(), "expected layer blob at {layer_path:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pulls_oci_image_with_sha384_layer_digest_into_cache() {
     pulls_oci_image_with_layer_algorithm_into_cache("sha384").await;
 }

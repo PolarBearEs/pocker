@@ -1,10 +1,13 @@
 pub mod download;
 pub(crate) mod orchestrator;
 
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use futures_util::stream::{FuturesUnordered, StreamExt};
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 use tracing::warn;
 
 use crate::docker;
@@ -26,6 +29,7 @@ pub struct PullContext {
     pub stop: Arc<AtomicBool>,
     pub ui: Arc<Ui>,
     pub blob_retry_limit: Option<u32>,
+    pub blob_locks: Arc<BlobDownloadLocks>,
 }
 
 #[derive(Debug, Clone)]
@@ -46,6 +50,24 @@ pub enum LoadMode {
 #[derive(Clone)]
 pub struct Puller {
     context: PullContext,
+}
+
+#[derive(Default)]
+pub struct BlobDownloadLocks {
+    locks: Mutex<HashMap<String, Arc<AsyncMutex<()>>>>,
+}
+
+impl BlobDownloadLocks {
+    pub async fn lock(&self, digest: &str) -> OwnedMutexGuard<()> {
+        let lock = {
+            let mut locks = self.locks.lock().expect("blob lock state poisoned");
+            locks
+                .entry(digest.to_string())
+                .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+                .clone()
+        };
+        lock.lock_owned().await
+    }
 }
 
 impl Puller {

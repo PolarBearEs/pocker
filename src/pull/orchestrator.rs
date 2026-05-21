@@ -9,12 +9,14 @@ use crate::cli::{ComposePullArgs, PullArgs};
 use crate::error::{DockerPullError, Result};
 use crate::http::build_http_client;
 use crate::platform::Platform;
-use crate::pull::{DEFAULT_BLOB_RETRIES, LoadMode, PullContext, PullOptions, Puller};
+use crate::pull::{
+    BlobDownloadLocks, DEFAULT_BLOB_RETRIES, LoadMode, PullContext, PullOptions, Puller,
+};
 use crate::reference;
 use crate::registry::{DEFAULT_REQUEST_RETRIES, RegistryClient};
 use crate::signal;
 use crate::store::Store;
-use crate::ui::{Ui, UiGroup};
+use crate::ui::UiGroup;
 
 pub(crate) struct PullRequestOptions {
     platform: Option<String>,
@@ -37,13 +39,13 @@ pub(crate) struct PullRequestOptions {
 }
 
 impl PullRequestOptions {
-    pub(crate) fn from_pull_args(args: PullArgs) -> (String, Self) {
+    pub(crate) fn from_pull_args(args: PullArgs) -> (Vec<String>, Self) {
         (
-            args.reference,
+            args.references,
             Self {
                 platform: args.download.platform,
                 concurrency: args.download.concurrency,
-                image_concurrency: 1,
+                image_concurrency: args.image_parallel.image_concurrency,
                 blob_retry_limit: retry_limit(
                     args.retry.blob_retries,
                     args.retry.retry_forever,
@@ -74,7 +76,7 @@ impl PullRequestOptions {
         Self {
             platform: args.download.platform,
             concurrency: args.download.concurrency,
-            image_concurrency: args.compose_parallel.image_concurrency,
+            image_concurrency: args.image_parallel.image_concurrency,
             blob_retry_limit: retry_limit(
                 args.retry.blob_retries,
                 args.retry.retry_forever,
@@ -119,6 +121,7 @@ struct SharedPullState {
     registry: Arc<RegistryClient>,
     stop: Arc<AtomicBool>,
     blob_retry_limit: Option<u32>,
+    blob_locks: Arc<BlobDownloadLocks>,
     options: PullOptions,
     ui_group: UiGroup,
 }
@@ -137,7 +140,6 @@ pub(crate) async fn pull_references(
         .map(Platform::parse)
         .transpose()?
         .unwrap_or_else(Platform::host);
-    let ui = Arc::new(Ui::new(quiet, !request.no_animations));
     let credentials = read_credentials(request.username, request.password_stdin)?;
     let auth = Arc::new(AuthResolver::new(credentials)?);
     let client = Arc::new(RegistryClient::new_with_cache_from(
@@ -165,30 +167,23 @@ pub(crate) async fn pull_references(
         load_mode: request.load_mode,
     };
 
-    if references.len() <= 1 || request.image_concurrency <= 1 {
-        let context = PullContext {
-            store,
-            registry: client,
-            stop,
-            ui,
-            blob_retry_limit: request.blob_retry_limit,
-        };
-        let puller = Puller::new(context);
-        for reference in references {
-            let reference = reference::ImageReference::parse(&reference)?;
-            puller.pull(reference, options.clone()).await?;
-        }
-        return Ok(());
-    }
-
     let state = SharedPullState {
         store,
         registry: client,
         stop,
         blob_retry_limit: request.blob_retry_limit,
+        blob_locks: Arc::new(BlobDownloadLocks::default()),
         options,
-        ui_group: UiGroup::new(quiet, false),
+        ui_group: UiGroup::new(quiet, !request.no_animations),
     };
+
+    if request.image_concurrency <= 1 {
+        for reference in references {
+            pull_reference_with_group(state.clone(), reference).await?;
+        }
+        return Ok(());
+    }
+
     pull_references_parallel(state, references, request.image_concurrency.max(1)).await
 }
 
@@ -217,7 +212,7 @@ async fn pull_references_parallel(
             Err(error) => {
                 queue.abort_all();
                 return Err(DockerPullError::CommandFailed(format!(
-                    "compose pull task failed: {error}"
+                    "pull task failed: {error}"
                 )));
             }
         }
@@ -231,16 +226,19 @@ async fn pull_references_parallel(
 }
 
 fn spawn_pull_task(queue: &mut JoinSet<Result<()>>, state: SharedPullState, reference: String) {
-    queue.spawn(async move {
-        let reference = reference::ImageReference::parse(&reference)?;
-        let label = reference.display_name();
-        let context = PullContext {
-            store: state.store,
-            registry: state.registry,
-            stop: state.stop,
-            ui: Arc::new(state.ui_group.image_ui(label)),
-            blob_retry_limit: state.blob_retry_limit,
-        };
-        Puller::new(context).pull(reference, state.options).await
-    });
+    queue.spawn(async move { pull_reference_with_group(state, reference).await });
+}
+
+async fn pull_reference_with_group(state: SharedPullState, reference: String) -> Result<()> {
+    let reference = reference::ImageReference::parse(&reference)?;
+    let label = reference.display_name();
+    let context = PullContext {
+        store: state.store,
+        registry: state.registry,
+        stop: state.stop,
+        ui: Arc::new(state.ui_group.image_ui(label)),
+        blob_retry_limit: state.blob_retry_limit,
+        blob_locks: state.blob_locks,
+    };
+    Puller::new(context).pull(reference, state.options).await
 }
