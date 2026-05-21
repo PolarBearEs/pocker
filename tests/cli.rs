@@ -92,8 +92,14 @@ fn compose_config_json_prints_resolved_model() {
             "services:\n",
             "  web:\n",
             "    image: nginx:alpine\n",
+            "    labels:\n",
+            "      app.example/name: web\n",
+            "      enabled: true\n",
             "  api:\n",
             "    image: nginx:alpine\n",
+            "    labels:\n",
+            "      - role=api\n",
+            "      - flag-only\n",
             "  builder:\n",
             "    build: .\n",
         ),
@@ -120,8 +126,18 @@ fn compose_config_json_prints_resolved_model() {
     assert_eq!(
         value["services"],
         serde_json::json!([
-            {"name": "web", "image": "nginx:alpine", "build_only": false},
-            {"name": "api", "image": "nginx:alpine", "build_only": false},
+            {
+                "name": "web",
+                "image": "nginx:alpine",
+                "build_only": false,
+                "labels": {"app.example/name": "web", "enabled": "true"},
+            },
+            {
+                "name": "api",
+                "image": "nginx:alpine",
+                "build_only": false,
+                "labels": {"role": "api", "flag-only": null},
+            },
             {"name": "builder", "image": null, "build_only": true},
         ])
     );

@@ -257,6 +257,11 @@ if pocker_config["skipped_build_only"] != ["build_only", "included_build"]:
 labels = docker_services["app"].get("labels", {})
 if "$REGISTRY.key" not in labels and "$$REGISTRY.key" not in labels:
     raise SystemExit(f"docker unexpectedly interpolated label key: {labels}")
+pocker_labels = pocker_services["app"].get("labels", {})
+if pocker_labels.get("$REGISTRY.key") != "should_not_interpolate_key":
+    raise SystemExit(f"pocker unexpectedly interpolated label key: {pocker_labels}")
+if pocker_labels.get("interpolated.value") != "registry.example.com/value":
+    raise SystemExit(f"pocker did not interpolate label value: {pocker_labels}")
 PY
 
 echo "smoke: multi-platform pull selects linux/arm64 config"

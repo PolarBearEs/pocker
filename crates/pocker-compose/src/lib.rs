@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use serde::Serialize;
 
@@ -34,6 +34,8 @@ pub struct ComposeServiceImage {
     pub service: String,
     pub image: Option<String>,
     pub build_only: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub labels: Option<BTreeMap<String, Option<String>>>,
 }
 
 pub fn unique_images(images: &[String]) -> Vec<String> {

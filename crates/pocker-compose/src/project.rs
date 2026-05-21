@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::path::{Path, PathBuf};
 
@@ -119,12 +119,14 @@ pub fn resolve_images(files: &[PathBuf], working_dir: &Path) -> Result<ComposeIm
             name: service.name.clone(),
         };
         let resolved = project.resolve_service(&key, &mut Vec::new())?;
+        let labels = service_labels(&resolved);
         if let Some(image) = mapping_get_string(value_mapping(&resolved), "image") {
             images.push(image.clone());
             service_images.push(ComposeServiceImage {
                 service: service.name,
                 image: Some(image),
                 build_only: false,
+                labels,
             });
         } else if mapping_has_key(value_mapping(&resolved), "build") {
             skipped_build_only.push(service.name.clone());
@@ -132,6 +134,7 @@ pub fn resolve_images(files: &[PathBuf], working_dir: &Path) -> Result<ComposeIm
                 service: service.name,
                 image: None,
                 build_only: true,
+                labels,
             });
         }
     }
@@ -337,6 +340,40 @@ fn load_compose_env(project_dir: &Path) -> Result<HashMap<String, String>> {
     Ok(values)
 }
 
+fn service_labels(service: &Value) -> Option<BTreeMap<String, Option<String>>> {
+    let labels = mapping_get(value_mapping(service), "labels")?;
+    let labels = match labels {
+        Value::Mapping(mapping) => mapping
+            .iter()
+            .filter_map(|(key, value)| {
+                let key = key.as_str()?.to_string();
+                let value = match value {
+                    Value::Null => None,
+                    Value::String(value) => Some(value.clone()),
+                    Value::Bool(value) => Some(value.to_string()),
+                    Value::Number(value) => Some(value.to_string()),
+                    _ => return None,
+                };
+                Some((key, value))
+            })
+            .collect::<BTreeMap<_, _>>(),
+        Value::Sequence(items) => items
+            .iter()
+            .filter_map(|item| {
+                let item = item.as_str()?;
+                let (key, value) = item
+                    .split_once('=')
+                    .map(|(key, value)| (key, Some(value.to_string())))
+                    .unwrap_or((item, None));
+                Some((key.to_string(), value))
+            })
+            .collect::<BTreeMap<_, _>>(),
+        _ => BTreeMap::new(),
+    };
+
+    (!labels.is_empty()).then_some(labels)
+}
+
 fn interpolate_value(value: Value, env: &HashMap<String, String>) -> Result<Value> {
     match value {
         Value::String(value) => interpolate(&value, env).map(Value::String),
@@ -366,7 +403,7 @@ mod tests {
 
     use serde_yml::Value;
 
-    use super::interpolate_value;
+    use super::{interpolate_value, service_labels};
     use crate::yaml::{mapping_get, value_mapping};
 
     #[test]
@@ -409,5 +446,46 @@ services:
             mapping_get(labels, "example.com.key").is_none(),
             "mapping keys must not be interpolated"
         );
+    }
+
+    #[test]
+    fn service_labels_supports_mapping_and_sequence_forms() {
+        let mapping_service = serde_yml::from_str::<Value>(
+            r#"
+image: app
+labels:
+  app.example/name: web
+  enabled: true
+  priority: 3
+  empty:
+"#,
+        )
+        .expect("mapping labels should parse");
+        let mapping_labels = service_labels(&mapping_service).expect("labels should resolve");
+
+        assert_eq!(
+            mapping_labels.get("app.example/name"),
+            Some(&Some("web".to_string()))
+        );
+        assert_eq!(
+            mapping_labels.get("enabled"),
+            Some(&Some("true".to_string()))
+        );
+        assert_eq!(mapping_labels.get("priority"), Some(&Some("3".to_string())));
+        assert_eq!(mapping_labels.get("empty"), Some(&None));
+
+        let sequence_service = serde_yml::from_str::<Value>(
+            r#"
+image: app
+labels:
+  - role=api
+  - flag-only
+"#,
+        )
+        .expect("sequence labels should parse");
+        let sequence_labels = service_labels(&sequence_service).expect("labels should resolve");
+
+        assert_eq!(sequence_labels.get("role"), Some(&Some("api".to_string())));
+        assert_eq!(sequence_labels.get("flag-only"), Some(&None));
     }
 }
