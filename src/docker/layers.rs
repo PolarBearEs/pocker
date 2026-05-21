@@ -110,7 +110,7 @@ fn spawn_inspect_task(
     index: usize,
     id: String,
 ) {
-    queue.spawn(async move { Ok((index, daemon.inspect_image(&id).await?)) });
+    queue.spawn(async move { Ok((index, daemon.inspect_daemon_image(&id).await?)) });
 }
 
 pub(super) fn ordered_unique_image_ids(summaries: Vec<DaemonImageSummary>) -> Vec<String> {

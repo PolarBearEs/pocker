@@ -37,14 +37,14 @@ impl DockerDaemon {
         self.transport.load_archive_stream(stream).await
     }
 
-    pub(super) async fn inspect_image(&self, image: &str) -> Result<Option<DaemonImage>> {
+    pub(super) async fn inspect_daemon_image(&self, image: &str) -> Result<Option<DaemonImage>> {
         self.inspect_image_bytes(image)
             .await?
             .map(|bytes| serde_json::from_slice(&bytes).map_err(Into::into))
             .transpose()
     }
 
-    pub(super) async fn inspect_image_value(&self, image: &str) -> Result<Option<Value>> {
+    pub(super) async fn inspect_image_json(&self, image: &str) -> Result<Option<Value>> {
         self.inspect_image_bytes(image)
             .await?
             .map(|bytes| serde_json::from_slice(&bytes).map_err(Into::into))

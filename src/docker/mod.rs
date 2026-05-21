@@ -99,7 +99,7 @@ fn write_archive_to_stream(
 pub async fn daemon_has_reference(reference: &ImageReference, config_digest: &str) -> Result<bool> {
     let inspect_target = daemon_inspect_target(reference, config_digest);
     let daemon = DockerDaemon::connect()?;
-    let Some(image) = daemon.inspect_image(&inspect_target).await? else {
+    let Some(image) = daemon.inspect_daemon_image(&inspect_target).await? else {
         return Ok(false);
     };
 
@@ -134,9 +134,7 @@ pub async fn remove_image_tag(reference: &str) -> Result<()> {
 }
 
 pub async fn inspect_image(reference: &str) -> Result<Option<Value>> {
-    DockerDaemon::connect()?
-        .inspect_image_value(reference)
-        .await
+    DockerDaemon::connect()?.inspect_image_json(reference).await
 }
 
 pub async fn list_images() -> Result<Vec<ImageSummary>> {
