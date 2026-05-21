@@ -168,6 +168,38 @@ services:
     }
 
     #[test]
+    fn resolves_default_override_file_when_no_files_are_given() {
+        let dir = tempdir().expect("tempdir should be created");
+        fs::write(
+            dir.path().join("docker-compose.yml"),
+            r#"
+services:
+  app:
+    image: example/app:base
+  worker:
+    image: example/worker:base
+"#,
+        )
+        .expect("base compose should be written");
+        fs::write(
+            dir.path().join("docker-compose.override.yml"),
+            r#"
+services:
+  app:
+    image: example/app:override
+"#,
+        )
+        .expect("override compose should be written");
+
+        let resolved = resolve_images(&[], dir.path()).expect("images should resolve");
+
+        assert_eq!(
+            resolved.images,
+            vec!["example/app:override", "example/worker:base"]
+        );
+    }
+
+    #[test]
     fn deduplicates_images_in_first_seen_order() {
         let images = unique_images(&[
             "alpine:latest".into(),

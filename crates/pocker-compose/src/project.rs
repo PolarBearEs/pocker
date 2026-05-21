@@ -18,6 +18,12 @@ const DEFAULT_COMPOSE_FILES: [&str; 4] = [
     "docker-compose.yaml",
     "docker-compose.yml",
 ];
+const DEFAULT_COMPOSE_OVERRIDE_FILES: [&str; 4] = [
+    "compose.override.yaml",
+    "compose.override.yml",
+    "docker-compose.override.yaml",
+    "docker-compose.override.yml",
+];
 
 #[derive(Debug)]
 struct ComposeProject {
@@ -42,7 +48,7 @@ struct ServiceKey {
 
 pub fn resolve_images(files: &[PathBuf], working_dir: &Path) -> Result<ComposeImages> {
     let entry_files = if files.is_empty() {
-        vec![find_default_compose_file(working_dir)?]
+        find_default_compose_files(working_dir)?
     } else {
         files
             .iter()
@@ -295,6 +301,18 @@ impl NormalizeOptionPath for Option<PathBuf> {
     fn transpose_normalize(self) -> Result<Option<PathBuf>> {
         self.map(|path| normalize_path(&path)).transpose()
     }
+}
+
+fn find_default_compose_files(working_dir: &Path) -> Result<Vec<PathBuf>> {
+    let base_file = find_default_compose_file(working_dir)?;
+    let mut files = vec![base_file];
+    for name in DEFAULT_COMPOSE_OVERRIDE_FILES {
+        let candidate = working_dir.join(name);
+        if candidate.is_file() {
+            files.push(normalize_path(&candidate)?);
+        }
+    }
+    Ok(files)
 }
 
 fn find_default_compose_file(working_dir: &Path) -> Result<PathBuf> {
