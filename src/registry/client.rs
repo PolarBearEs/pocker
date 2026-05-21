@@ -302,6 +302,12 @@ impl RegistryClient {
         if response.status() == StatusCode::NOT_FOUND {
             return Err(DockerPullError::BlobNotFound(digest.to_string()));
         }
+        if !response.status().is_success() {
+            return Err(DockerPullError::BadResponse(format!(
+                "registry returned {} for blob {digest}",
+                response.status()
+            )));
+        }
         Ok(response.bytes().await?.to_vec())
     }
 
@@ -1084,6 +1090,36 @@ mod tests {
             )
             .await
             .expect_err("non-success HEAD responses should fail");
+
+        assert!(matches!(error, DockerPullError::BadResponse(message) if message.contains("403")));
+    }
+
+    #[tokio::test]
+    async fn get_blob_bytes_rejects_non_success_status() {
+        let registry = spawn_single_response(
+            b"HTTP/1.1 403 Forbidden\r\nContent-Length: 9\r\nConnection: close\r\n\r\nforbidden"
+                .to_vec(),
+        )
+        .await;
+        let client = RegistryClient::new(
+            reqwest::Client::builder()
+                .https_only(false)
+                .build()
+                .expect("client should build"),
+            Arc::new(AuthResolver::new(None).expect("auth resolver should build")),
+            true,
+            Some(DEFAULT_REQUEST_RETRIES),
+        );
+        let reference =
+            ImageReference::parse(&format!("{registry}/sample:latest")).expect("reference parse");
+
+        let error = client
+            .get_blob_bytes(
+                &reference,
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )
+            .await
+            .expect_err("non-success blob byte responses should fail");
 
         assert!(matches!(error, DockerPullError::BadResponse(message) if message.contains("403")));
     }
