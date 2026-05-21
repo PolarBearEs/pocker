@@ -11,6 +11,7 @@ use tracing::{debug, warn};
 use url::Url;
 
 use crate::auth::{AuthResolver, Credentials};
+use crate::digest::canonical_digest_bytes;
 use crate::error::{DockerPullError, Result};
 use crate::platform::Platform;
 use crate::reference::ImageReference;
@@ -852,11 +853,7 @@ fn response_content_media_type(response: &Response) -> String {
 }
 
 fn digest_bytes(bytes: &[u8]) -> String {
-    use sha2::{Digest as _, Sha256};
-
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    format!("sha256:{}", hex::encode(hasher.finalize()))
+    canonical_digest_bytes(bytes)
 }
 
 fn retry_limit_exceeded(

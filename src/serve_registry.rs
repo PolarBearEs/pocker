@@ -328,7 +328,7 @@ async fn fetch_manifest(
     reference: &ImageReference,
     requested_reference: &str,
 ) -> Result<Descriptor> {
-    let raw = if requested_reference.starts_with("sha256:") {
+    let raw = if is_supported_digest_reference(requested_reference) {
         state
             .registry
             .get_manifest_digest_raw(reference, requested_reference, Some(MANIFEST_ACCEPT))
@@ -419,7 +419,7 @@ async fn serve_manifest_blob(
 
 fn upstream_reference(repository: &str, reference: &str) -> Result<ImageReference> {
     let (registry, upstream_repository) = decode_cache_repository(repository)?;
-    let separator = if reference.starts_with("sha256:") {
+    let separator = if is_supported_digest_reference(reference) {
         '@'
     } else {
         ':'
@@ -427,6 +427,13 @@ fn upstream_reference(repository: &str, reference: &str) -> Result<ImageReferenc
     ImageReference::parse(&format!(
         "{registry}/{upstream_repository}{separator}{reference}"
     ))
+}
+
+fn is_supported_digest_reference(reference: &str) -> bool {
+    matches!(
+        reference.split_once(':'),
+        Some(("sha256" | "sha384" | "sha512", value)) if !value.is_empty()
+    )
 }
 
 fn split_route<'a>(path: &'a str, separator: &str) -> Option<(&'a str, &'a str)> {
@@ -637,7 +644,7 @@ mod tests {
     use tokio::net::TcpListener;
     use tokio::sync::Semaphore;
 
-    use super::{ServeState, parse_byte_range, run_server};
+    use super::{ServeState, is_supported_digest_reference, parse_byte_range, run_server};
     use crate::auth::AuthResolver;
     use crate::platform::Platform;
     use crate::pull::{PullContext, PullOptions, Puller};
@@ -784,6 +791,24 @@ mod tests {
         assert!(parse_byte_range("bytes=7-4", 10).is_none());
         assert!(parse_byte_range("bytes=4-99", 10).is_none());
         assert!(parse_byte_range("bytes=-4", 10).is_none());
+    }
+
+    #[test]
+    fn supported_digest_reference_accepts_sha512() {
+        assert!(is_supported_digest_reference(&format!(
+            "sha512:{}",
+            "a".repeat(128)
+        )));
+        assert!(is_supported_digest_reference(&format!(
+            "sha256:{}",
+            "A".repeat(64)
+        )));
+        assert!(is_supported_digest_reference("sha384:abc"));
+        assert!(!is_supported_digest_reference(&format!(
+            "sha224:{}",
+            "a".repeat(56)
+        )));
+        assert!(!is_supported_digest_reference("sha512:"));
     }
 
     #[tokio::test]

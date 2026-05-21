@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use assert_cmd::Command;
 use predicates::str::contains;
-use sha2::{Digest, Sha256};
+use sha2::{Digest, Sha256, Sha384, Sha512};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -89,6 +89,78 @@ async fn pulls_oci_image_from_fake_registry_into_cache() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pulls_oci_image_with_sha384_layer_digest_into_cache() {
+    pulls_oci_image_with_layer_algorithm_into_cache("sha384").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pulls_oci_image_with_sha512_layer_digest_into_cache() {
+    pulls_oci_image_with_layer_algorithm_into_cache("sha512").await;
+}
+
+async fn pulls_oci_image_with_layer_algorithm_into_cache(algorithm: &'static str) {
+    let fixture = Arc::new(Fixture::build_with_layer_algorithm(algorithm));
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("fake registry should bind");
+    let address = listener
+        .local_addr()
+        .expect("listener should expose address");
+
+    let server_fixture = Arc::clone(&fixture);
+    let server = tokio::spawn(async move {
+        loop {
+            let (stream, _peer) = match listener.accept().await {
+                Ok(pair) => pair,
+                Err(_) => return,
+            };
+            let request_fixture = Arc::clone(&server_fixture);
+            tokio::spawn(async move {
+                let _ = handle_connection(stream, request_fixture).await;
+            });
+        }
+    });
+
+    let cache_dir = tempfile::tempdir().expect("cache tempdir should create");
+    let reference = format!("{address}/library/test:latest");
+
+    let pocker_run = tokio::task::spawn_blocking({
+        let cache = cache_dir.path().to_path_buf();
+        move || {
+            Command::cargo_bin("pocker")
+                .expect("pocker binary should be built")
+                .arg("--cache-dir")
+                .arg(&cache)
+                .args([
+                    "pull",
+                    "--plain-http",
+                    "--no-load",
+                    "--quiet",
+                    "--request-retries",
+                    "0",
+                    "--blob-retries",
+                    "0",
+                ])
+                .arg(&reference)
+                .timeout(Duration::from_secs(30))
+                .assert()
+                .success();
+        }
+    });
+
+    pocker_run.await.expect("pocker subprocess should run");
+    server.abort();
+
+    let layer_path = cache_dir
+        .path()
+        .join("blobs")
+        .join(algorithm)
+        .join(&fixture.layer_digest);
+
+    assert!(layer_path.exists(), "expected layer blob at {layer_path:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pull_rejects_malformed_layer_digest_before_cache_path_use() {
     let fixture = Arc::new(Fixture::build_with_layer_digest(
         "sha256:../../outside".to_string(),
@@ -162,16 +234,29 @@ struct Fixture {
 
 impl Fixture {
     fn build() -> Self {
+        Self::build_with_layer_algorithm("sha256")
+    }
+
+    fn build_with_layer_algorithm(algorithm: &str) -> Self {
         let layer_bytes = b"fake layer payload".to_vec();
-        let layer_digest = sha256_hex(&layer_bytes);
-        Self::build_with_layer_digest(format!("sha256:{layer_digest}"))
+        let layer_digest = match algorithm {
+            "sha256" => sha256_hex(&layer_bytes),
+            "sha384" => sha384_hex(&layer_bytes),
+            "sha512" => sha512_hex(&layer_bytes),
+            other => panic!("unsupported test digest algorithm {other}"),
+        };
+        Self::build_with_layer_digest(format!("{algorithm}:{layer_digest}"))
     }
 
     fn build_with_layer_digest(layer_descriptor_digest: String) -> Self {
         let layer_bytes = b"fake layer payload".to_vec();
-        let layer_digest = sha256_hex(&layer_bytes);
+        let layer_diff_id = sha256_hex(&layer_bytes);
+        let layer_digest = layer_descriptor_digest
+            .split_once(':')
+            .map(|(_, value)| value.to_string())
+            .unwrap_or_else(|| layer_descriptor_digest.clone());
         let config_bytes = format!(
-            r#"{{"architecture":"amd64","os":"linux","rootfs":{{"type":"layers","diff_ids":["sha256:{layer_digest}"]}}}}"#
+            r#"{{"architecture":"amd64","os":"linux","rootfs":{{"type":"layers","diff_ids":["sha256:{layer_diff_id}"]}}}}"#
         )
         .into_bytes();
         let config_digest = sha256_hex(&config_bytes);
@@ -197,6 +282,18 @@ impl Fixture {
 
 fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hex::encode(hasher.finalize())
+}
+
+fn sha384_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha384::new();
+    hasher.update(bytes);
+    hex::encode(hasher.finalize())
+}
+
+fn sha512_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha512::new();
     hasher.update(bytes);
     hex::encode(hasher.finalize())
 }
