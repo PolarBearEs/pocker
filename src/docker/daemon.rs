@@ -38,26 +38,20 @@ impl DockerDaemon {
     }
 
     pub(super) async fn inspect_image(&self, image: &str) -> Result<Option<DaemonImage>> {
-        let response = self
-            .transport
-            .request_bytes(
-                "GET",
-                &format!("/images/{}/json", encode_path_segment(image)),
-                None,
-            )
-            .await?;
-        if response.status == StatusCode::NOT_FOUND {
-            return Ok(None);
-        }
-        ensure_success_status(
-            response.status,
-            response.body.clone(),
-            "docker image inspect",
-        )?;
-        Ok(Some(serde_json::from_slice(&response.body)?))
+        self.inspect_image_bytes(image)
+            .await?
+            .map(|bytes| serde_json::from_slice(&bytes).map_err(Into::into))
+            .transpose()
     }
 
     pub(super) async fn inspect_image_value(&self, image: &str) -> Result<Option<Value>> {
+        self.inspect_image_bytes(image)
+            .await?
+            .map(|bytes| serde_json::from_slice(&bytes).map_err(Into::into))
+            .transpose()
+    }
+
+    async fn inspect_image_bytes(&self, image: &str) -> Result<Option<Vec<u8>>> {
         let response = self
             .transport
             .request_bytes(
@@ -74,7 +68,7 @@ impl DockerDaemon {
             response.body.clone(),
             "docker image inspect",
         )?;
-        Ok(Some(serde_json::from_slice(&response.body)?))
+        Ok(Some(response.body))
     }
 
     pub(super) async fn list_image_summaries(&self) -> Result<Vec<DaemonImageSummary>> {
