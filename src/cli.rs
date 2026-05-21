@@ -74,10 +74,36 @@ pub enum ComposeCommands {
 pub struct ComposeConfigArgs {
     #[arg(value_name = "SERVICE", help = "Compose service to include")]
     pub services: Vec<String>,
-    #[arg(long, help = "Print resolved service image references")]
+    #[arg(
+        long,
+        conflicts_with_all = ["services_only", "pull_plan", "format"],
+        help = "Print resolved service image references"
+    )]
     pub images: bool,
-    #[arg(long = "services", help = "Print resolved service names")]
+    #[arg(
+        long = "services",
+        conflicts_with_all = ["images", "pull_plan", "format"],
+        help = "Print resolved service names"
+    )]
     pub services_only: bool,
+    #[arg(
+        long,
+        conflicts_with_all = ["images", "services_only", "format"],
+        help = "Print the Compose pull plan"
+    )]
+    pub pull_plan: bool,
+    #[arg(
+        long,
+        value_enum,
+        conflicts_with_all = ["images", "services_only", "pull_plan"],
+        help = "Print pocker's resolved Compose pull model in the selected format"
+    )]
+    pub format: Option<ComposeConfigFormat>,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, ValueEnum)]
+pub enum ComposeConfigFormat {
+    Json,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -447,7 +473,9 @@ fn platform_help() -> String {
 mod tests {
     use clap::{CommandFactory, Parser};
 
-    use super::{CacheCommands, Cli, Commands, ComposeCommands, LoadMode, platform_help};
+    use super::{
+        CacheCommands, Cli, Commands, ComposeCommands, ComposeConfigFormat, LoadMode, platform_help,
+    };
 
     #[test]
     fn pull_accepts_no_animations_flag() {
@@ -810,6 +838,41 @@ mod tests {
 
         assert!(config.images);
         assert_eq!(config.services, vec!["app"]);
+    }
+
+    #[test]
+    fn compose_config_accepts_json_format() {
+        let cli = Cli::parse_from([
+            "pocker",
+            "compose",
+            "-f",
+            "compose.yml",
+            "config",
+            "--format",
+            "json",
+        ]);
+        let Commands::Compose(args) = cli.command else {
+            panic!("expected compose command");
+        };
+        let ComposeCommands::Config(config) = args.command else {
+            panic!("expected compose config command");
+        };
+
+        assert_eq!(config.format, Some(ComposeConfigFormat::Json));
+    }
+
+    #[test]
+    fn compose_config_rejects_conflicting_output_modes() {
+        for args in [
+            ["pocker", "compose", "config", "--images", "--pull-plan"].as_slice(),
+            [
+                "pocker", "compose", "config", "--images", "--format", "json",
+            ]
+            .as_slice(),
+        ] {
+            let error = Cli::try_parse_from(args).expect_err("output modes should conflict");
+            assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+        }
     }
 
     #[test]

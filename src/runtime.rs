@@ -5,7 +5,9 @@ use pocker_compose as compose;
 use tracing_subscriber::EnvFilter;
 
 use crate::auth::{AuthResolver, read_credentials};
-use crate::cli::{CacheCommands, Cli, Commands, ComposeCommands, ImageCommands};
+use crate::cli::{
+    CacheCommands, Cli, Commands, ComposeCommands, ComposeConfigFormat, ImageCommands,
+};
 use crate::error::Result;
 use crate::http::build_http_client;
 use crate::image_view::{format_size, print_image_inspect, print_image_list};
@@ -28,7 +30,13 @@ pub async fn run() -> Result<()> {
             ComposeCommands::Config(config_args) => {
                 let resolved = compose::resolve_images(&args.file, &std::env::current_dir()?)?;
                 let resolved = compose::select_services(&resolved, &config_args.services)?;
-                print_compose_config(&resolved, config_args.images, config_args.services_only);
+                print_compose_config(
+                    &resolved,
+                    config_args.images,
+                    config_args.services_only,
+                    config_args.pull_plan,
+                    config_args.format,
+                )?;
             }
             ComposeCommands::Pull(pull_args) => {
                 let resolved = compose::resolve_images(&args.file, &std::env::current_dir()?)?;
@@ -112,22 +120,44 @@ pub async fn run() -> Result<()> {
     Ok(())
 }
 
-fn print_compose_config(resolved: &compose::ComposeImages, images: bool, services_only: bool) {
+fn print_compose_config(
+    resolved: &compose::ComposeImages,
+    images: bool,
+    services_only: bool,
+    pull_plan: bool,
+    format: Option<ComposeConfigFormat>,
+) -> Result<()> {
     if images {
         for image in &compose::unique_images(&resolved.images) {
             println!("{image}");
         }
-        return;
+        return Ok(());
     }
 
     if services_only {
         for service in &resolved.services {
             println!("{}", service.service);
         }
-        return;
+        return Ok(());
     }
 
-    print_compose_pull_plan(resolved, false);
+    if pull_plan {
+        print_compose_pull_plan(resolved, false);
+        return Ok(());
+    }
+
+    match format.unwrap_or(ComposeConfigFormat::Json) {
+        ComposeConfigFormat::Json => print_compose_config_json(resolved)?,
+    }
+    Ok(())
+}
+
+fn print_compose_config_json(resolved: &compose::ComposeImages) -> Result<()> {
+    let mut resolved = resolved.clone();
+    resolved.images = compose::unique_images(&resolved.images);
+    serde_json::to_writer_pretty(std::io::stdout(), &resolved)?;
+    println!();
+    Ok(())
 }
 
 fn print_compose_pull_plan(resolved: &compose::ComposeImages, quiet: bool) {
