@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use reqwest::header::RANGE;
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Semaphore, oneshot};
 use tracing::warn;
@@ -16,6 +16,8 @@ use crate::reference::ImageReference;
 use crate::registry::{Descriptor, MANIFEST_ACCEPT, RegistryClient, decode_cache_repository};
 use crate::store::{Store, StoredReference};
 use crate::ui::Ui;
+
+use super::response::{RegistryResponse, write_response};
 
 const DEFAULT_MANIFEST_CONTENT_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";
 const BLOB_CONTENT_TYPE: &str = "application/octet-stream";
@@ -453,151 +455,6 @@ fn manifest_config_digest(bytes: &[u8]) -> Option<String> {
         .map(ToString::to_string)
 }
 
-enum RegistryBody {
-    Empty,
-    Text(Vec<u8>),
-    File(PathBuf),
-}
-
-struct RegistryResponse {
-    status: u16,
-    reason: &'static str,
-    content_type: String,
-    body: RegistryBody,
-    content_length: u64,
-    digest: Option<String>,
-    range: Option<ResponseRange>,
-}
-
-#[derive(Clone, Copy)]
-struct ResponseRange {
-    start: u64,
-    end: u64,
-    total: u64,
-}
-
-impl RegistryResponse {
-    fn empty(status: u16, reason: &'static str) -> Self {
-        Self {
-            status,
-            reason,
-            content_type: "text/plain".to_string(),
-            body: RegistryBody::Empty,
-            content_length: 0,
-            digest: None,
-            range: None,
-        }
-    }
-
-    fn text(status: u16, reason: &'static str, text: String) -> Self {
-        Self {
-            status,
-            reason,
-            content_type: "text/plain".to_string(),
-            content_length: text.len() as u64,
-            body: RegistryBody::Text(text.into_bytes()),
-            digest: None,
-            range: None,
-        }
-    }
-
-    fn file(
-        status: u16,
-        reason: &'static str,
-        content_type: String,
-        path: PathBuf,
-        content_length: u64,
-        headers_only: bool,
-    ) -> Self {
-        Self {
-            status,
-            reason,
-            content_type,
-            content_length,
-            body: if headers_only {
-                RegistryBody::Empty
-            } else {
-                RegistryBody::File(path)
-            },
-            digest: None,
-            range: None,
-        }
-    }
-
-    fn with_digest(mut self, digest: &str) -> Self {
-        self.digest = Some(digest.to_string());
-        self
-    }
-
-    fn with_range(mut self, range: Option<&str>) -> Self {
-        let Some(range) = range else {
-            return self;
-        };
-        let Some(range) = parse_byte_range(range, self.content_length) else {
-            return RegistryResponse::empty(416, "Range Not Satisfiable");
-        };
-        self.status = 206;
-        self.reason = "Partial Content";
-        self.content_length = range.end - range.start + 1;
-        self.range = Some(range);
-        self
-    }
-}
-
-fn parse_byte_range(value: &str, total: u64) -> Option<ResponseRange> {
-    let value = value.strip_prefix("bytes=")?;
-    let (start, end) = value.split_once('-')?;
-    if start.is_empty() {
-        return None;
-    }
-    let start = start.parse::<u64>().ok()?;
-    let end = if end.is_empty() {
-        total.checked_sub(1)?
-    } else {
-        end.parse::<u64>().ok()?
-    };
-    if start > end || end >= total {
-        return None;
-    }
-    Some(ResponseRange { start, end, total })
-}
-
-async fn write_response(stream: &mut TcpStream, response: RegistryResponse) -> Result<()> {
-    let mut headers = format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n",
-        response.status, response.reason, response.content_type, response.content_length
-    );
-    headers.push_str("Docker-Distribution-API-Version: registry/2.0\r\n");
-    if let Some(digest) = &response.digest {
-        headers.push_str(&format!("Docker-Content-Digest: {digest}\r\n"));
-    }
-    if let Some(range) = response.range {
-        headers.push_str(&format!(
-            "Content-Range: bytes {}-{}/{}\r\n",
-            range.start, range.end, range.total
-        ));
-    }
-    headers.push_str("\r\n");
-    stream.write_all(headers.as_bytes()).await?;
-    match response.body {
-        RegistryBody::Empty => {}
-        RegistryBody::Text(bytes) => stream.write_all(&bytes).await?,
-        RegistryBody::File(path) => {
-            let mut file = tokio::fs::File::open(path).await?;
-            if let Some(range) = response.range {
-                file.seek(std::io::SeekFrom::Start(range.start)).await?;
-                let mut take = file.take(response.content_length);
-                tokio::io::copy(&mut take, stream).await?;
-            } else {
-                tokio::io::copy(&mut file, stream).await?;
-            }
-        }
-    }
-    stream.flush().await?;
-    stream.shutdown().await?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -609,12 +466,13 @@ mod tests {
     use tokio::net::TcpListener;
     use tokio::sync::Semaphore;
 
-    use super::{ServeState, is_supported_digest_reference, parse_byte_range, run_server};
+    use super::{ServeState, is_supported_digest_reference, run_server};
     use crate::auth::AuthResolver;
     use crate::platform::Platform;
     use crate::pull::{BlobDownloadLocks, PullContext, PullOptions, Puller};
     use crate::reference::ImageReference;
     use crate::registry::{Descriptor, RegistryClient, cache_repository};
+    use crate::serve_registry::response::parse_byte_range;
     use crate::store::{Store, StoredReference};
     use crate::ui::Ui;
 
