@@ -21,14 +21,8 @@ pub async fn run() -> Result<()> {
 
     match cli.command {
         Commands::Pull(args) => {
-            let (reference, request) = PullRequestOptions::from_pull_args(args);
-            pull_references(
-                &cli.global.cache_dir,
-                cli.global.quiet,
-                vec![reference],
-                request,
-            )
-            .await?;
+            let (references, request) = PullRequestOptions::from_pull_args(args);
+            pull_references(&cli.global.cache_dir, cli.global.quiet, references, request).await?;
         }
         Commands::Compose(args) => match args.command {
             ComposeCommands::Config(config_args) => {

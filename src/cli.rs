@@ -32,7 +32,7 @@ pub struct GlobalArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum Commands {
-    #[command(about = "Pull an OCI image directly from a registry")]
+    #[command(about = "Pull OCI images directly from registries")]
     Pull(PullArgs),
     #[command(about = "Serve the local cache as an OCI registry")]
     Serve(ServeArgs),
@@ -87,7 +87,7 @@ pub struct ComposePullArgs {
     #[command(flatten)]
     pub download: PullDownloadArgs,
     #[command(flatten)]
-    pub compose_parallel: ComposeParallelArgs,
+    pub image_parallel: ImageParallelArgs,
     #[command(flatten)]
     pub retry: RetryArgs,
     #[command(flatten)]
@@ -117,7 +117,7 @@ pub struct PullDownloadArgs {
 }
 
 #[derive(Debug, Clone, Args)]
-pub struct ComposeParallelArgs {
+pub struct ImageParallelArgs {
     #[arg(
         long = "max-parallel-images",
         default_value_t = 2,
@@ -386,10 +386,17 @@ pub struct ImageLoadArgs {
 
 #[derive(Debug, Clone, Args)]
 pub struct PullArgs {
-    #[arg(help = "Image reference to pull")]
-    pub reference: String,
+    #[arg(
+        value_name = "IMAGE",
+        required = true,
+        num_args = 1..,
+        help = "Image reference(s) to pull"
+    )]
+    pub references: Vec<String>,
     #[command(flatten)]
     pub download: PullDownloadArgs,
+    #[command(flatten)]
+    pub image_parallel: ImageParallelArgs,
     #[command(flatten)]
     pub retry: RetryArgs,
     #[command(flatten)]
@@ -450,6 +457,46 @@ mod tests {
         };
 
         assert!(args.no_animations);
+        assert_eq!(args.references, vec!["alpine:latest"]);
+    }
+
+    #[test]
+    fn pull_accepts_multiple_references() {
+        let cli = Cli::parse_from(["pocker", "pull", "alpine:latest", "busybox:latest"]);
+        let Commands::Pull(args) = cli.command else {
+            panic!("expected pull command");
+        };
+
+        assert_eq!(args.references, vec!["alpine:latest", "busybox:latest"]);
+    }
+
+    #[test]
+    fn pull_rejects_missing_reference() {
+        let error = Cli::try_parse_from(["pocker", "pull"])
+            .expect_err("pull should require at least one image");
+
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+    }
+
+    #[test]
+    fn pull_accepts_max_parallel_images() {
+        let cli = Cli::parse_from([
+            "pocker",
+            "pull",
+            "--max-parallel-images",
+            "4",
+            "alpine:latest",
+            "busybox:latest",
+        ]);
+        let Commands::Pull(args) = cli.command else {
+            panic!("expected pull command");
+        };
+
+        assert_eq!(args.image_parallel.image_concurrency, 4);
+        assert_eq!(args.references, vec!["alpine:latest", "busybox:latest"]);
     }
 
     #[test]

@@ -12,7 +12,7 @@ use tracing::warn;
 
 use crate::error::{DockerPullError, Result};
 use crate::platform::Platform;
-use crate::pull::{PullContext, download};
+use crate::pull::{BlobDownloadLocks, PullContext, download};
 use crate::reference::{ImageReference, ReferenceTarget};
 use crate::registry::{Descriptor, RegistryClient, cache_repository, decode_cache_repository};
 use crate::store::{Store, StoredReference};
@@ -69,6 +69,7 @@ impl TemporaryCacheRegistry {
             blob_retry_limit: Some(1),
             quiet: true,
             downloads: Arc::new(Semaphore::new(1)),
+            blob_locks: Arc::new(BlobDownloadLocks::default()),
         });
         let (shutdown, shutdown_rx) = oneshot::channel();
         let task = tokio::spawn(async move {
@@ -106,6 +107,7 @@ pub async fn serve(config: ServeConfig) -> Result<()> {
         blob_retry_limit: config.blob_retry_limit,
         quiet: config.quiet,
         downloads: Arc::new(Semaphore::new(config.concurrency)),
+        blob_locks: Arc::new(BlobDownloadLocks::default()),
     });
     run_server(listener, state, None).await
 }
@@ -143,6 +145,7 @@ struct ServeState {
     blob_retry_limit: Option<u32>,
     quiet: bool,
     downloads: Arc<Semaphore>,
+    blob_locks: Arc<BlobDownloadLocks>,
 }
 
 #[derive(Debug)]
@@ -383,6 +386,7 @@ async fn fetch_blob(state: &ServeState, reference: &ImageReference, digest: &str
         stop: Arc::new(AtomicBool::new(false)),
         ui: Arc::new(Ui::new(state.quiet, false)),
         blob_retry_limit: state.blob_retry_limit,
+        blob_locks: Arc::clone(&state.blob_locks),
     };
     download::download_blob(&context, reference, &reference.normalized(), descriptor).await
 }
@@ -647,7 +651,7 @@ mod tests {
     use super::{ServeState, is_supported_digest_reference, parse_byte_range, run_server};
     use crate::auth::AuthResolver;
     use crate::platform::Platform;
-    use crate::pull::{PullContext, PullOptions, Puller};
+    use crate::pull::{BlobDownloadLocks, PullContext, PullOptions, Puller};
     use crate::reference::ImageReference;
     use crate::registry::{Descriptor, RegistryClient, cache_repository};
     use crate::store::{Store, StoredReference};
@@ -964,6 +968,7 @@ mod tests {
             stop: Arc::new(AtomicBool::new(false)),
             ui: Arc::new(Ui::new(true, false)),
             blob_retry_limit: Some(1),
+            blob_locks: Arc::new(BlobDownloadLocks::default()),
         });
 
         puller
@@ -1017,6 +1022,7 @@ mod tests {
             blob_retry_limit: Some(1),
             quiet: true,
             downloads: Arc::new(Semaphore::new(1)),
+            blob_locks: Arc::new(BlobDownloadLocks::default()),
         });
         tokio::spawn(async move {
             let _ = run_server(listener, state, None).await;

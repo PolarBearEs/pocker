@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use assert_cmd::Command;
@@ -86,6 +87,99 @@ async fn pulls_oci_image_from_fake_registry_into_cache() {
         "expected config blob at {config_path:?}"
     );
     assert!(layer_path.exists(), "expected layer blob at {layer_path:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pulls_multiple_oci_images_from_fake_registry_into_cache() {
+    let fixture = Arc::new(Fixture::build());
+    let layer_gets = Arc::new(AtomicUsize::new(0));
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("fake registry should bind");
+    let address = listener
+        .local_addr()
+        .expect("listener should expose address");
+
+    let server_fixture = Arc::clone(&fixture);
+    let server_layer_gets = Arc::clone(&layer_gets);
+    let server = tokio::spawn(async move {
+        loop {
+            let (stream, _peer) = match listener.accept().await {
+                Ok(pair) => pair,
+                Err(_) => return,
+            };
+            let request_fixture = Arc::clone(&server_fixture);
+            let request_layer_gets = Arc::clone(&server_layer_gets);
+            tokio::spawn(async move {
+                let _ =
+                    handle_connection_with_layer_gets(stream, request_fixture, request_layer_gets)
+                        .await;
+            });
+        }
+    });
+
+    let cache_dir = tempfile::tempdir().expect("cache tempdir should create");
+    let first_reference = format!("{address}/library/test:first");
+    let second_reference = format!("{address}/library/test:second");
+
+    let pocker_run = tokio::task::spawn_blocking({
+        let cache = cache_dir.path().to_path_buf();
+        move || {
+            Command::cargo_bin("pocker")
+                .expect("pocker binary should be built")
+                .arg("--cache-dir")
+                .arg(&cache)
+                .args([
+                    "pull",
+                    "--plain-http",
+                    "--no-load",
+                    "--quiet",
+                    "--request-retries",
+                    "0",
+                    "--blob-retries",
+                    "0",
+                ])
+                .arg(&first_reference)
+                .arg(&second_reference)
+                .timeout(Duration::from_secs(30))
+                .assert()
+                .success();
+        }
+    });
+
+    pocker_run.await.expect("pocker subprocess should run");
+    server.abort();
+
+    let manifest_path = cache_dir
+        .path()
+        .join("blobs")
+        .join("sha256")
+        .join(&fixture.manifest_digest);
+    let layer_path = cache_dir
+        .path()
+        .join("blobs")
+        .join("sha256")
+        .join(&fixture.layer_digest);
+    let config_path = cache_dir
+        .path()
+        .join("blobs")
+        .join("sha256")
+        .join(&fixture.config_digest);
+
+    assert!(
+        manifest_path.exists(),
+        "expected manifest blob at {manifest_path:?}"
+    );
+    assert!(
+        config_path.exists(),
+        "expected config blob at {config_path:?}"
+    );
+    assert!(layer_path.exists(), "expected layer blob at {layer_path:?}");
+    assert_eq!(
+        layer_gets.load(Ordering::SeqCst),
+        1,
+        "shared layer blob should be downloaded once across concurrent image pulls"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -298,7 +392,23 @@ fn sha512_hex(bytes: &[u8]) -> String {
     hex::encode(hasher.finalize())
 }
 
-async fn handle_connection(mut stream: TcpStream, fixture: Arc<Fixture>) -> std::io::Result<()> {
+async fn handle_connection(stream: TcpStream, fixture: Arc<Fixture>) -> std::io::Result<()> {
+    handle_connection_with_optional_layer_gets(stream, fixture, None).await
+}
+
+async fn handle_connection_with_layer_gets(
+    stream: TcpStream,
+    fixture: Arc<Fixture>,
+    layer_gets: Arc<AtomicUsize>,
+) -> std::io::Result<()> {
+    handle_connection_with_optional_layer_gets(stream, fixture, Some(layer_gets)).await
+}
+
+async fn handle_connection_with_optional_layer_gets(
+    mut stream: TcpStream,
+    fixture: Arc<Fixture>,
+    layer_gets: Option<Arc<AtomicUsize>>,
+) -> std::io::Result<()> {
     let mut buffer = Vec::with_capacity(2048);
     let mut chunk = [0_u8; 1024];
     loop {
@@ -338,6 +448,11 @@ async fn handle_connection(mut stream: TcpStream, fixture: Arc<Fixture>) -> std:
             &fixture.config_bytes,
         )
     } else if path.ends_with(&fixture.layer_digest) {
+        if method != "HEAD"
+            && let Some(layer_gets) = &layer_gets
+        {
+            layer_gets.fetch_add(1, Ordering::SeqCst);
+        }
         ("200 OK", "application/octet-stream", &fixture.layer_bytes)
     } else {
         ("404 Not Found", "text/plain", &[][..])

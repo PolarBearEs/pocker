@@ -21,6 +21,8 @@ pub async fn download_blob(
     normalized_reference: &str,
     descriptor: Descriptor,
 ) -> Result<()> {
+    let _blob_guard = context.blob_locks.lock(&descriptor.digest).await;
+
     if context
         .store
         .ensure_blob_complete(&descriptor.digest, descriptor.expected_size()?)

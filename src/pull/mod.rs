@@ -1,10 +1,13 @@
 pub mod download;
 pub(crate) mod orchestrator;
 
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use futures_util::stream::{FuturesUnordered, StreamExt};
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 use tracing::warn;
 
 use crate::docker;
@@ -26,6 +29,7 @@ pub struct PullContext {
     pub stop: Arc<AtomicBool>,
     pub ui: Arc<Ui>,
     pub blob_retry_limit: Option<u32>,
+    pub blob_locks: Arc<BlobDownloadLocks>,
 }
 
 #[derive(Debug, Clone)]
@@ -46,6 +50,56 @@ pub enum LoadMode {
 #[derive(Clone)]
 pub struct Puller {
     context: PullContext,
+}
+
+#[derive(Default)]
+pub struct BlobDownloadLocks {
+    locks: Mutex<HashMap<String, Arc<AsyncMutex<()>>>>,
+}
+
+pub struct BlobDownloadGuard<'a> {
+    locks: &'a BlobDownloadLocks,
+    digest: String,
+    lock: Arc<AsyncMutex<()>>,
+    guard: Option<OwnedMutexGuard<()>>,
+}
+
+impl BlobDownloadLocks {
+    pub async fn lock(&self, digest: &str) -> BlobDownloadGuard<'_> {
+        let lock = {
+            let mut locks = self.locks.lock().expect("blob lock state poisoned");
+            locks
+                .entry(digest.to_string())
+                .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+                .clone()
+        };
+        let guard = lock.clone().lock_owned().await;
+        BlobDownloadGuard {
+            locks: self,
+            digest: digest.to_string(),
+            lock,
+            guard: Some(guard),
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.locks.lock().expect("blob lock state poisoned").len()
+    }
+}
+
+impl Drop for BlobDownloadGuard<'_> {
+    fn drop(&mut self) {
+        drop(self.guard.take());
+
+        let mut locks = self.locks.locks.lock().expect("blob lock state poisoned");
+        let should_remove = locks
+            .get(&self.digest)
+            .is_some_and(|lock| Arc::ptr_eq(lock, &self.lock) && Arc::strong_count(lock) == 2);
+        if should_remove {
+            locks.remove(&self.digest);
+        }
+    }
 }
 
 impl Puller {
@@ -265,4 +319,38 @@ async fn load_reference_through_cache_registry(
     let _ = docker::remove_image_tag(&synthetic).await;
     tag_result?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BlobDownloadLocks;
+
+    #[tokio::test]
+    async fn blob_download_locks_remove_idle_entries() {
+        let locks = BlobDownloadLocks::default();
+
+        let guard = locks.lock("sha256:abc").await;
+        assert_eq!(locks.len(), 1);
+
+        drop(guard);
+        assert_eq!(locks.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn blob_download_locks_keep_entries_for_waiters() {
+        let locks = std::sync::Arc::new(BlobDownloadLocks::default());
+        let guard = locks.lock("sha256:abc").await;
+        let waiter_locks = std::sync::Arc::clone(&locks);
+
+        let waiter = tokio::spawn(async move {
+            let _guard = waiter_locks.lock("sha256:abc").await;
+        });
+        tokio::task::yield_now().await;
+
+        drop(guard);
+        assert_eq!(locks.len(), 1);
+
+        waiter.await.expect("waiter task should finish");
+        assert_eq!(locks.len(), 0);
+    }
 }
