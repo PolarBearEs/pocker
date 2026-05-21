@@ -1,31 +1,26 @@
-use std::collections::{HashMap, HashSet};
-use std::fs::File;
-use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
-use reqwest::StatusCode;
-use serde::Deserialize;
-use serde::de::DeserializeOwned;
 use serde_json::Value;
-use sha2::{Digest as _, Sha256};
-use tar::Archive;
-use tempfile::{NamedTempFile, TempDir};
 use tokio::io::DuplexStream;
-use tokio::task::JoinSet;
 use tokio_util::io::{ReaderStream, SyncIoBridge};
 
 use crate::error::{DockerPullError, Result};
 use crate::export::oci_archive::{
     PreparedOciArchive, prepare_oci_archive, write_prepared_oci_archive_to_writer,
 };
-use crate::image::LayerSpec;
 use crate::reference::{ImageReference, ReferenceTarget};
 use crate::store::{Store, StoredReference};
 
+mod daemon;
+pub(crate) mod layers;
 mod transport;
 
-use transport::{DockerTransport, ensure_success_status};
+use daemon::DockerDaemon;
+
+pub(crate) use layers::{
+    MaterializedDaemonLayers, daemon_layer_coverage, materialize_daemon_layers,
+};
 
 const PATH_SEGMENT_ENCODE_SET: &AsciiSet = &CONTROLS
     .add(b' ')
@@ -47,125 +42,14 @@ const PATH_SEGMENT_ENCODE_SET: &AsciiSet = &CONTROLS
     .add(b'|')
     .add(b'}');
 const QUERY_VALUE_ENCODE_SET: &AsciiSet = &PATH_SEGMENT_ENCODE_SET.add(b'&').add(b'=').add(b'+');
-const DAEMON_INSPECT_CONCURRENCY: usize = 8;
 const LOAD_ARCHIVE_STREAM_BUFFER_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone)]
-struct DockerDaemon {
-    transport: DockerTransport,
-}
-
-impl DockerDaemon {
-    fn connect() -> Result<Self> {
-        Ok(Self {
-            transport: DockerTransport::connect()?,
-        })
-    }
-
-    async fn load_archive(&self, path: &Path) -> Result<()> {
-        self.transport.load_archive(path).await
-    }
-
-    async fn load_archive_stream(&self, stream: ReaderStream<DuplexStream>) -> Result<()> {
-        self.transport.load_archive_stream(stream).await
-    }
-
-    async fn inspect_image(&self, image: &str) -> Result<Option<DaemonImage>> {
-        let response = self
-            .transport
-            .request_bytes(
-                "GET",
-                &format!("/images/{}/json", encode_path_segment(image)),
-                None,
-            )
-            .await?;
-        if response.status == StatusCode::NOT_FOUND {
-            return Ok(None);
-        }
-        ensure_success_status(
-            response.status,
-            response.body.clone(),
-            "docker image inspect",
-        )?;
-        Ok(Some(serde_json::from_slice(&response.body)?))
-    }
-
-    async fn list_image_summaries(&self) -> Result<Vec<DaemonImageSummary>> {
-        self.get_json("/images/json?all=1", "docker image ls").await
-    }
-
-    async fn save_image(&self, image: &str, path: &Path) -> Result<()> {
-        self.transport
-            .save_response_to_file(
-                &format!("/images/{}/get", encode_path_segment(image)),
-                path,
-                "docker image save",
-            )
-            .await
-    }
-
-    async fn pull_image(&self, reference: &str) -> Result<()> {
-        let (repository, tag) = split_tagged_reference(reference)?;
-        let response = self
-            .transport
-            .request_bytes(
-                "POST",
-                &format!(
-                    "/images/create?fromImage={}&tag={}",
-                    encode_query_value(repository),
-                    encode_query_value(tag)
-                ),
-                None,
-            )
-            .await?;
-        ensure_success_status(response.status, response.body.clone(), "docker image pull")?;
-        ensure_json_stream_success(
-            String::from_utf8_lossy(&response.body).into_owned(),
-            "docker image pull",
-        )
-    }
-
-    async fn tag_image(&self, source: &str, target: &str) -> Result<()> {
-        let (repository, tag) = split_tagged_reference(target)?;
-        let response = self
-            .transport
-            .request_bytes(
-                "POST",
-                &format!(
-                    "/images/{}/tag?repo={}&tag={}",
-                    encode_path_segment(source),
-                    encode_query_value(repository),
-                    encode_query_value(tag)
-                ),
-                None,
-            )
-            .await?;
-        ensure_success_status(response.status, response.body, "docker image tag")
-    }
-
-    async fn remove_image_tag(&self, reference: &str) -> Result<()> {
-        let response = self
-            .transport
-            .request_bytes(
-                "DELETE",
-                &format!(
-                    "/images/{}?force=1&noprune=1",
-                    encode_path_segment(reference)
-                ),
-                None,
-            )
-            .await?;
-        ensure_success_status(response.status, response.body, "docker image remove")
-    }
-
-    async fn get_json<T>(&self, path: &str, action: &str) -> Result<T>
-    where
-        T: DeserializeOwned,
-    {
-        let response = self.transport.request_bytes("GET", path, None).await?;
-        ensure_success_status(response.status, response.body.clone(), action)?;
-        serde_json::from_slice(&response.body).map_err(Into::into)
-    }
+pub struct ImageSummary {
+    pub created: Option<i64>,
+    pub id: String,
+    pub repo_tags: Vec<String>,
+    pub size: Option<u64>,
 }
 
 pub async fn load_reference_archive_stream(
@@ -215,79 +99,11 @@ fn write_archive_to_stream(
 pub async fn daemon_has_reference(reference: &ImageReference, config_digest: &str) -> Result<bool> {
     let inspect_target = daemon_inspect_target(reference, config_digest);
     let daemon = DockerDaemon::connect()?;
-    let Some(image) = daemon.inspect_image(&inspect_target).await? else {
+    let Some(image) = daemon.inspect_daemon_image(&inspect_target).await? else {
         return Ok(false);
     };
 
     Ok(normalize_image_id(&image.id) == normalize_image_id(config_digest))
-}
-
-pub async fn daemon_layer_coverage(layers: &[LayerSpec]) -> Result<HashMap<String, String>> {
-    let mut wanted = HashSet::new();
-    for layer in layers {
-        if !layer.diff_id.is_empty() {
-            wanted.insert(layer.diff_id.clone());
-        }
-    }
-    if wanted.is_empty() {
-        return Ok(HashMap::new());
-    }
-
-    let daemon = DockerDaemon::connect()?;
-    let chosen = choose_daemon_images(&daemon, &wanted).await?;
-    let mut coverage = HashMap::new();
-    for chosen in chosen {
-        let label = chosen.image.label();
-        for diff_id in chosen.diff_ids {
-            coverage.insert(diff_id, label.clone());
-        }
-    }
-    Ok(coverage)
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct DaemonImageSummary {
-    #[serde(rename = "Id")]
-    id: String,
-    #[serde(rename = "Created")]
-    created: Option<i64>,
-    #[serde(rename = "RepoTags")]
-    repo_tags: Option<Vec<String>>,
-    #[serde(rename = "Size")]
-    size: Option<u64>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct DaemonImage {
-    #[serde(rename = "Id")]
-    id: String,
-    #[serde(rename = "RepoTags")]
-    repo_tags: Option<Vec<String>>,
-    #[serde(default, rename = "RootFS")]
-    rootfs: Option<RootFs>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct RootFs {
-    #[serde(default, rename = "Layers")]
-    layers: Option<Vec<String>>,
-}
-
-impl DaemonImage {
-    fn rootfs_layers(&self) -> &[String] {
-        self.rootfs
-            .as_ref()
-            .and_then(|rootfs| rootfs.layers.as_deref())
-            .unwrap_or(&[])
-    }
-
-    fn label(&self) -> String {
-        self.repo_tags
-            .as_ref()
-            .and_then(|tags| tags.first())
-            .cloned()
-            .unwrap_or_else(|| self.id.clone())
-    }
 }
 
 fn daemon_inspect_target(reference: &ImageReference, config_digest: &str) -> String {
@@ -299,37 +115,6 @@ fn daemon_inspect_target(reference: &ImageReference, config_digest: &str) -> Str
 
 fn normalize_image_id(image_id: &str) -> &str {
     image_id.strip_prefix("sha256:").unwrap_or(image_id).trim()
-}
-
-#[derive(Debug, Deserialize)]
-struct SaveManifestEntry {
-    #[serde(rename = "Layers")]
-    layers: Vec<String>,
-}
-
-#[derive(Debug, Clone)]
-struct ChosenImageLayers {
-    image: DaemonImage,
-    diff_ids: Vec<String>,
-}
-
-pub struct MaterializedDaemonLayers {
-    _tempdir: TempDir,
-    paths: HashMap<String, PathBuf>,
-}
-
-impl MaterializedDaemonLayers {
-    pub(crate) fn paths(&self) -> &HashMap<String, PathBuf> {
-        &self.paths
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct ImageSummary {
-    pub created: Option<i64>,
-    pub id: String,
-    pub repo_tags: Vec<String>,
-    pub size: Option<u64>,
 }
 
 pub async fn load_archive(path: &Path) -> Result<()> {
@@ -349,24 +134,7 @@ pub async fn remove_image_tag(reference: &str) -> Result<()> {
 }
 
 pub async fn inspect_image(reference: &str) -> Result<Option<Value>> {
-    let daemon = DockerDaemon::connect()?;
-    let response = daemon
-        .transport
-        .request_bytes(
-            "GET",
-            &format!("/images/{}/json", encode_path_segment(reference)),
-            None,
-        )
-        .await?;
-    if response.status == StatusCode::NOT_FOUND {
-        return Ok(None);
-    }
-    ensure_success_status(
-        response.status,
-        response.body.clone(),
-        "docker image inspect",
-    )?;
-    Ok(Some(serde_json::from_slice(&response.body)?))
+    DockerDaemon::connect()?.inspect_image_json(reference).await
 }
 
 pub async fn list_images() -> Result<Vec<ImageSummary>> {
@@ -385,249 +153,6 @@ pub async fn list_images() -> Result<Vec<ImageSummary>> {
 
 pub async fn save_image(reference: &str, path: &Path) -> Result<()> {
     DockerDaemon::connect()?.save_image(reference, path).await
-}
-
-async fn list_daemon_images(daemon: &DockerDaemon) -> Result<Vec<DaemonImage>> {
-    let ids = ordered_unique_image_ids(daemon.list_image_summaries().await?);
-    if ids.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let mut queue = JoinSet::new();
-    let mut pending = ids.into_iter().enumerate();
-    let mut images = vec![None; pending.len()];
-
-    while queue.len() < DAEMON_INSPECT_CONCURRENCY {
-        let Some((index, id)) = pending.next() else {
-            break;
-        };
-        spawn_inspect_task(&mut queue, daemon.clone(), index, id);
-    }
-
-    while let Some(result) = queue.join_next().await {
-        let (index, image) = match result {
-            Ok(Ok(result)) => result,
-            Ok(Err(error)) => {
-                queue.abort_all();
-                return Err(error);
-            }
-            Err(error) => {
-                queue.abort_all();
-                return Err(DockerPullError::CommandFailed(format!(
-                    "docker image inspect task failed: {error}"
-                )));
-            }
-        };
-        images[index] = image;
-
-        if let Some((index, id)) = pending.next() {
-            spawn_inspect_task(&mut queue, daemon.clone(), index, id);
-        }
-    }
-
-    Ok(images.into_iter().flatten().collect())
-}
-
-fn spawn_inspect_task(
-    queue: &mut JoinSet<Result<(usize, Option<DaemonImage>)>>,
-    daemon: DockerDaemon,
-    index: usize,
-    id: String,
-) {
-    queue.spawn(async move { Ok((index, daemon.inspect_image(&id).await?)) });
-}
-
-fn ordered_unique_image_ids(summaries: Vec<DaemonImageSummary>) -> Vec<String> {
-    let mut seen = HashSet::new();
-    let mut ids = Vec::with_capacity(summaries.len());
-    for summary in summaries {
-        if seen.insert(summary.id.clone()) {
-            ids.push(summary.id);
-        }
-    }
-    ids
-}
-
-pub async fn materialize_daemon_layers(
-    store: &Store,
-    diff_ids: &[String],
-) -> Result<MaterializedDaemonLayers> {
-    let wanted = diff_ids.iter().cloned().collect::<HashSet<_>>();
-    if wanted.is_empty() {
-        return Ok(MaterializedDaemonLayers {
-            _tempdir: tempfile::tempdir_in(store.root())?,
-            paths: HashMap::new(),
-        });
-    }
-
-    let daemon = DockerDaemon::connect()?;
-    let chosen = choose_daemon_images(&daemon, &wanted).await?;
-    let tempdir = tempfile::tempdir_in(store.root())?;
-    let mut paths = HashMap::new();
-    for chosen in &chosen {
-        materialize_layers_from_saved_image(store, &daemon, chosen, tempdir.path(), &mut paths)
-            .await?;
-    }
-
-    let unresolved = diff_ids
-        .iter()
-        .filter(|diff_id| !paths.contains_key(diff_id.as_str()))
-        .cloned()
-        .collect::<Vec<_>>();
-    if !unresolved.is_empty() {
-        return Err(DockerPullError::BadResponse(format!(
-            "docker daemon is missing required layer(s): {}",
-            unresolved.join(", ")
-        )));
-    }
-
-    Ok(MaterializedDaemonLayers {
-        _tempdir: tempdir,
-        paths,
-    })
-}
-
-async fn choose_daemon_images(
-    daemon: &DockerDaemon,
-    wanted: &HashSet<String>,
-) -> Result<Vec<ChosenImageLayers>> {
-    let images = list_daemon_images(daemon).await?;
-    let mut chosen = Vec::new();
-    let mut unresolved = wanted.clone();
-
-    for image in images {
-        let provided = image
-            .rootfs_layers()
-            .iter()
-            .filter(|diff_id| unresolved.contains(*diff_id))
-            .cloned()
-            .collect::<Vec<_>>();
-        if provided.is_empty() {
-            continue;
-        }
-        for diff_id in &provided {
-            unresolved.remove(diff_id);
-        }
-        chosen.push(ChosenImageLayers {
-            image,
-            diff_ids: provided,
-        });
-        if unresolved.is_empty() {
-            break;
-        }
-    }
-
-    Ok(chosen)
-}
-
-async fn materialize_layers_from_saved_image(
-    store: &Store,
-    daemon: &DockerDaemon,
-    chosen: &ChosenImageLayers,
-    output_root: &Path,
-    paths: &mut HashMap<String, PathBuf>,
-) -> Result<()> {
-    let temp = NamedTempFile::new_in(store.root())?;
-    if daemon
-        .save_image(&chosen.image.id, temp.path())
-        .await
-        .is_err()
-    {
-        return Ok(());
-    }
-
-    let entries = save_manifest_entries(temp.path())?;
-    let Some(entry) = entries.into_iter().next() else {
-        return Ok(());
-    };
-    if entry.layers.len() != chosen.image.rootfs_layers().len() {
-        return Ok(());
-    }
-
-    let targets = chosen
-        .image
-        .rootfs_layers()
-        .iter()
-        .cloned()
-        .zip(entry.layers)
-        .filter(|(diff_id, _)| chosen.diff_ids.contains(diff_id))
-        .map(|(diff_id, path)| (path, diff_id))
-        .collect::<HashMap<_, _>>();
-    if targets.is_empty() {
-        return Ok(());
-    }
-
-    let file = File::open(temp.path())?;
-    let mut archive = Archive::new(file);
-
-    for entry in archive.entries()? {
-        let mut entry = entry?;
-        let path = entry.path()?.to_string_lossy().into_owned();
-        let Some(diff_id) = targets.get(&path) else {
-            continue;
-        };
-        if paths.contains_key(diff_id.as_str()) {
-            continue;
-        }
-        let destination = extracted_layer_path(output_root, diff_id)?;
-        copy_archive_entry_with_digest(&mut entry, &destination, diff_id)?;
-        paths.insert(diff_id.clone(), destination);
-    }
-
-    Ok(())
-}
-
-fn save_manifest_entries(path: &Path) -> Result<Vec<SaveManifestEntry>> {
-    let file = File::open(path)?;
-    let mut archive = Archive::new(file);
-    for entry in archive.entries()? {
-        let mut entry = entry?;
-        let path = entry.path()?.to_string_lossy().into_owned();
-        if path == "manifest.json" {
-            let mut bytes = Vec::new();
-            std::io::Read::read_to_end(&mut entry, &mut bytes)?;
-            return serde_json::from_slice(&bytes).map_err(Into::into);
-        }
-    }
-    Err(DockerPullError::BadResponse(
-        "docker save archive is missing manifest.json".into(),
-    ))
-}
-
-fn extracted_layer_path(root: &Path, diff_id: &str) -> Result<PathBuf> {
-    let (algorithm, value) = diff_id
-        .split_once(':')
-        .ok_or_else(|| DockerPullError::InvalidInput(format!("invalid digest `{diff_id}`")))?;
-    Ok(root.join(format!("{algorithm}-{value}.tar")))
-}
-
-fn copy_archive_entry_with_digest<R: Read>(
-    reader: &mut R,
-    path: &Path,
-    expected_digest: &str,
-) -> Result<()> {
-    let mut file = File::create(path)?;
-    let mut hasher = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let read = reader.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        file.write_all(&buffer[..read])?;
-        hasher.update(&buffer[..read]);
-    }
-    file.flush()?;
-    file.sync_data()?;
-    let actual_digest = format!("sha256:{}", hex::encode(hasher.finalize()));
-    if actual_digest != expected_digest {
-        return Err(DockerPullError::DigestMismatch {
-            digest: expected_digest.to_string(),
-            expected: expected_digest.to_string(),
-            actual: actual_digest,
-        });
-    }
-    Ok(())
 }
 
 fn encode_path_segment(value: &str) -> String {
@@ -691,7 +216,7 @@ mod tests {
     use super::transport::windows::{decode_chunked_body, header_value, parse_response_head};
     use super::transport::{DEFAULT_DOCKER_HOST, DockerEndpoint, docker_endpoint_from_host};
     use super::{daemon_inspect_target, encode_path_segment, encode_query_value};
-    use super::{ordered_unique_image_ids, split_tagged_reference};
+    use super::{layers::ordered_unique_image_ids, split_tagged_reference};
     use crate::reference::ImageReference;
 
     #[test]
@@ -716,19 +241,19 @@ mod tests {
     #[test]
     fn ordered_unique_image_ids_preserves_first_seen_order() {
         let ids = ordered_unique_image_ids(vec![
-            super::DaemonImageSummary {
+            super::daemon::DaemonImageSummary {
                 id: "sha256:1".into(),
                 created: None,
                 repo_tags: None,
                 size: None,
             },
-            super::DaemonImageSummary {
+            super::daemon::DaemonImageSummary {
                 id: "sha256:2".into(),
                 created: None,
                 repo_tags: None,
                 size: None,
             },
-            super::DaemonImageSummary {
+            super::daemon::DaemonImageSummary {
                 id: "sha256:1".into(),
                 created: None,
                 repo_tags: None,
