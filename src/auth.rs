@@ -421,6 +421,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn restore_path_env(previous: Option<&std::ffi::OsStr>) {
         unsafe {
             if let Some(previous) = previous {
