@@ -200,6 +200,29 @@ services:
     }
 
     #[test]
+    fn detects_build_only_services_from_yaml_merge_keys() {
+        let dir = tempdir().expect("tempdir should be created");
+        fs::write(
+            dir.path().join("docker-compose.yml"),
+            r#"
+x-build: &build
+  build: .
+services:
+  builder:
+    <<: *build
+"#,
+        )
+        .expect("compose should be written");
+
+        let resolved = resolve_images(&[], dir.path()).expect("images should resolve");
+
+        assert_eq!(resolved.images, Vec::<String>::new());
+        assert_eq!(resolved.skipped_build_only, vec!["builder"]);
+        assert_eq!(resolved.services[0].service, "builder");
+        assert!(resolved.services[0].build_only);
+    }
+
+    #[test]
     fn deduplicates_images_in_first_seen_order() {
         let images = unique_images(&[
             "alpine:latest".into(),
