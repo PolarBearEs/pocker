@@ -430,7 +430,7 @@ impl RegistryClient {
             let credentials = if cache_request {
                 None
             } else {
-                self.auth.resolve(&reference.registry)?
+                self.auth.resolve(&reference.registry).await?
             };
             let mut builder = self.client.request(request.method.clone(), url.clone());
             if let Some(accept) = request.accept {
