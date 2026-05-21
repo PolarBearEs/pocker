@@ -7,16 +7,13 @@ use reqwest::header::RANGE;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Semaphore, oneshot};
-use tokio::task::JoinHandle;
 use tracing::warn;
 
 use crate::error::{DockerPullError, Result};
 use crate::platform::Platform;
 use crate::pull::{BlobDownloadLocks, PullContext, download};
-use crate::reference::{ImageReference, ReferenceTarget};
-use crate::registry::{
-    Descriptor, MANIFEST_ACCEPT, RegistryClient, cache_repository, decode_cache_repository,
-};
+use crate::reference::ImageReference;
+use crate::registry::{Descriptor, MANIFEST_ACCEPT, RegistryClient, decode_cache_repository};
 use crate::store::{Store, StoredReference};
 use crate::ui::Ui;
 
@@ -33,69 +30,37 @@ pub struct ServeConfig {
     pub quiet: bool,
 }
 
-pub struct TemporaryCacheRegistry {
-    address: String,
-    repository: String,
-    tag: String,
-    _task: JoinHandle<()>,
-    shutdown: Option<oneshot::Sender<()>>,
-}
-
-impl TemporaryCacheRegistry {
-    pub async fn start(
-        store: Arc<Store>,
-        registry: Arc<RegistryClient>,
-        reference: &ImageReference,
-    ) -> Result<Self> {
-        let tag = match &reference.target {
-            ReferenceTarget::Tag(tag) => tag.clone(),
-            ReferenceTarget::Digest(_) => {
-                return Err(DockerPullError::InvalidInput(
-                    "temporary cache registry requires a tag reference".into(),
-                ));
-            }
-        };
-        let listener = TcpListener::bind("127.0.0.1:0").await?;
-        let address = listener.local_addr()?.to_string();
-        let repository = cache_repository(&reference.registry, &reference.repository);
-        let state = Arc::new(ServeState {
-            store,
-            registry,
-            pull_missing: false,
-            blob_retry_limit: Some(1),
-            quiet: true,
-            downloads: Arc::new(Semaphore::new(1)),
-            blob_locks: Arc::new(BlobDownloadLocks::default()),
-        });
-        let (shutdown, shutdown_rx) = oneshot::channel();
-        let task = tokio::spawn(async move {
-            let _ = run_server(listener, state, Some(shutdown_rx)).await;
-        });
-
-        Ok(Self {
-            address,
-            repository,
-            tag,
-            _task: task,
-            shutdown: Some(shutdown),
-        })
-    }
-
-    pub fn synthetic_reference(&self) -> String {
-        format!("{}/{}:{}", self.address, self.repository, self.tag)
-    }
-}
-
-impl Drop for TemporaryCacheRegistry {
-    fn drop(&mut self) {
-        if let Some(shutdown) = self.shutdown.take() {
-            let _ = shutdown.send(());
-        }
-    }
-}
-
 pub async fn serve(config: ServeConfig) -> Result<()> {
     let listener = TcpListener::bind(config.listen).await?;
+    serve_listener(
+        listener,
+        ServeListenerConfig {
+            store: config.store,
+            registry: config.registry,
+            pull_missing: config.pull_missing,
+            blob_retry_limit: config.blob_retry_limit,
+            concurrency: config.concurrency,
+            quiet: config.quiet,
+        },
+        None,
+    )
+    .await
+}
+
+pub(crate) struct ServeListenerConfig {
+    pub store: Arc<Store>,
+    pub registry: Arc<RegistryClient>,
+    pub pull_missing: bool,
+    pub blob_retry_limit: Option<u32>,
+    pub concurrency: usize,
+    pub quiet: bool,
+}
+
+pub(crate) async fn serve_listener(
+    listener: TcpListener,
+    config: ServeListenerConfig,
+    shutdown: Option<oneshot::Receiver<()>>,
+) -> Result<()> {
     let state = Arc::new(ServeState {
         store: config.store,
         registry: config.registry,
@@ -105,7 +70,7 @@ pub async fn serve(config: ServeConfig) -> Result<()> {
         downloads: Arc::new(Semaphore::new(config.concurrency)),
         blob_locks: Arc::new(BlobDownloadLocks::default()),
     });
-    run_server(listener, state, None).await
+    run_server(listener, state, shutdown).await
 }
 
 async fn run_server(

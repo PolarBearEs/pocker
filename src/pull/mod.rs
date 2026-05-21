@@ -1,4 +1,5 @@
 pub mod download;
+mod load;
 pub(crate) mod orchestrator;
 
 use std::collections::HashMap;
@@ -14,9 +15,8 @@ use crate::docker;
 use crate::error::{DockerPullError, Result};
 use crate::image::pair_layers;
 use crate::platform::Platform;
-use crate::reference::{ImageReference, ReferenceTarget};
+use crate::reference::ImageReference;
 use crate::registry::{Descriptor, RegistryClient};
-use crate::serve_registry;
 use crate::store::{Store, StoredReference};
 use crate::ui::Ui;
 
@@ -133,8 +133,13 @@ impl Puller {
         };
 
         if !options.no_load
-            && finalize_existing_reference(&self.context, &reference, &stored_reference, &options)
-                .await?
+            && load::finalize_existing_reference(
+                &self.context,
+                &reference,
+                &stored_reference,
+                &options,
+            )
+            .await?
         {
             return Ok(());
         }
@@ -211,7 +216,7 @@ impl Puller {
         if options.no_load {
             self.context.ui.finish_image(&normalized, "Pulled");
         } else {
-            load_reference(&self.context, &reference, &stored_reference, &options).await?;
+            load::load_reference(&self.context, &reference, &stored_reference, &options).await?;
         }
 
         Ok(())
@@ -237,88 +242,6 @@ async fn load_blob_bytes(
         .await?;
     context.store.save_blob_bytes(descriptor, &bytes).await?;
     Ok(bytes)
-}
-
-async fn finalize_existing_reference(
-    context: &PullContext,
-    reference: &ImageReference,
-    stored_reference: &StoredReference,
-    options: &PullOptions,
-) -> Result<bool> {
-    let normalized = &stored_reference.reference;
-    let already_loaded = docker::daemon_has_reference(reference, &stored_reference.config_digest)
-        .await
-        .unwrap_or(false);
-    if !already_loaded {
-        return Ok(false);
-    }
-
-    context.ui.set_image_status(normalized, "Already exists");
-    context.ui.prepare_layers(&[]);
-    context.store.save_reference(stored_reference).await?;
-    if !options.keep_layer_blobs {
-        context.ui.set_image_status(normalized, "Pruning cache");
-        context
-            .store
-            .prune_reference_layer_blobs(stored_reference)
-            .await?;
-    }
-    context.ui.finish_image(normalized, "Already exists");
-    Ok(true)
-}
-
-async fn load_reference(
-    context: &PullContext,
-    reference: &ImageReference,
-    stored_reference: &StoredReference,
-    options: &PullOptions,
-) -> Result<()> {
-    let normalized = &stored_reference.reference;
-    context.ui.begin_load(normalized);
-    match options.load_mode {
-        LoadMode::Stream => {
-            docker::load_reference_archive_stream(&context.store, stored_reference).await?;
-        }
-        LoadMode::Registry => {
-            load_reference_through_cache_registry(context, reference, stored_reference).await?;
-        }
-    }
-    if !options.keep_layer_blobs {
-        context.ui.set_image_status(normalized, "Pruning cache");
-        context
-            .store
-            .prune_reference_layer_blobs(stored_reference)
-            .await?;
-    }
-    context.ui.finish_image(normalized, "Ready");
-    Ok(())
-}
-
-async fn load_reference_through_cache_registry(
-    context: &PullContext,
-    reference: &ImageReference,
-    stored_reference: &StoredReference,
-) -> Result<()> {
-    if matches!(reference.target, ReferenceTarget::Digest(_)) {
-        context.ui.warn(
-            "registry load mode does not support digest references yet; falling back to stream load",
-        );
-        docker::load_reference_archive_stream(&context.store, stored_reference).await?;
-        return Ok(());
-    }
-
-    let registry = serve_registry::TemporaryCacheRegistry::start(
-        context.store.clone(),
-        context.registry.clone(),
-        reference,
-    )
-    .await?;
-    let synthetic = registry.synthetic_reference();
-    docker::pull_image(&synthetic).await?;
-    let tag_result = docker::tag_image(&synthetic, &reference.display_name()).await;
-    let _ = docker::remove_image_tag(&synthetic).await;
-    tag_result?;
-    Ok(())
 }
 
 #[cfg(test)]
