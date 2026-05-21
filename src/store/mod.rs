@@ -65,9 +65,9 @@ impl Store {
     async fn open_with_lock(root: PathBuf, shared_lock: bool) -> Result<Self> {
         ensure_directory(&root)?;
         let lock = if shared_lock {
-            let lock = open_lock_file(&root)?;
-            lock.lock_shared()?;
-            Some(std::sync::Arc::new(lock))
+            Some(std::sync::Arc::new(
+                acquire_shared_cache_lock(root.clone()).await?,
+            ))
         } else {
             None
         };
@@ -333,6 +333,16 @@ impl Store {
     pub fn root(&self) -> &Path {
         &self.root
     }
+}
+
+async fn acquire_shared_cache_lock(root: PathBuf) -> Result<File> {
+    tokio::task::spawn_blocking(move || {
+        let lock = open_lock_file(&root)?;
+        lock.lock_shared()?;
+        Result::Ok(lock)
+    })
+    .await
+    .map_err(|e| DockerPullError::InvalidInput(format!("cache lock task panicked: {e}")))?
 }
 
 fn open_lock_file(root: &Path) -> Result<File> {

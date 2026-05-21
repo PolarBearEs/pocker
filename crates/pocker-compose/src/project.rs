@@ -422,7 +422,7 @@ fn parse_quoted_env_value<'a>(
 fn parse_unquoted_env_value(value: &str) -> String {
     let mut output = String::new();
     let mut escaped = false;
-    let mut previous_was_whitespace = true;
+    let mut previous_was_whitespace = false;
 
     for ch in value.chars() {
         if escaped {
@@ -458,6 +458,7 @@ mod tests {
             "# comment\n",
             "export REGISTRY=example.com # registry host\n",
             "TAG=\"1.2.3\"\n",
+            "LITERAL_HASH=#literal\n",
             "SUFFIX=foo\\#bar # comment\n",
             "HASHED='pa#ss'\n",
             "QUOTED=\"hello \\\"there\\\"\"\n",
@@ -470,6 +471,10 @@ mod tests {
             Some("example.com")
         );
         assert_eq!(values.get("TAG").map(String::as_str), Some("1.2.3"));
+        assert_eq!(
+            values.get("LITERAL_HASH").map(String::as_str),
+            Some("#literal")
+        );
         assert_eq!(values.get("SUFFIX").map(String::as_str), Some("foo#bar"));
         assert_eq!(values.get("HASHED").map(String::as_str), Some("pa#ss"));
         assert_eq!(
