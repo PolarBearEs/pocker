@@ -13,6 +13,8 @@ use crate::error::{DockerPullError, Result};
 
 use super::DockerResponse;
 
+const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(60);
+
 #[derive(Debug, Clone)]
 pub(in crate::docker) struct ReqwestTransport {
     client: Client,
@@ -110,6 +112,7 @@ impl ReqwestTransport {
 fn builder() -> reqwest::ClientBuilder {
     Client::builder()
         .connect_timeout(Duration::from_secs(20))
+        .read_timeout(DEFAULT_READ_TIMEOUT)
         .user_agent(format!("pocker/{}", env!("CARGO_PKG_VERSION")))
         .http1_only()
 }
