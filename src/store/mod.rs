@@ -54,10 +54,10 @@ struct DownloadCheckpoint {
 impl Store {
     pub async fn open(root: PathBuf) -> Result<Self> {
         ensure_directory(&root)?;
-        ensure_directory(&root.join("blobs"))?;
-        ensure_directory(&root.join("blobs").join("sha256"))?;
-        ensure_directory(&root.join("partials"))?;
-        ensure_directory(&root.join("partials").join("sha256"))?;
+        for algorithm in ["sha256", "sha384", "sha512"] {
+            ensure_directory(&root.join("blobs").join(algorithm))?;
+            ensure_directory(&root.join("partials").join(algorithm))?;
+        }
         ensure_directory(&root.join("references"))?;
         Ok(Self { root })
     }
@@ -639,12 +639,22 @@ mod tests {
         );
         assert!(
             store.root().join("blobs").join("sha256").exists(),
-            "blob cache layout should be recreated"
+            "sha256 blob cache layout should be recreated"
         );
         assert!(
             store.root().join("partials").join("sha256").exists(),
-            "partial cache layout should be recreated"
+            "sha256 partial cache layout should be recreated"
         );
+        for algorithm in ["sha384", "sha512"] {
+            assert!(
+                store.root().join("blobs").join(algorithm).exists(),
+                "{algorithm} blob cache layout should be recreated"
+            );
+            assert!(
+                store.root().join("partials").join(algorithm).exists(),
+                "{algorithm} partial cache layout should be recreated"
+            );
+        }
         assert_eq!(cleared.reclaimed_bytes, 11);
         assert_eq!(
             cleared.files,
