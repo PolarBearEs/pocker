@@ -9,6 +9,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Semaphore, oneshot};
 use tracing::warn;
 
+use crate::digest::parse_digest;
 use crate::error::{DockerPullError, Result};
 use crate::platform::Platform;
 use crate::pull::{BlobDownloadLocks, PullContext, download};
@@ -397,10 +398,7 @@ fn upstream_reference(repository: &str, reference: &str) -> Result<ImageReferenc
 }
 
 fn is_supported_digest_reference(reference: &str) -> bool {
-    matches!(
-        reference.split_once(':'),
-        Some(("sha256" | "sha384" | "sha512", value)) if !value.is_empty()
-    )
+    parse_digest(reference).is_ok()
 }
 
 fn split_route<'a>(path: &'a str, separator: &str) -> Option<(&'a str, &'a str)> {
@@ -623,10 +621,18 @@ mod tests {
             "a".repeat(128)
         )));
         assert!(is_supported_digest_reference(&format!(
+            "sha384:{}",
+            "b".repeat(96)
+        )));
+        assert!(is_supported_digest_reference(&format!(
+            "sha256:{}",
+            "c".repeat(64)
+        )));
+        assert!(!is_supported_digest_reference(&format!(
             "sha256:{}",
             "A".repeat(64)
         )));
-        assert!(is_supported_digest_reference("sha384:abc"));
+        assert!(!is_supported_digest_reference("sha384:abc"));
         assert!(!is_supported_digest_reference(&format!(
             "sha224:{}",
             "a".repeat(56)

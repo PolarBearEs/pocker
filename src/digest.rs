@@ -87,6 +87,10 @@ pub(crate) fn parse_digest(digest: &str) -> Result<ParsedDigest<'_>> {
     Ok(ParsedDigest { algorithm, value })
 }
 
+pub(crate) fn digest_hex(digest: &str) -> Result<&str> {
+    Ok(parse_digest(digest)?.value)
+}
+
 pub(crate) fn digest_bytes_for_digest(digest: &str, bytes: &[u8]) -> Result<String> {
     Ok(parse_digest(digest)?.algorithm.digest_bytes(bytes))
 }
@@ -120,7 +124,7 @@ fn hash_reader<D: sha2::Digest>(reader: &mut impl Read, buffer: &mut [u8]) -> Re
 
 #[cfg(test)]
 mod tests {
-    use super::{DigestAlgorithm, digest_bytes_for_digest, parse_digest};
+    use super::{DigestAlgorithm, digest_bytes_for_digest, digest_hex, parse_digest};
     use crate::error::DockerPullError;
 
     #[test]
@@ -142,6 +146,28 @@ mod tests {
         assert!(
             matches!(error, DockerPullError::UnsupportedDigestAlgorithm(algorithm) if algorithm == "sha224")
         );
+    }
+
+    #[test]
+    fn parse_digest_rejects_invalid_hex_values() {
+        for digest in [
+            "sha256:abc",
+            "sha256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "sha256:gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg",
+        ] {
+            let error = parse_digest(digest).expect_err("invalid digest value should fail");
+
+            assert!(matches!(error, DockerPullError::InvalidInput(_)));
+        }
+    }
+
+    #[test]
+    fn digest_hex_returns_validated_value() {
+        let value = "a".repeat(64);
+        let digest = format!("sha256:{value}");
+
+        assert_eq!(digest_hex(&digest).expect("digest should parse"), value);
+        assert!(digest_hex("sha256:abc").is_err());
     }
 
     #[test]

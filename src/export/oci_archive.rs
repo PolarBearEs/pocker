@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use tar::{Builder, Header};
 
+use crate::digest::{canonical_digest_bytes, digest_hex, parse_digest};
 use crate::docker;
 use crate::error::{DockerPullError, Result};
 use crate::image::parse_diff_ids;
@@ -134,7 +135,7 @@ fn write_oci_archive_to_writer_with_fallbacks<W: Write>(
     let archive_manifest = archive_manifest(&inputs.manifest, &layer_sources, &reference.manifest);
     let archive_manifest_bytes = serde_json::to_vec(&archive_manifest)?;
     let mut manifest_descriptor = reference.manifest.clone();
-    manifest_descriptor.digest = digest_bytes(&archive_manifest_bytes);
+    manifest_descriptor.digest = canonical_digest_bytes(&archive_manifest_bytes);
     manifest_descriptor.size = archive_manifest_bytes.len() as i64;
     if manifest_descriptor.media_type.is_empty() {
         manifest_descriptor.media_type = archive_manifest.media_type.clone();
@@ -321,18 +322,8 @@ fn resolved_manifest_media_type(
 }
 
 fn blob_tar_path(digest: &str) -> Result<String> {
-    let (algorithm, value) = digest
-        .split_once(':')
-        .ok_or_else(|| DockerPullError::InvalidInput(format!("invalid digest `{digest}`")))?;
-    Ok(format!("blobs/{algorithm}/{value}"))
-}
-
-fn digest_bytes(bytes: &[u8]) -> String {
-    use sha2::{Digest as _, Sha256};
-
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    format!("sha256:{}", hex::encode(hasher.finalize()))
+    let parsed = parse_digest(digest)?;
+    Ok(format!("blobs/{}/{}", parsed.algorithm, parsed.value))
 }
 
 fn docker_repo_tags(reference: &str) -> Result<Vec<String>> {
@@ -360,12 +351,7 @@ fn docker_repositories(reference: &str, config_digest: &str) -> Result<Option<se
     let (image_name, tag_name) = image_name.rsplit_once(':').ok_or_else(|| {
         DockerPullError::InvalidInput(format!("invalid display reference `{image_name}`"))
     })?;
-    let image_id = config_digest
-        .split_once(':')
-        .map(|(_, value)| value)
-        .ok_or_else(|| {
-            DockerPullError::InvalidInput(format!("invalid digest `{config_digest}`"))
-        })?;
+    let image_id = digest_hex(config_digest)?;
     let mut tags = serde_json::Map::new();
     tags.insert(
         tag_name.to_string(),

@@ -9,6 +9,7 @@ use tar::Archive;
 use tempfile::{NamedTempFile, TempDir};
 use tokio::task::JoinSet;
 
+use crate::digest::parse_digest;
 use crate::error::{DockerPullError, Result};
 use crate::image::LayerSpec;
 use crate::store::Store;
@@ -271,10 +272,8 @@ fn save_manifest_entries(path: &Path) -> Result<Vec<SaveManifestEntry>> {
 }
 
 fn extracted_layer_path(root: &Path, diff_id: &str) -> Result<PathBuf> {
-    let (algorithm, value) = diff_id
-        .split_once(':')
-        .ok_or_else(|| DockerPullError::InvalidInput(format!("invalid digest `{diff_id}`")))?;
-    Ok(root.join(format!("{algorithm}-{value}.tar")))
+    let parsed = parse_digest(diff_id)?;
+    Ok(root.join(format!("{}-{}.tar", parsed.algorithm, parsed.value)))
 }
 
 fn copy_archive_entry_with_digest<R: Read>(
