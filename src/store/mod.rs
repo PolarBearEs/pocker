@@ -17,7 +17,9 @@ use fs::{
 #[derive(Debug, Clone)]
 pub struct Store {
     root: PathBuf,
-    _shared_lock: Option<std::sync::Arc<File>>,
+    // Keeps the active cache lock held for the Store lifetime.
+    #[allow(dead_code)]
+    shared_lock: Option<std::sync::Arc<File>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -78,7 +80,7 @@ impl Store {
         ensure_directory(&root.join("references"))?;
         Ok(Self {
             root,
-            _shared_lock: lock,
+            shared_lock: lock,
         })
     }
 
