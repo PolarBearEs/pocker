@@ -6,7 +6,9 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use tokio::fs as tokio_fs;
 
-use crate::digest::{digest_bytes_for_digest, digest_file_for_digest, parse_digest, sha256_hex};
+use crate::digest::{
+    DigestAlgorithm, digest_bytes_for_digest, digest_file_for_digest, parse_digest, sha256_hex,
+};
 use crate::error::{DockerPullError, Result};
 use crate::registry::Descriptor;
 use fs::{
@@ -73,9 +75,10 @@ impl Store {
         } else {
             None
         };
-        for algorithm in ["sha256", "sha384", "sha512"] {
-            ensure_directory(&root.join("blobs").join(algorithm))?;
-            ensure_directory(&root.join("partials").join(algorithm))?;
+        for algorithm in DigestAlgorithm::ALL {
+            let algorithm = algorithm.to_string();
+            ensure_directory(&root.join("blobs").join(&algorithm))?;
+            ensure_directory(&root.join("partials").join(&algorithm))?;
         }
         ensure_directory(&root.join("references"))?;
         Ok(Self {
