@@ -351,6 +351,7 @@ async fn fetch_blob(state: &ServeState, reference: &ImageReference, digest: &str
         ui: Arc::new(Ui::new(state.quiet, false)),
         blob_retry_limit: state.blob_retry_limit,
         blob_locks: Arc::clone(&state.blob_locks),
+        daemon_layer_cache: None,
     };
     download::download_blob(&context, reference, descriptor).await
 }
@@ -794,6 +795,7 @@ mod tests {
             ui: Arc::new(Ui::new(true, false)),
             blob_retry_limit: Some(1),
             blob_locks: Arc::new(BlobDownloadLocks::default()),
+            daemon_layer_cache: None,
         });
 
         puller

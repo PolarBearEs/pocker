@@ -7,6 +7,7 @@ use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
 use tar::Archive;
 use tempfile::{NamedTempFile, TempDir};
+use tokio::sync::OnceCell;
 use tokio::task::JoinSet;
 
 use crate::digest::parse_digest;
@@ -18,19 +19,49 @@ use super::daemon::{DaemonImage, DaemonImageSummary, DockerDaemon};
 
 const DAEMON_INSPECT_CONCURRENCY: usize = 8;
 
+#[derive(Debug, Default)]
+pub struct DaemonLayerCache {
+    images: OnceCell<Vec<DaemonImage>>,
+}
+
+impl DaemonLayerCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub async fn coverage(&self, layers: &[LayerSpec]) -> Result<HashMap<String, String>> {
+        let wanted = wanted_diff_ids(layers);
+        if wanted.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let images = self
+            .images
+            .get_or_try_init(|| async {
+                let daemon = DockerDaemon::connect()?;
+                list_daemon_images(&daemon).await
+            })
+            .await?;
+        let chosen = choose_from_daemon_images(images.iter().cloned(), &wanted);
+        Ok(coverage_from_chosen(chosen))
+    }
+}
+
 pub async fn daemon_layer_coverage(layers: &[LayerSpec]) -> Result<HashMap<String, String>> {
+    DaemonLayerCache::new().coverage(layers).await
+}
+
+fn wanted_diff_ids(layers: &[LayerSpec]) -> HashSet<String> {
     let mut wanted = HashSet::new();
     for layer in layers {
         if !layer.diff_id.is_empty() {
             wanted.insert(layer.diff_id.clone());
         }
     }
-    if wanted.is_empty() {
-        return Ok(HashMap::new());
-    }
+    wanted
+}
 
-    let daemon = DockerDaemon::connect()?;
-    let chosen = choose_daemon_images(&daemon, &wanted).await?;
+fn coverage_from_chosen(chosen: Vec<ChosenImageLayers>) -> HashMap<String, String> {
     let mut coverage = HashMap::new();
     for chosen in chosen {
         let label = chosen.image.label();
@@ -38,7 +69,7 @@ pub async fn daemon_layer_coverage(layers: &[LayerSpec]) -> Result<HashMap<Strin
             coverage.insert(diff_id, label.clone());
         }
     }
-    Ok(coverage)
+    coverage
 }
 
 #[derive(Debug, Deserialize)]
@@ -169,6 +200,13 @@ async fn choose_daemon_images(
     wanted: &HashSet<String>,
 ) -> Result<Vec<ChosenImageLayers>> {
     let images = list_daemon_images(daemon).await?;
+    Ok(choose_from_daemon_images(images, wanted))
+}
+
+fn choose_from_daemon_images(
+    images: impl IntoIterator<Item = DaemonImage>,
+    wanted: &HashSet<String>,
+) -> Vec<ChosenImageLayers> {
     let mut chosen = Vec::new();
     let mut unresolved = wanted.clone();
 
@@ -194,7 +232,7 @@ async fn choose_daemon_images(
         }
     }
 
-    Ok(chosen)
+    chosen
 }
 
 async fn materialize_layers_from_saved_image(
