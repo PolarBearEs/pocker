@@ -11,6 +11,7 @@ use crate::error::{DockerPullError, Result};
 use crate::pull::PullContext;
 use crate::reference::ImageReference;
 use crate::registry::Descriptor;
+use crate::retry::{retry_budget, retry_limit_exceeded};
 use crate::store::DownloadPlan;
 
 const CHECKPOINT_BYTES: u64 = 8 * 1024 * 1024;
@@ -281,17 +282,14 @@ fn register_retry(
         .blob_retry_limit
         .is_some_and(|limit| next_retry > limit)
     {
-        return Err(DockerPullError::RetryLimitExceeded {
-            operation: format!("blob download {digest}"),
+        return Err(retry_limit_exceeded(
+            format!("blob download {digest}"),
             retries,
             detail,
-        });
+        ));
     }
 
-    let retry_budget = match context.blob_retry_limit {
-        Some(limit) => format!("{next_retry}/{limit}"),
-        None => format!("{next_retry}/unlimited"),
-    };
+    let retry_budget = retry_budget(next_retry, context.blob_retry_limit);
     context.ui.warn(format!(
         "{detail} for {digest}; retrying in {:?} ({retry_budget})",
         delay
