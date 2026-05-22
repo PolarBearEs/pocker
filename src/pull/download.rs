@@ -11,9 +11,7 @@ use crate::error::{DockerPullError, Result};
 use crate::pull::PullContext;
 use crate::reference::ImageReference;
 use crate::registry::Descriptor;
-use crate::retry::{
-    jittered_backoff_delay, retry_budget, retry_limit_exceeded, retry_limit_exhausted,
-};
+use crate::retry::{jittered_backoff_delay, record_retry_attempt};
 use crate::store::DownloadPlan;
 
 const CHECKPOINT_BYTES: u64 = 8 * 1024 * 1024;
@@ -272,22 +270,19 @@ fn register_retry(
     detail: impl Into<String>,
     delay: Duration,
 ) -> Result<u32> {
+    let mut retries = retries;
     let detail = detail.into();
-    let next_retry = retries + 1;
-    if retry_limit_exhausted(retries, context.blob_retry_limit) {
-        return Err(retry_limit_exceeded(
-            format!("blob download {digest}"),
-            retries,
-            detail,
-        ));
-    }
-
-    let retry_budget = retry_budget(next_retry, context.blob_retry_limit);
+    let retry_budget = record_retry_attempt(
+        &mut retries,
+        context.blob_retry_limit,
+        format!("blob download {digest}"),
+        detail.clone(),
+    )?;
     context.ui.warn(format!(
         "{detail} for {digest}; retrying in {:?} ({retry_budget})",
         delay
     ));
-    Ok(next_retry)
+    Ok(retries)
 }
 
 #[cfg(test)]

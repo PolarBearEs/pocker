@@ -24,9 +24,7 @@ use crate::digest::canonical_digest_bytes;
 use crate::error::{DockerPullError, Result};
 use crate::platform::Platform;
 use crate::reference::ImageReference;
-use crate::retry::{
-    jittered_backoff_delay, retry_budget, retry_limit_exceeded, retry_limit_exhausted,
-};
+use crate::retry::{jittered_backoff_delay, record_retry_attempt};
 
 pub const DEFAULT_REQUEST_RETRIES: u32 = 5;
 const MAX_AUTH_RETRIES: u32 = 2;
@@ -553,12 +551,12 @@ impl RegistryClient {
         delay: Duration,
         reason: RetryReason,
     ) -> Result<()> {
-        if retry_limit_exhausted(*retries, self.request_retry_limit) {
-            return Err(retry_limit_exceeded("registry request", *retries, detail));
-        }
-
-        let next_retry = *retries + 1;
-        let retry_budget = retry_budget(next_retry, self.request_retry_limit);
+        let retry_budget = record_retry_attempt(
+            retries,
+            self.request_retry_limit,
+            "registry request",
+            detail,
+        )?;
         match reason {
             RetryReason::SendError => warn!(
                 "request failed before response, retrying in {:?} ({})",
@@ -570,7 +568,6 @@ impl RegistryClient {
             ),
         }
         sleep(delay).await;
-        *retries = next_retry;
         Ok(())
     }
 
