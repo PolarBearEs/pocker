@@ -171,10 +171,12 @@ pub async fn download_blob(
         .ui
         .set_layer_status(&descriptor.digest, "Verifying checksum");
     context.store.finalize_download(&descriptor).await?;
-    if let Ok(partial) = context.store.partial_path(&descriptor.digest)
-        && partial.exists()
-    {
-        let _ = fs::remove_file(partial).await;
+    if let Ok(partial) = context.store.partial_path(&descriptor.digest) {
+        match fs::remove_file(partial).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => {}
+        }
     }
     context.ui.finish_layer_download(&descriptor.digest);
     Ok(())
