@@ -304,13 +304,10 @@ impl NormalizeOptionPath for Option<PathBuf> {
 fn find_default_compose_files(working_dir: &Path) -> Result<Vec<PathBuf>> {
     let mut current = working_dir;
     loop {
-        let candidates = find_files(&DEFAULT_COMPOSE_FILES, current);
-        if let Some(base_file) = candidates.first() {
-            let mut files = vec![normalize_path(base_file)?];
-            if let Some(override_file) =
-                find_files(&DEFAULT_COMPOSE_OVERRIDE_FILES, current).first()
-            {
-                files.push(normalize_path(override_file)?);
+        if let Some(base_file) = find_file(&DEFAULT_COMPOSE_FILES, current) {
+            let mut files = vec![normalize_path(&base_file)?];
+            if let Some(override_file) = find_file(&DEFAULT_COMPOSE_OVERRIDE_FILES, current) {
+                files.push(normalize_path(&override_file)?);
             }
             return Ok(files);
         }
@@ -330,12 +327,11 @@ fn find_default_compose_files(working_dir: &Path) -> Result<Vec<PathBuf>> {
     )))
 }
 
-fn find_files(names: &[&str], directory: &Path) -> Vec<PathBuf> {
+fn find_file(names: &[&str], directory: &Path) -> Option<PathBuf> {
     names
         .iter()
         .map(|name| directory.join(name))
-        .filter(|candidate| candidate.is_file())
-        .collect()
+        .find(|candidate| candidate.is_file())
 }
 
 fn absolutize(base: &Path, file: &Path) -> PathBuf {
