@@ -160,7 +160,7 @@ impl RegistryClient {
             let manifest: ImageManifest = serde_json::from_slice(&body)?;
             let manifest_descriptor = Descriptor {
                 media_type: manifest.media_type.clone(),
-                digest: digest.unwrap_or_else(|| digest_bytes(&body)),
+                digest: digest.unwrap_or_else(|| canonical_digest_bytes(&body)),
                 size: body.len() as i64,
                 platform: Some(platform.clone()),
                 annotations: None,
@@ -587,7 +587,7 @@ async fn raw_manifest_from_response(response: Response) -> Result<RawManifest> {
             } else {
                 media_type
             },
-            digest: digest.unwrap_or_else(|| digest_bytes(&bytes)),
+            digest: digest.unwrap_or_else(|| canonical_digest_bytes(&bytes)),
             size: bytes.len() as i64,
             platform: None,
             annotations: None,
@@ -743,10 +743,6 @@ fn response_content_media_type(response: &Response) -> String {
         .and_then(|value| value.to_str().ok())
         .map(|value| value.split(';').next().unwrap_or(value).trim().to_string())
         .unwrap_or_default()
-}
-
-fn digest_bytes(bytes: &[u8]) -> String {
-    canonical_digest_bytes(bytes)
 }
 
 fn retry_limit_exceeded(
