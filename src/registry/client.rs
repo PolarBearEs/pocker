@@ -21,7 +21,9 @@ use crate::digest::canonical_digest_bytes;
 use crate::error::{DockerPullError, Result};
 use crate::platform::Platform;
 use crate::reference::ImageReference;
-use crate::retry::{retry_budget, retry_limit_exceeded, retry_limit_exhausted};
+use crate::retry::{
+    jittered_backoff_delay, retry_budget, retry_limit_exceeded, retry_limit_exhausted,
+};
 
 pub const DEFAULT_REQUEST_RETRIES: u32 = 5;
 const MAX_AUTH_RETRIES: u32 = 2;
@@ -455,7 +457,7 @@ impl RegistryClient {
                         return Err(retry_limit_exceeded("registry request", retries, detail));
                     }
                     let next_retry = retries + 1;
-                    let delay = backoff_delay(retries);
+                    let delay = jittered_backoff_delay(retries);
                     let retry_budget = retry_budget(next_retry, self.request_retry_limit);
                     warn!(
                         "request failed before response, retrying in {:?} ({})",
@@ -509,7 +511,7 @@ impl RegistryClient {
                 }
                 let next_retry = retries + 1;
                 let delay = retry_after_delay(response.headers().get(RETRY_AFTER))
-                    .unwrap_or_else(|| backoff_delay(retries));
+                    .unwrap_or_else(|| jittered_backoff_delay(retries));
                 let retry_budget = retry_budget(next_retry, self.request_retry_limit);
                 warn!(
                     "registry returned {}, retrying in {:?} ({})",
@@ -703,11 +705,6 @@ fn is_retryable_status(status: StatusCode) -> bool {
 
 fn is_retryable_http_error(error: &reqwest::Error) -> bool {
     error.is_timeout() || error.is_connect() || error.is_request() || error.is_body()
-}
-
-fn backoff_delay(attempt: u32) -> Duration {
-    let seconds = 2_u64.saturating_pow(attempt.min(5)) + 1;
-    Duration::from_secs(seconds)
 }
 
 fn retry_after_delay(value: Option<&HeaderValue>) -> Option<Duration> {

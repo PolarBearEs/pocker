@@ -11,7 +11,9 @@ use crate::error::{DockerPullError, Result};
 use crate::pull::PullContext;
 use crate::reference::ImageReference;
 use crate::registry::Descriptor;
-use crate::retry::{retry_budget, retry_limit_exceeded, retry_limit_exhausted};
+use crate::retry::{
+    jittered_backoff_delay, retry_budget, retry_limit_exceeded, retry_limit_exhausted,
+};
 use crate::store::DownloadPlan;
 
 const CHECKPOINT_BYTES: u64 = 8 * 1024 * 1024;
@@ -61,7 +63,7 @@ pub async fn download_blob(
             .await?;
         let status = response.status();
         if status == StatusCode::OK && offset > 0 {
-            let delay = retry_delay(offset);
+            let delay = jittered_backoff_delay(retries);
             retries = register_retry(
                 context,
                 &descriptor.digest,
@@ -80,7 +82,7 @@ pub async fn download_blob(
             continue;
         }
         if status == StatusCode::RANGE_NOT_SATISFIABLE {
-            let delay = retry_delay(offset);
+            let delay = jittered_backoff_delay(retries);
             retries = register_retry(
                 context,
                 &descriptor.digest,
@@ -132,7 +134,7 @@ pub async fn download_blob(
                     }
                 }
                 Err(error) => {
-                    let delay = retry_delay(offset);
+                    let delay = jittered_backoff_delay(retries);
                     retries = register_retry(
                         context,
                         &descriptor.digest,
@@ -261,14 +263,6 @@ fn reset_download_progress(
 fn reset_checkpoint_tracking(bytes_since_checkpoint: &mut u64, last_checkpoint: &mut Instant) {
     *bytes_since_checkpoint = 0;
     *last_checkpoint = Instant::now();
-}
-
-fn retry_delay(offset: u64) -> Duration {
-    if offset == 0 {
-        Duration::from_secs(2)
-    } else {
-        Duration::from_secs(1)
-    }
 }
 
 fn register_retry(
