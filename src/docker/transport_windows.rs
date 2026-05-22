@@ -14,6 +14,8 @@ use tokio::net::windows::named_pipe::ClientOptions;
 use tokio_util::io::ReaderStream;
 
 use crate::error::{DockerPullError, Result};
+#[cfg(windows)]
+use crate::http::USER_AGENT;
 
 #[cfg(windows)]
 use super::{DockerResponse, ensure_success_status};
@@ -54,10 +56,9 @@ pub(super) async fn request_bytes(
     body: Vec<u8>,
 ) -> Result<DockerResponse> {
     let mut pipe = open_named_pipe(pipe_path).await?;
+    let len = body.len();
     let headers = format!(
-        "{method} {path} HTTP/1.1\r\nHost: docker\r\nUser-Agent: pocker/{}\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
-        env!("CARGO_PKG_VERSION"),
-        body.len()
+        "{method} {path} HTTP/1.1\r\nHost: docker\r\nUser-Agent: {USER_AGENT}\r\nConnection: close\r\nContent-Length: {len}\r\n\r\n"
     );
     pipe.write_all(headers.as_bytes()).await?;
     pipe.write_all(&body).await?;
@@ -76,8 +77,7 @@ pub(super) async fn request_file(
 ) -> Result<DockerResponse> {
     let mut pipe = open_named_pipe(pipe_path).await?;
     let headers = format!(
-        "{method} {path} HTTP/1.1\r\nHost: docker\r\nUser-Agent: pocker/{}\r\nConnection: close\r\nContent-Type: {content_type}\r\nContent-Length: {len}\r\n\r\n",
-        env!("CARGO_PKG_VERSION")
+        "{method} {path} HTTP/1.1\r\nHost: docker\r\nUser-Agent: {USER_AGENT}\r\nConnection: close\r\nContent-Type: {content_type}\r\nContent-Length: {len}\r\n\r\n"
     );
     pipe.write_all(headers.as_bytes()).await?;
     tokio::io::copy(&mut file, &mut pipe).await?;
@@ -95,8 +95,7 @@ pub(super) async fn request_chunked_stream(
 ) -> Result<DockerResponse> {
     let mut pipe = open_named_pipe(pipe_path).await?;
     let headers = format!(
-        "{method} {path} HTTP/1.1\r\nHost: docker\r\nUser-Agent: pocker/{}\r\nConnection: close\r\nContent-Type: {content_type}\r\nTransfer-Encoding: chunked\r\n\r\n",
-        env!("CARGO_PKG_VERSION")
+        "{method} {path} HTTP/1.1\r\nHost: docker\r\nUser-Agent: {USER_AGENT}\r\nConnection: close\r\nContent-Type: {content_type}\r\nTransfer-Encoding: chunked\r\n\r\n"
     );
     pipe.write_all(headers.as_bytes()).await?;
     while let Some(chunk) = stream.next().await {
@@ -121,8 +120,7 @@ pub(super) async fn request_to_file(
 ) -> Result<()> {
     let mut pipe = open_named_pipe(pipe_path).await?;
     let headers = format!(
-        "{method} {path} HTTP/1.1\r\nHost: docker\r\nUser-Agent: pocker/{}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
-        env!("CARGO_PKG_VERSION")
+        "{method} {path} HTTP/1.1\r\nHost: docker\r\nUser-Agent: {USER_AGENT}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
     );
     pipe.write_all(headers.as_bytes()).await?;
     pipe.flush().await?;
