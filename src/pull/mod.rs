@@ -199,9 +199,8 @@ impl Puller {
             }
             let context = self.context.clone();
             let reference = reference.clone();
-            let normalized = normalized.clone();
             queue.push(tokio::spawn(async move {
-                download::download_blob(&context, &reference, &normalized, descriptor).await
+                download::download_blob(&context, &reference, descriptor).await
             }));
         }
 

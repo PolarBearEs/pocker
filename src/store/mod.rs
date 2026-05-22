@@ -51,8 +51,6 @@ pub struct ClearedCacheFile {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DownloadCheckpoint {
-    reference: String,
-    media_type: String,
     expected_size: u64,
     durable_offset: u64,
 }
@@ -178,7 +176,6 @@ impl Store {
 
     pub async fn prepare_download(
         &self,
-        reference: &str,
         descriptor: &Descriptor,
         expected_size: u64,
     ) -> Result<DownloadPlan> {
@@ -195,8 +192,6 @@ impl Store {
         atomic_write_json(
             &metadata_path,
             &DownloadCheckpoint {
-                reference: reference.to_string(),
-                media_type: descriptor.media_type.clone(),
                 expected_size,
                 durable_offset,
             },
@@ -214,18 +209,9 @@ impl Store {
         expected_size: u64,
     ) -> Result<()> {
         let path = self.partial_metadata_path(digest)?;
-        let stored =
-            read_json_if_exists::<DownloadCheckpoint>(&path)?.unwrap_or(DownloadCheckpoint {
-                reference: String::new(),
-                media_type: String::new(),
-                expected_size,
-                durable_offset: 0,
-            });
         atomic_write_json(
             &path,
             &DownloadCheckpoint {
-                reference: stored.reference,
-                media_type: stored.media_type,
                 expected_size,
                 durable_offset,
             },
@@ -467,11 +453,7 @@ mod tests {
             annotations: None,
         };
         store
-            .prepare_download(
-                "registry-1.docker.io/library/alpine:latest",
-                &descriptor,
-                10,
-            )
+            .prepare_download(&descriptor, 10)
             .await
             .expect("download checkpoint should be created");
         let partial = store
@@ -482,11 +464,7 @@ mod tests {
             .checkpoint_download(&descriptor.digest, 8, 10)
             .expect("download state should be updated");
         let plan = store
-            .prepare_download(
-                "registry-1.docker.io/library/alpine:latest",
-                &descriptor,
-                10,
-            )
+            .prepare_download(&descriptor, 10)
             .await
             .expect("download plan should be created");
         assert_eq!(plan.durable_offset, 4);

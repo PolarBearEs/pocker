@@ -19,7 +19,6 @@ const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(2);
 pub async fn download_blob(
     context: &PullContext,
     reference: &ImageReference,
-    normalized_reference: &str,
     descriptor: Descriptor,
 ) -> Result<()> {
     let _blob_guard = context.blob_locks.lock(&descriptor.digest).await;
@@ -39,7 +38,7 @@ pub async fn download_blob(
     let expected_size = head.size.unwrap_or(descriptor.expected_size()?);
     let mut plan = context
         .store
-        .prepare_download(normalized_reference, &descriptor, expected_size)
+        .prepare_download(&descriptor, expected_size)
         .await?;
     let mut offset = plan.durable_offset;
     context
@@ -75,15 +74,8 @@ pub async fn download_blob(
                 "registry ignored range request for {}, restarting blob",
                 descriptor.digest
             );
-            reset_download_state(
-                context,
-                normalized_reference,
-                &descriptor,
-                expected_size,
-                &mut plan,
-                &mut offset,
-            )
-            .await?;
+            reset_download_state(context, &descriptor, expected_size, &mut plan, &mut offset)
+                .await?;
             reset_checkpoint_tracking(&mut bytes_since_checkpoint, &mut last_checkpoint);
             tokio::time::sleep(delay).await;
             continue;
@@ -235,7 +227,6 @@ fn content_range_start(value: &str) -> Option<u64> {
 
 async fn reset_download_state(
     context: &PullContext,
-    normalized_reference: &str,
     descriptor: &Descriptor,
     expected_size: u64,
     plan: &mut DownloadPlan,
@@ -247,7 +238,7 @@ async fn reset_download_state(
         .await?;
     *plan = context
         .store
-        .prepare_download(normalized_reference, descriptor, expected_size)
+        .prepare_download(descriptor, expected_size)
         .await?;
     reset_download_progress(context, &descriptor.digest, expected_size, offset);
     Ok(())
