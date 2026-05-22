@@ -99,7 +99,7 @@ impl ImageReference {
     }
 }
 
-fn is_docker_hub(registry: &str) -> bool {
+pub(crate) fn is_docker_hub(registry: &str) -> bool {
     matches!(
         registry,
         "registry-1.docker.io" | "docker.io" | "index.docker.io"

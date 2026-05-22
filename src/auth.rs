@@ -10,6 +10,7 @@ use tokio::sync::{Mutex, OnceCell};
 use tracing::warn;
 
 use crate::error::{DockerPullError, Result};
+use crate::reference::is_docker_hub;
 
 #[derive(Debug, Clone)]
 pub enum Credentials {
@@ -272,11 +273,7 @@ fn registry_keys(registry: &str) -> Vec<&str> {
 }
 
 fn docker_hub_aliases(registry: &str) -> impl Iterator<Item = &'static str> {
-    let is_hub = matches!(
-        registry,
-        "registry-1.docker.io" | "docker.io" | "index.docker.io"
-    );
-    let aliases: &'static [&'static str] = if is_hub {
+    let aliases: &'static [&'static str] = if is_docker_hub(registry) {
         &[
             "registry-1.docker.io",
             "https://registry-1.docker.io",
