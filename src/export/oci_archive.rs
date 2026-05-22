@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use tar::{Builder, Header};
 
+use crate::digest::{canonical_digest_bytes, digest_hex, parse_digest};
 use crate::docker;
 use crate::error::{DockerPullError, Result};
 use crate::image::parse_diff_ids;
@@ -321,18 +322,12 @@ fn resolved_manifest_media_type(
 }
 
 fn blob_tar_path(digest: &str) -> Result<String> {
-    let (algorithm, value) = digest
-        .split_once(':')
-        .ok_or_else(|| DockerPullError::InvalidInput(format!("invalid digest `{digest}`")))?;
-    Ok(format!("blobs/{algorithm}/{value}"))
+    let parsed = parse_digest(digest)?;
+    Ok(format!("blobs/{}/{}", parsed.algorithm, parsed.value))
 }
 
 fn digest_bytes(bytes: &[u8]) -> String {
-    use sha2::{Digest as _, Sha256};
-
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    format!("sha256:{}", hex::encode(hasher.finalize()))
+    canonical_digest_bytes(bytes)
 }
 
 fn docker_repo_tags(reference: &str) -> Result<Vec<String>> {
@@ -360,12 +355,7 @@ fn docker_repositories(reference: &str, config_digest: &str) -> Result<Option<se
     let (image_name, tag_name) = image_name.rsplit_once(':').ok_or_else(|| {
         DockerPullError::InvalidInput(format!("invalid display reference `{image_name}`"))
     })?;
-    let image_id = config_digest
-        .split_once(':')
-        .map(|(_, value)| value)
-        .ok_or_else(|| {
-            DockerPullError::InvalidInput(format!("invalid digest `{config_digest}`"))
-        })?;
+    let image_id = digest_hex(config_digest)?;
     let mut tags = serde_json::Map::new();
     tags.insert(
         tag_name.to_string(),
