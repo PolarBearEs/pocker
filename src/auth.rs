@@ -12,6 +12,14 @@ use tracing::warn;
 use crate::error::{DockerPullError, Result};
 use crate::reference::is_docker_hub;
 
+const DOCKER_HUB_AUTH_KEYS: &[&str] = &[
+    "https://index.docker.io/v1/",
+    "registry-1.docker.io",
+    "https://registry-1.docker.io",
+    "index.docker.io",
+    "docker.io",
+];
+
 #[derive(Debug, Clone)]
 pub enum Credentials {
     Basic { username: String, password: String },
@@ -264,27 +272,15 @@ fn invoke_helper_command(
 
 fn registry_keys(registry: &str) -> Vec<&str> {
     let mut keys = vec![registry];
-    for alias in docker_hub_aliases(registry) {
-        if alias != registry {
-            keys.push(alias);
-        }
+    if is_docker_hub(registry) {
+        keys.extend(
+            DOCKER_HUB_AUTH_KEYS
+                .iter()
+                .copied()
+                .filter(|key| *key != registry),
+        );
     }
     keys
-}
-
-fn docker_hub_aliases(registry: &str) -> impl Iterator<Item = &'static str> {
-    let aliases: &'static [&'static str] = if is_docker_hub(registry) {
-        &[
-            "registry-1.docker.io",
-            "https://registry-1.docker.io",
-            "index.docker.io",
-            "https://index.docker.io/v1/",
-            "docker.io",
-        ]
-    } else {
-        &[]
-    };
-    aliases.iter().copied()
 }
 
 pub(crate) fn read_credentials(
@@ -465,9 +461,9 @@ mod tests {
             registry_keys("registry-1.docker.io"),
             vec![
                 "registry-1.docker.io",
+                "https://index.docker.io/v1/",
                 "https://registry-1.docker.io",
                 "index.docker.io",
-                "https://index.docker.io/v1/",
                 "docker.io",
             ]
         );
