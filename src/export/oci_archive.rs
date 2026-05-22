@@ -140,7 +140,8 @@ fn write_oci_archive_to_writer_with_fallbacks<W: Write>(
     if manifest_descriptor.media_type.is_empty() {
         manifest_descriptor.media_type = archive_manifest.media_type.clone();
     }
-    if let Some(ref_name) = oci_ref_name(&reference.reference)? {
+    let parsed_reference = ImageReference::parse(&reference.reference)?;
+    if let Some(ref_name) = oci_ref_name(&parsed_reference) {
         let mut annotations = manifest_descriptor.annotations.unwrap_or_default();
         annotations.insert("org.opencontainers.image.ref.name".to_string(), ref_name);
         manifest_descriptor.annotations = Some(annotations);
@@ -166,7 +167,7 @@ fn write_oci_archive_to_writer_with_fallbacks<W: Write>(
         "manifest.json",
         &vec![DockerManifestEntry {
             config: config_path,
-            repo_tags: docker_repo_tags(&reference.reference)?,
+            repo_tags: docker_repo_tags(&parsed_reference),
             layers: layer_sources
                 .iter()
                 .map(|source| source.archive_path.clone())
@@ -174,8 +175,7 @@ fn write_oci_archive_to_writer_with_fallbacks<W: Write>(
         }],
     )?;
 
-    if let Some(repositories) = docker_repositories(&reference.reference, &reference.config_digest)?
-    {
+    if let Some(repositories) = docker_repositories(&parsed_reference, &reference.config_digest)? {
         append_json(&mut builder, "repositories", &repositories)?;
     }
 
@@ -326,28 +326,28 @@ fn blob_tar_path(digest: &str) -> Result<String> {
     Ok(format!("blobs/{}/{}", parsed.algorithm, parsed.value))
 }
 
-fn docker_repo_tags(reference: &str) -> Result<Vec<String>> {
-    let parsed = ImageReference::parse(reference)?;
-    match parsed.target {
-        ReferenceTarget::Tag(_) => Ok(vec![parsed.display_name()]),
-        ReferenceTarget::Digest(_) => Ok(Vec::new()),
+fn docker_repo_tags(reference: &ImageReference) -> Vec<String> {
+    match &reference.target {
+        ReferenceTarget::Tag(_) => vec![reference.display_name()],
+        ReferenceTarget::Digest(_) => Vec::new(),
     }
 }
 
-fn oci_ref_name(reference: &str) -> Result<Option<String>> {
-    let parsed = ImageReference::parse(reference)?;
-    match parsed.target {
-        ReferenceTarget::Tag(tag) => Ok(Some(tag)),
-        ReferenceTarget::Digest(_) => Ok(None),
+fn oci_ref_name(reference: &ImageReference) -> Option<String> {
+    match &reference.target {
+        ReferenceTarget::Tag(tag) => Some(tag.clone()),
+        ReferenceTarget::Digest(_) => None,
     }
 }
 
-fn docker_repositories(reference: &str, config_digest: &str) -> Result<Option<serde_json::Value>> {
-    let parsed = ImageReference::parse(reference)?;
-    let ReferenceTarget::Tag(_) = &parsed.target else {
+fn docker_repositories(
+    reference: &ImageReference,
+    config_digest: &str,
+) -> Result<Option<serde_json::Value>> {
+    let ReferenceTarget::Tag(_) = &reference.target else {
         return Ok(None);
     };
-    let image_name = parsed.display_name();
+    let image_name = reference.display_name();
     let (image_name, tag_name) = image_name.rsplit_once(':').ok_or_else(|| {
         DockerPullError::InvalidInput(format!("invalid display reference `{image_name}`"))
     })?;
@@ -376,21 +376,25 @@ mod tests {
     };
     use crate::digest::canonical_digest_bytes;
     use crate::platform::Platform;
+    use crate::reference::ImageReference;
     use crate::registry::Descriptor;
     use crate::store::{Store, StoredReference};
 
     #[test]
     fn oci_ref_name_uses_tag_only() {
-        let ref_name = oci_ref_name("ghcr.io/acme/app:1.2.3").expect("reference should parse");
+        let reference =
+            ImageReference::parse("ghcr.io/acme/app:1.2.3").expect("reference should parse");
+        let ref_name = oci_ref_name(&reference);
         assert_eq!(ref_name.as_deref(), Some("1.2.3"));
     }
 
     #[test]
     fn oci_ref_name_is_omitted_for_digest_references() {
-        let ref_name = oci_ref_name(
+        let reference = ImageReference::parse(
             "ghcr.io/acme/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         )
         .expect("reference should parse");
+        let ref_name = oci_ref_name(&reference);
         assert!(ref_name.is_none());
     }
 
