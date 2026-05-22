@@ -11,7 +11,7 @@ use crate::error::{DockerPullError, Result};
 use crate::pull::PullContext;
 use crate::reference::ImageReference;
 use crate::registry::Descriptor;
-use crate::retry::{retry_budget, retry_limit_exceeded};
+use crate::retry::{retry_budget, retry_limit_exceeded, retry_limit_exhausted};
 use crate::store::DownloadPlan;
 
 const CHECKPOINT_BYTES: u64 = 8 * 1024 * 1024;
@@ -32,6 +32,8 @@ pub async fn download_blob(
         return Ok(());
     }
 
+    // OCI descriptors carry the authoritative blob size, so avoid a pre-flight
+    // HEAD request and let the first ranged GET surface missing blobs.
     let expected_size = descriptor.expected_size()?;
     let mut plan = context
         .store
@@ -278,10 +280,7 @@ fn register_retry(
 ) -> Result<u32> {
     let detail = detail.into();
     let next_retry = retries + 1;
-    if context
-        .blob_retry_limit
-        .is_some_and(|limit| next_retry > limit)
-    {
+    if retry_limit_exhausted(retries, context.blob_retry_limit) {
         return Err(retry_limit_exceeded(
             format!("blob download {digest}"),
             retries,

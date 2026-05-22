@@ -61,19 +61,17 @@ impl PullRequestOptions {
     }
 
     pub(crate) fn from_compose_pull_args(args: ComposePullArgs) -> Self {
-        Self {
-            ..Self::from_args(PullOptionArgs {
-                download: args.download,
-                image_parallel: args.image_parallel,
-                retry: args.retry,
-                import: args.import,
-                registry: args.registry,
-                auth: args.auth,
-                output: args.output,
-                cache: args.cache,
-                no_animations: true,
-            })
-        }
+        Self::from_args(PullOptionArgs {
+            download: args.download,
+            image_parallel: args.image_parallel,
+            retry: args.retry,
+            import: args.import,
+            registry: args.registry,
+            auth: args.auth,
+            output: args.output,
+            cache: args.cache,
+            no_animations: true,
+        })
     }
 
     fn from_args(args: PullOptionArgs) -> Self {
