@@ -21,6 +21,7 @@ use crate::digest::canonical_digest_bytes;
 use crate::error::{DockerPullError, Result};
 use crate::platform::Platform;
 use crate::reference::ImageReference;
+use crate::retry::{retry_budget, retry_limit_exceeded, retry_limit_exhausted};
 
 pub const DEFAULT_REQUEST_RETRIES: u32 = 5;
 const MAX_AUTH_RETRIES: u32 = 2;
@@ -450,12 +451,12 @@ impl RegistryClient {
                 Ok(response) => response,
                 Err(error) if request.allow_retry && is_retryable_http_error(&error) => {
                     let detail = error.to_string();
-                    if request_retry_limit_exhausted(retries, self.request_retry_limit) {
+                    if retry_limit_exhausted(retries, self.request_retry_limit) {
                         return Err(retry_limit_exceeded("registry request", retries, detail));
                     }
                     let next_retry = retries + 1;
                     let delay = backoff_delay(retries);
-                    let retry_budget = format_retry_budget(next_retry, self.request_retry_limit);
+                    let retry_budget = retry_budget(next_retry, self.request_retry_limit);
                     warn!(
                         "request failed before response, retrying in {:?} ({})",
                         delay, retry_budget
@@ -499,7 +500,7 @@ impl RegistryClient {
 
             if request.allow_retry && is_retryable_status(response.status()) {
                 let status = response.status();
-                if request_retry_limit_exhausted(retries, self.request_retry_limit) {
+                if retry_limit_exhausted(retries, self.request_retry_limit) {
                     return Err(retry_limit_exceeded(
                         "registry request",
                         retries,
@@ -509,7 +510,7 @@ impl RegistryClient {
                 let next_retry = retries + 1;
                 let delay = retry_after_delay(response.headers().get(RETRY_AFTER))
                     .unwrap_or_else(|| backoff_delay(retries));
-                let retry_budget = format_retry_budget(next_retry, self.request_retry_limit);
+                let retry_budget = retry_budget(next_retry, self.request_retry_limit);
                 warn!(
                     "registry returned {}, retrying in {:?} ({})",
                     status, delay, retry_budget
@@ -718,17 +719,6 @@ fn retry_after_delay(value: Option<&HeaderValue>) -> Option<Duration> {
     retry_at.duration_since(std::time::SystemTime::now()).ok()
 }
 
-fn request_retry_limit_exhausted(retries: u32, retry_limit: Option<u32>) -> bool {
-    retry_limit.is_some_and(|limit| retries >= limit)
-}
-
-fn format_retry_budget(next_retry: u32, retry_limit: Option<u32>) -> String {
-    match retry_limit {
-        Some(limit) => format!("{next_retry}/{limit}"),
-        None => format!("{next_retry}/unlimited"),
-    }
-}
-
 fn header_string(response: &Response, name: &HeaderName) -> Result<Option<String>> {
     Ok(response
         .headers()
@@ -744,18 +734,6 @@ fn response_content_media_type(response: &Response) -> String {
         .and_then(|value| value.to_str().ok())
         .map(|value| value.split(';').next().unwrap_or(value).trim().to_string())
         .unwrap_or_default()
-}
-
-fn retry_limit_exceeded(
-    operation: &str,
-    retries: u32,
-    detail: impl Into<String>,
-) -> DockerPullError {
-    DockerPullError::RetryLimitExceeded {
-        operation: operation.to_string(),
-        retries,
-        detail: detail.into(),
-    }
 }
 
 #[cfg(test)]

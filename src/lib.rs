@@ -13,6 +13,7 @@ mod platform;
 mod pull;
 mod reference;
 mod registry;
+mod retry;
 mod runtime;
 mod serve_registry;
 mod signal;
