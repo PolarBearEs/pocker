@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use reqwest::header::{ACCEPT, HeaderValue, RANGE, RETRY_AFTER, WWW_AUTHENTICATE};
+use reqwest::header::{ACCEPT, HeaderName, HeaderValue, RANGE, RETRY_AFTER, WWW_AUTHENTICATE};
 use reqwest::{Client, Method, Response, StatusCode};
 use serde::Deserialize;
 use tokio::sync::Mutex;
@@ -24,6 +24,7 @@ use crate::reference::ImageReference;
 
 pub const DEFAULT_REQUEST_RETRIES: u32 = 5;
 const MAX_AUTH_RETRIES: u32 = 2;
+const DOCKER_CONTENT_DIGEST: HeaderName = HeaderName::from_static("docker-content-digest");
 
 #[derive(Debug, Clone)]
 pub struct RegistryClient {
@@ -139,7 +140,7 @@ impl RegistryClient {
         if response.status() == StatusCode::NOT_FOUND {
             return Err(DockerPullError::ManifestNotFound);
         }
-        let digest = header_string(&response, "docker-content-digest")?;
+        let digest = header_string(&response, &DOCKER_CONTENT_DIGEST)?;
         let media_type = response_content_media_type(&response);
         let body = response.bytes().await?.to_vec();
         let envelope: ManifestEnvelope = serde_json::from_slice(&body)?;
@@ -576,7 +577,7 @@ async fn raw_manifest_from_response(response: Response) -> Result<RawManifest> {
             response.status()
         )));
     }
-    let digest = header_string(&response, "docker-content-digest")?;
+    let digest = header_string(&response, &DOCKER_CONTENT_DIGEST)?;
     let media_type = response_content_media_type(&response);
     let bytes = response.bytes().await?.to_vec();
     let envelope: ManifestEnvelope = serde_json::from_slice(&bytes)?;
@@ -728,7 +729,7 @@ fn format_retry_budget(next_retry: u32, retry_limit: Option<u32>) -> String {
     }
 }
 
-fn header_string(response: &Response, name: &str) -> Result<Option<String>> {
+fn header_string(response: &Response, name: &HeaderName) -> Result<Option<String>> {
     Ok(response
         .headers()
         .get(name)

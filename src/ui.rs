@@ -2,7 +2,7 @@ use std::collections::HashMap;
 #[cfg(target_os = "linux")]
 use std::fs;
 use std::io::IsTerminal;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use anstyle::{AnsiColor, Style};
@@ -602,7 +602,10 @@ fn layer_progress_char(layer: &AggregateLayer) -> char {
 }
 
 pub(crate) fn should_color_stderr() -> bool {
-    std::io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none()
+    static SHOULD_COLOR_STDERR: OnceLock<bool> = OnceLock::new();
+
+    *SHOULD_COLOR_STDERR
+        .get_or_init(|| std::io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none())
 }
 
 #[cfg(test)]

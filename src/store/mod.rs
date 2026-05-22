@@ -6,7 +6,9 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use tokio::fs as tokio_fs;
 
-use crate::digest::{digest_bytes_for_digest, digest_file_for_digest, parse_digest, sha256_hex};
+use crate::digest::{
+    DigestAlgorithm, digest_bytes_for_digest, digest_file_for_digest, parse_digest, sha256_hex,
+};
 use crate::error::{DockerPullError, Result};
 use crate::registry::Descriptor;
 use fs::{
@@ -17,7 +19,9 @@ use fs::{
 #[derive(Debug, Clone)]
 pub struct Store {
     root: PathBuf,
-    _shared_lock: Option<std::sync::Arc<File>>,
+    // Keeps the active cache lock held for the Store lifetime.
+    #[allow(dead_code)]
+    shared_lock: Option<std::sync::Arc<File>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -71,14 +75,15 @@ impl Store {
         } else {
             None
         };
-        for algorithm in ["sha256", "sha384", "sha512"] {
-            ensure_directory(&root.join("blobs").join(algorithm))?;
-            ensure_directory(&root.join("partials").join(algorithm))?;
+        for algorithm in DigestAlgorithm::SUPPORTED {
+            let algorithm = algorithm.to_string();
+            ensure_directory(&root.join("blobs").join(&algorithm))?;
+            ensure_directory(&root.join("partials").join(&algorithm))?;
         }
         ensure_directory(&root.join("references"))?;
         Ok(Self {
             root,
-            _shared_lock: lock,
+            shared_lock: lock,
         })
     }
 
