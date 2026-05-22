@@ -135,7 +135,7 @@ fn write_oci_archive_to_writer_with_fallbacks<W: Write>(
     let archive_manifest = archive_manifest(&inputs.manifest, &layer_sources, &reference.manifest);
     let archive_manifest_bytes = serde_json::to_vec(&archive_manifest)?;
     let mut manifest_descriptor = reference.manifest.clone();
-    manifest_descriptor.digest = digest_bytes(&archive_manifest_bytes);
+    manifest_descriptor.digest = canonical_digest_bytes(&archive_manifest_bytes);
     manifest_descriptor.size = archive_manifest_bytes.len() as i64;
     if manifest_descriptor.media_type.is_empty() {
         manifest_descriptor.media_type = archive_manifest.media_type.clone();
@@ -324,10 +324,6 @@ fn resolved_manifest_media_type(
 fn blob_tar_path(digest: &str) -> Result<String> {
     let parsed = parse_digest(digest)?;
     Ok(format!("blobs/{}/{}", parsed.algorithm, parsed.value))
-}
-
-fn digest_bytes(bytes: &[u8]) -> String {
-    canonical_digest_bytes(bytes)
 }
 
 fn docker_repo_tags(reference: &str) -> Result<Vec<String>> {
