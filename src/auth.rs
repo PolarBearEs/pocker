@@ -2,9 +2,11 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 
 use base64::Engine;
 use serde::Deserialize;
+use tokio::sync::{Mutex, OnceCell};
 use tracing::warn;
 
 use crate::error::{DockerPullError, Result};
@@ -18,9 +20,10 @@ pub enum Credentials {
 pub struct AuthResolver {
     cli_credentials: Option<Credentials>,
     docker_config: Option<DockerConfig>,
+    resolved: Mutex<HashMap<String, Arc<OnceCell<Option<Credentials>>>>>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct DockerConfig {
     #[serde(default)]
     auths: HashMap<String, DockerAuthEntry>,
@@ -30,7 +33,7 @@ struct DockerConfig {
     creds_store: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct DockerAuthEntry {
     auth: Option<String>,
 }
@@ -48,54 +51,79 @@ impl AuthResolver {
         Ok(Self {
             cli_credentials,
             docker_config: load_docker_config()?,
+            resolved: Mutex::new(HashMap::new()),
         })
     }
 
-    pub fn resolve(&self, registry: &str) -> Result<Option<Credentials>> {
+    pub async fn resolve(&self, registry: &str) -> Result<Option<Credentials>> {
         if let Some(credentials) = &self.cli_credentials {
             return Ok(Some(credentials.clone()));
         }
 
-        let Some(config) = &self.docker_config else {
+        let Some(config) = self.docker_config.clone() else {
             return Ok(None);
         };
 
+        let registry = registry.to_string();
+        let cell = {
+            let mut resolved = self.resolved.lock().await;
+            resolved
+                .entry(registry.clone())
+                .or_insert_with(|| Arc::new(OnceCell::new()))
+                .clone()
+        };
+
+        let credentials = cell
+            .get_or_try_init(|| async move {
+                tokio::task::spawn_blocking(move || resolve_docker_config(&config, &registry))
+                    .await
+                    .map_err(|error| {
+                        DockerPullError::InvalidInput(format!(
+                            "auth resolver task panicked: {error}"
+                        ))
+                    })?
+            })
+            .await?;
+        Ok(credentials.clone())
+    }
+}
+
+fn resolve_docker_config(config: &DockerConfig, registry: &str) -> Result<Option<Credentials>> {
+    for key in registry_keys(registry) {
+        if let Some(helper) = config.cred_helpers.get(key)
+            && let Some(credentials) = invoke_helper(helper, key)?
+        {
+            return Ok(Some(credentials));
+        }
+    }
+
+    if let Some(helper) = &config.creds_store {
         for key in registry_keys(registry) {
-            if let Some(helper) = config.cred_helpers.get(key)
-                && let Some(credentials) = invoke_helper(helper, key)?
-            {
+            if let Some(credentials) = invoke_helper(helper, key)? {
                 return Ok(Some(credentials));
             }
         }
-
-        if let Some(helper) = &config.creds_store {
-            for key in registry_keys(registry) {
-                if let Some(credentials) = invoke_helper(helper, key)? {
-                    return Ok(Some(credentials));
-                }
-            }
-        }
-
-        for key in registry_keys(registry) {
-            if let Some(entry) = config.auths.get(key)
-                && let Some(auth) = &entry.auth
-            {
-                let decoded = base64::engine::general_purpose::STANDARD.decode(auth)?;
-                let value = String::from_utf8(decoded).map_err(|error| {
-                    DockerPullError::InvalidInput(format!("invalid docker auth entry: {error}"))
-                })?;
-                let (username, password) = value.split_once(':').ok_or_else(|| {
-                    DockerPullError::InvalidInput("docker auth entry is missing separator".into())
-                })?;
-                return Ok(Some(Credentials::Basic {
-                    username: username.to_string(),
-                    password: password.to_string(),
-                }));
-            }
-        }
-
-        Ok(None)
     }
+
+    for key in registry_keys(registry) {
+        if let Some(entry) = config.auths.get(key)
+            && let Some(auth) = &entry.auth
+        {
+            let decoded = base64::engine::general_purpose::STANDARD.decode(auth)?;
+            let value = String::from_utf8(decoded).map_err(|error| {
+                DockerPullError::InvalidInput(format!("invalid docker auth entry: {error}"))
+            })?;
+            let (username, password) = value.split_once(':').ok_or_else(|| {
+                DockerPullError::InvalidInput("docker auth entry is missing separator".into())
+            })?;
+            return Ok(Some(Credentials::Basic {
+                username: username.to_string(),
+                password: password.to_string(),
+            }));
+        }
+    }
+
+    Ok(None)
 }
 
 fn load_docker_config() -> Result<Option<DockerConfig>> {
@@ -397,6 +425,17 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    fn restore_path_env(previous: Option<&std::ffi::OsStr>) {
+        unsafe {
+            if let Some(previous) = previous {
+                std::env::set_var("PATH", previous);
+            } else {
+                std::env::remove_var("PATH");
+            }
+        }
+    }
+
     fn with_docker_config_env<T>(path: &std::path::Path, run: impl FnOnce() -> T) -> T {
         let guard = DockerConfigEnvGuard::new(path);
         let result = catch_unwind(AssertUnwindSafe(run));
@@ -452,8 +491,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn resolves_docker_hub_alias_auth_entry_from_config() {
+    #[tokio::test]
+    async fn resolves_docker_hub_alias_auth_entry_from_config() {
         let dir = tempdir().expect("tempdir should create");
         let auth = base64::engine::general_purpose::STANDARD.encode("demo-user:demo-pass");
         let config = format!(
@@ -467,18 +506,98 @@ mod tests {
         );
         fs::write(dir.path().join("config.json"), config).expect("config should be written");
 
-        let credentials = with_docker_config_env(dir.path(), || {
-            AuthResolver::new(None)
-                .expect("resolver should build")
-                .resolve("registry-1.docker.io")
-                .expect("auth resolution should succeed")
+        let resolver = with_docker_config_env(dir.path(), || {
+            AuthResolver::new(None).expect("resolver should build")
         });
+        let credentials = resolver
+            .resolve("registry-1.docker.io")
+            .await
+            .expect("auth resolution should succeed");
 
         assert!(matches!(
             credentials,
             Some(Credentials::Basic { username, password })
                 if username == "demo-user" && password == "demo-pass"
         ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_docker_config_helper_resolution_is_cached() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let lock = lock_docker_config_env();
+        let dir = tempdir().expect("tempdir should create");
+        let bin_dir = dir.path().join("bin");
+        fs::create_dir(&bin_dir).expect("bin dir should create");
+        let helper_path = bin_dir.join("docker-credential-test");
+        let count_path = dir.path().join("helper-count");
+        fs::write(
+            &helper_path,
+            format!(
+                r#"#!/bin/sh
+count_file="{}"
+printf x >> "$count_file"
+sleep 0.2
+printf '{{"Username":"helper-user","Secret":"helper-pass"}}'
+"#,
+                count_path.display()
+            ),
+        )
+        .expect("helper should be written");
+        let mut permissions = fs::metadata(&helper_path)
+            .expect("helper metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&helper_path, permissions).expect("helper should be executable");
+        fs::write(
+            dir.path().join("config.json"),
+            r#"{"credHelpers":{"registry-1.docker.io":"test"}}"#,
+        )
+        .expect("config should be written");
+
+        let previous_path = std::env::var_os("PATH");
+        unsafe {
+            std::env::set_var(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    bin_dir.display(),
+                    previous_path
+                        .as_deref()
+                        .and_then(std::ffi::OsStr::to_str)
+                        .unwrap_or_default()
+                ),
+            );
+        }
+        let mut docker_config = DockerConfigEnvGuard::new_with_lock(lock, dir.path());
+        let resolver = AuthResolver::new(None).expect("resolver should build");
+
+        let (first, second) = tokio::join!(
+            resolver.resolve("registry-1.docker.io"),
+            resolver.resolve("registry-1.docker.io")
+        );
+        let first = first.expect("first auth resolution should succeed");
+        let second = second.expect("second auth resolution should succeed");
+
+        docker_config.restore();
+        restore_path_env(previous_path.as_deref());
+
+        assert!(matches!(
+            first,
+            Some(Credentials::Basic { username, password })
+                if username == "helper-user" && password == "helper-pass"
+        ));
+        assert!(matches!(
+            second,
+            Some(Credentials::Basic { username, password })
+                if username == "helper-user" && password == "helper-pass"
+        ));
+        assert_eq!(
+            fs::read_to_string(count_path).expect("count should read"),
+            "x",
+            "concurrent callers should share one in-flight helper invocation"
+        );
     }
 
     #[test]

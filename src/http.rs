@@ -5,22 +5,32 @@ use reqwest::{Certificate, Client, ClientBuilder};
 
 use crate::error::Result;
 
+const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(60);
+
 pub fn build_http_client(
     plain_http: bool,
     insecure_skip_tls_verify: bool,
     ca_file: Option<&Path>,
 ) -> Result<Client> {
-    build_http_client_with_timeout(plain_http, insecure_skip_tls_verify, ca_file, None)
+    build_http_client_with_timeouts(
+        plain_http,
+        insecure_skip_tls_verify,
+        ca_file,
+        None,
+        Some(DEFAULT_READ_TIMEOUT),
+    )
 }
 
-fn build_http_client_with_timeout(
+fn build_http_client_with_timeouts(
     plain_http: bool,
     insecure_skip_tls_verify: bool,
     ca_file: Option<&Path>,
     timeout: Option<Duration>,
+    read_timeout: Option<Duration>,
 ) -> Result<Client> {
-    let mut builder = http_client_builder(plain_http, insecure_skip_tls_verify, timeout)
-        .user_agent(format!("pocker/{}", env!("CARGO_PKG_VERSION")));
+    let mut builder =
+        http_client_builder(plain_http, insecure_skip_tls_verify, timeout, read_timeout)
+            .user_agent(format!("pocker/{}", env!("CARGO_PKG_VERSION")));
 
     if let Some(path) = ca_file {
         let pem = std::fs::read(path)?;
@@ -34,6 +44,7 @@ fn http_client_builder(
     plain_http: bool,
     insecure_skip_tls_verify: bool,
     timeout: Option<Duration>,
+    read_timeout: Option<Duration>,
 ) -> ClientBuilder {
     let mut builder = Client::builder()
         .connect_timeout(Duration::from_secs(20))
@@ -42,6 +53,9 @@ fn http_client_builder(
 
     if let Some(timeout) = timeout {
         builder = builder.timeout(timeout);
+    }
+    if let Some(read_timeout) = read_timeout {
+        builder = builder.read_timeout(read_timeout);
     }
 
     if plain_http {
@@ -61,7 +75,7 @@ mod tests {
     use tokio::net::TcpListener;
     use tokio::time::{sleep, timeout};
 
-    use super::build_http_client_with_timeout;
+    use super::build_http_client_with_timeouts;
 
     #[tokio::test]
     async fn client_without_total_timeout_allows_slow_response_headers() {
@@ -84,8 +98,8 @@ mod tests {
                 .expect("response should be written");
         });
 
-        let client =
-            build_http_client_with_timeout(true, false, None, None).expect("client should build");
+        let client = build_http_client_with_timeouts(true, false, None, None, None)
+            .expect("client should build");
         let response = timeout(
             Duration::from_secs(2),
             client.get(format!("http://{address}/slow")).send(),
@@ -115,14 +129,53 @@ mod tests {
                 .await;
         });
 
-        let client =
-            build_http_client_with_timeout(true, false, None, Some(Duration::from_millis(100)))
-                .expect("client should build");
+        let client = build_http_client_with_timeouts(
+            true,
+            false,
+            None,
+            Some(Duration::from_millis(100)),
+            None,
+        )
+        .expect("client should build");
         let error = client
             .get(format!("http://{address}/slow"))
             .send()
             .await
             .expect_err("request should time out");
+        assert!(error.is_timeout());
+        server.await.expect("server task should finish");
+    }
+
+    #[tokio::test]
+    async fn client_with_read_timeout_fails_stalled_response_headers() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let address = listener.local_addr().expect("listener address");
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("connection should arrive");
+            let mut buffer = [0_u8; 1024];
+            let _ = stream.read(&mut buffer).await;
+            sleep(Duration::from_millis(300)).await;
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .await;
+        });
+
+        let client = build_http_client_with_timeouts(
+            true,
+            false,
+            None,
+            None,
+            Some(Duration::from_millis(100)),
+        )
+        .expect("client should build");
+        let error = client
+            .get(format!("http://{address}/slow"))
+            .send()
+            .await
+            .expect_err("request should time out while waiting for response headers");
         assert!(error.is_timeout());
         server.await.expect("server task should finish");
     }

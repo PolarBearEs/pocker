@@ -168,6 +168,126 @@ services:
     }
 
     #[test]
+    fn resolves_default_override_file_when_no_files_are_given() {
+        let dir = tempdir().expect("tempdir should be created");
+        fs::write(
+            dir.path().join("docker-compose.yml"),
+            r#"
+services:
+  app:
+    image: example/app:base
+  worker:
+    image: example/worker:base
+"#,
+        )
+        .expect("base compose should be written");
+        fs::write(
+            dir.path().join("docker-compose.override.yml"),
+            r#"
+services:
+  app:
+    image: example/app:override
+"#,
+        )
+        .expect("override compose should be written");
+
+        let resolved = resolve_images(&[], dir.path()).expect("images should resolve");
+
+        assert_eq!(
+            resolved.images,
+            vec!["example/app:override", "example/worker:base"]
+        );
+    }
+
+    #[test]
+    fn uses_first_default_override_file_by_compose_preference() {
+        let dir = tempdir().expect("tempdir should be created");
+        fs::write(
+            dir.path().join("compose.yaml"),
+            r#"
+services:
+  app:
+    image: example/app:base
+"#,
+        )
+        .expect("base compose should be written");
+        fs::write(
+            dir.path().join("compose.override.yml"),
+            r#"
+services:
+  app:
+    image: example/app:yml
+"#,
+        )
+        .expect("preferred override should be written");
+        fs::write(
+            dir.path().join("compose.override.yaml"),
+            r#"
+services:
+  app:
+    image: example/app:yaml
+"#,
+        )
+        .expect("lower-priority override should be written");
+
+        let resolved = resolve_images(&[], dir.path()).expect("images should resolve");
+
+        assert_eq!(resolved.images, vec!["example/app:yml"]);
+    }
+
+    #[test]
+    fn discovers_default_compose_files_from_parent_directories() {
+        let dir = tempdir().expect("tempdir should be created");
+        let child = dir.path().join("nested").join("child");
+        fs::create_dir_all(&child).expect("child dir should be created");
+        fs::write(
+            dir.path().join("compose.yaml"),
+            r#"
+services:
+  app:
+    image: example/app:parent
+"#,
+        )
+        .expect("base compose should be written");
+        fs::write(
+            dir.path().join("compose.override.yml"),
+            r#"
+services:
+  app:
+    image: example/app:parent-override
+"#,
+        )
+        .expect("override compose should be written");
+
+        let resolved = resolve_images(&[], &child).expect("images should resolve");
+
+        assert_eq!(resolved.images, vec!["example/app:parent-override"]);
+    }
+
+    #[test]
+    fn detects_build_only_services_from_yaml_merge_keys() {
+        let dir = tempdir().expect("tempdir should be created");
+        fs::write(
+            dir.path().join("docker-compose.yml"),
+            r#"
+x-build: &build
+  build: .
+services:
+  builder:
+    <<: *build
+"#,
+        )
+        .expect("compose should be written");
+
+        let resolved = resolve_images(&[], dir.path()).expect("images should resolve");
+
+        assert_eq!(resolved.images, Vec::<String>::new());
+        assert_eq!(resolved.skipped_build_only, vec!["builder"]);
+        assert_eq!(resolved.services[0].service, "builder");
+        assert!(resolved.services[0].build_only);
+    }
+
+    #[test]
     fn deduplicates_images_in_first_seen_order() {
         let images = unique_images(&[
             "alpine:latest".into(),

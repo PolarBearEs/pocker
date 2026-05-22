@@ -139,5 +139,5 @@ pub(super) fn mapping_get_string(mapping: Option<&Mapping>, key: &str) -> Option
 }
 
 pub(super) fn mapping_has_key(mapping: Option<&Mapping>, key: &str) -> bool {
-    mapping.is_some_and(|mapping| mapping.contains_key(Value::String(key.to_string())))
+    mapping_get(mapping, key).is_some()
 }

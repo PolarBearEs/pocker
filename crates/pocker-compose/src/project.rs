@@ -15,8 +15,14 @@ use crate::{ComposeError, ComposeImages, ComposeServiceImage, Result};
 const DEFAULT_COMPOSE_FILES: [&str; 4] = [
     "compose.yaml",
     "compose.yml",
-    "docker-compose.yaml",
     "docker-compose.yml",
+    "docker-compose.yaml",
+];
+const DEFAULT_COMPOSE_OVERRIDE_FILES: [&str; 4] = [
+    "compose.override.yml",
+    "compose.override.yaml",
+    "docker-compose.override.yml",
+    "docker-compose.override.yaml",
 ];
 
 #[derive(Debug)]
@@ -42,7 +48,7 @@ struct ServiceKey {
 
 pub fn resolve_images(files: &[PathBuf], working_dir: &Path) -> Result<ComposeImages> {
     let entry_files = if files.is_empty() {
-        vec![find_default_compose_file(working_dir)?]
+        find_default_compose_files(working_dir)?
     } else {
         files
             .iter()
@@ -297,17 +303,41 @@ impl NormalizeOptionPath for Option<PathBuf> {
     }
 }
 
-fn find_default_compose_file(working_dir: &Path) -> Result<PathBuf> {
-    for name in DEFAULT_COMPOSE_FILES {
-        let candidate = working_dir.join(name);
-        if candidate.is_file() {
-            return normalize_path(&candidate);
+fn find_default_compose_files(working_dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut current = working_dir;
+    loop {
+        let candidates = find_files(&DEFAULT_COMPOSE_FILES, current);
+        if let Some(base_file) = candidates.first() {
+            let mut files = vec![normalize_path(base_file)?];
+            if let Some(override_file) =
+                find_files(&DEFAULT_COMPOSE_OVERRIDE_FILES, current).first()
+            {
+                files.push(normalize_path(override_file)?);
+            }
+            return Ok(files);
         }
+
+        let Some(parent) = current.parent() else {
+            break;
+        };
+        if parent == current {
+            break;
+        }
+        current = parent;
     }
+
     Err(ComposeError::InvalidInput(format!(
         "no compose file found in `{}`",
         working_dir.display()
     )))
+}
+
+fn find_files(names: &[&str], directory: &Path) -> Vec<PathBuf> {
+    names
+        .iter()
+        .map(|name| directory.join(name))
+        .filter(|candidate| candidate.is_file())
+        .collect()
 }
 
 fn absolutize(base: &Path, file: &Path) -> PathBuf {
