@@ -146,16 +146,8 @@ impl Store {
         descriptor: &Descriptor,
     ) -> Result<Option<Vec<u8>>> {
         let path = self.blob_path(&descriptor.digest)?;
-        if verify_blob_file(
-            path.clone(),
-            descriptor.digest.clone(),
-            descriptor.expected_size()?,
-        )
-        .await?
-        {
-            return Ok(Some(tokio_fs::read(path).await?));
-        }
-        Ok(None)
+        read_blob_file_if_verified(path, descriptor.digest.clone(), descriptor.expected_size()?)
+            .await
     }
 
     pub async fn prepare_download(
@@ -257,7 +249,9 @@ impl Store {
     }
 
     pub async fn clear(&self) -> Result<ClearedCache> {
-        self.clear_with_report(true).await.map(Option::unwrap)
+        self.clear_with_report(true)
+            .await
+            .map(|report| report.expect("clear_with_report(true) must return Some"))
     }
 
     pub async fn clear_quiet(&self) -> Result<()> {
@@ -371,6 +365,30 @@ async fn verify_blob_file(path: PathBuf, digest: String, expected_size: u64) -> 
     }
 
     Ok(true)
+}
+
+async fn read_blob_file_if_verified(
+    path: PathBuf,
+    digest: String,
+    expected_size: u64,
+) -> Result<Option<Vec<u8>>> {
+    let bytes = match tokio_fs::read(&path).await {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if bytes.len() as u64 != expected_size {
+        remove_file_if_exists(&path).await?;
+        return Ok(None);
+    }
+
+    let computed = digest_bytes_for_digest(&digest, &bytes)?;
+    if computed != digest {
+        remove_file_if_exists(&path).await?;
+        return Ok(None);
+    }
+
+    Ok(Some(bytes))
 }
 
 async fn prepare_download_blocking(
