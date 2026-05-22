@@ -368,13 +368,13 @@ mod tests {
     use std::io::{Cursor, Read};
 
     use serde_json::Value;
-    use sha2::{Digest as _, Sha256};
     use tempfile::tempdir;
 
     use super::{
         OCI_IMAGE_MANIFEST_MEDIA_TYPE, blob_tar_path, load_archive_inputs, oci_ref_name,
         write_oci_archive_to_writer, write_oci_archive_to_writer_with_fallbacks,
     };
+    use crate::digest::canonical_digest_bytes;
     use crate::platform::Platform;
     use crate::registry::Descriptor;
     use crate::store::{Store, StoredReference};
@@ -776,8 +776,6 @@ mod tests {
     }
 
     fn digest_bytes(bytes: &[u8]) -> String {
-        let mut hasher = Sha256::new();
-        hasher.update(bytes);
-        format!("sha256:{}", hex::encode(hasher.finalize()))
+        canonical_digest_bytes(bytes)
     }
 }

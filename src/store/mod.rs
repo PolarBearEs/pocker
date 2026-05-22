@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use tokio::fs as tokio_fs;
 
-use crate::digest::{digest_bytes_for_digest, digest_file_for_digest, parse_digest};
+use crate::digest::{digest_bytes_for_digest, digest_file_for_digest, parse_digest, sha256_hex};
 use crate::error::{DockerPullError, Result};
 use crate::registry::Descriptor;
 use fs::{
@@ -380,11 +380,7 @@ fn digest_bytes(bytes: &[u8]) -> String {
 }
 
 fn reference_key(reference: &str) -> String {
-    use sha2::{Digest as _, Sha256};
-
-    let mut hasher = Sha256::new();
-    hasher.update(reference.as_bytes());
-    hex::encode(hasher.finalize())
+    sha256_hex(reference.as_bytes())
 }
 
 fn collect_cache_files(root: &Path) -> Result<Vec<ClearedCacheFile>> {
