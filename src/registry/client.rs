@@ -49,6 +49,24 @@ struct RegistryRequest<'a> {
     allow_retry: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RequestMode {
+    Direct,
+    Cache,
+}
+
+impl RequestMode {
+    fn uses_registry_auth(self) -> bool {
+        matches!(self, Self::Direct)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RetryReason {
+    SendError,
+    Status(StatusCode),
+}
+
 impl RegistryClient {
     pub fn new(
         client: Client,
@@ -402,14 +420,18 @@ impl RegistryClient {
                 &request,
                 request.url.clone(),
                 reference,
-                self.uses_cache_from(),
+                if self.uses_cache_from() {
+                    RequestMode::Cache
+                } else {
+                    RequestMode::Direct
+                },
             )
             .await?;
         if response.status() == StatusCode::NOT_FOUND
             && let Some(fallback_url) = request.fallback_url.clone()
         {
             return self
-                .send_to_url(&request, fallback_url, reference, false)
+                .send_to_url(&request, fallback_url, reference, RequestMode::Direct)
                 .await;
         }
         Ok(response)
@@ -420,21 +442,21 @@ impl RegistryClient {
         request: &RegistryRequest<'_>,
         url: Url,
         reference: &ImageReference,
-        cache_request: bool,
+        mode: RequestMode,
     ) -> Result<Response> {
         let cache_key = token_cache_key(reference);
         let mut retries = 0_u32;
         let mut auth_retries = 0_u32;
         loop {
-            let token = if cache_request {
-                None
-            } else {
+            let token = if mode.uses_registry_auth() {
                 self.token_cache.lock().await.get(&cache_key).cloned()
-            };
-            let credentials = if cache_request {
-                None
             } else {
+                None
+            };
+            let credentials = if mode.uses_registry_auth() {
                 self.auth.resolve(&reference.registry).await?
+            } else {
+                None
             };
             let mut builder = self.client.request(request.method.clone(), url.clone());
             if let Some(accept) = request.accept {
@@ -452,25 +474,20 @@ impl RegistryClient {
             let response = match builder.send().await {
                 Ok(response) => response,
                 Err(error) if request.allow_retry && is_retryable_http_error(&error) => {
-                    let detail = error.to_string();
-                    if retry_limit_exhausted(retries, self.request_retry_limit) {
-                        return Err(retry_limit_exceeded("registry request", retries, detail));
-                    }
-                    let next_retry = retries + 1;
                     let delay = jittered_backoff_delay(retries);
-                    let retry_budget = retry_budget(next_retry, self.request_retry_limit);
-                    warn!(
-                        "request failed before response, retrying in {:?} ({})",
-                        delay, retry_budget
-                    );
-                    sleep(delay).await;
-                    retries = next_retry;
+                    self.retry_request(
+                        &mut retries,
+                        error.to_string(),
+                        delay,
+                        RetryReason::SendError,
+                    )
+                    .await?;
                     continue;
                 }
                 Err(error) => return Err(error.into()),
             };
 
-            if response.status() == StatusCode::UNAUTHORIZED && cache_request {
+            if response.status() == StatusCode::UNAUTHORIZED && mode == RequestMode::Cache {
                 return Err(DockerPullError::Unauthorized(reference.normalized()));
             }
 
@@ -502,23 +519,15 @@ impl RegistryClient {
 
             if request.allow_retry && is_retryable_status(response.status()) {
                 let status = response.status();
-                if retry_limit_exhausted(retries, self.request_retry_limit) {
-                    return Err(retry_limit_exceeded(
-                        "registry request",
-                        retries,
-                        format!("registry returned {status}"),
-                    ));
-                }
-                let next_retry = retries + 1;
                 let delay = retry_after_delay(response.headers().get(RETRY_AFTER))
                     .unwrap_or_else(|| jittered_backoff_delay(retries));
-                let retry_budget = retry_budget(next_retry, self.request_retry_limit);
-                warn!(
-                    "registry returned {}, retrying in {:?} ({})",
-                    status, delay, retry_budget
-                );
-                sleep(delay).await;
-                retries = next_retry;
+                self.retry_request(
+                    &mut retries,
+                    format!("registry returned {status}"),
+                    delay,
+                    RetryReason::Status(status),
+                )
+                .await?;
                 continue;
             }
 
@@ -532,6 +541,34 @@ impl RegistryClient {
             debug!("registry {} {}", request.method, url);
             return Ok(response);
         }
+    }
+
+    async fn retry_request(
+        &self,
+        retries: &mut u32,
+        detail: String,
+        delay: Duration,
+        reason: RetryReason,
+    ) -> Result<()> {
+        if retry_limit_exhausted(*retries, self.request_retry_limit) {
+            return Err(retry_limit_exceeded("registry request", *retries, detail));
+        }
+
+        let next_retry = *retries + 1;
+        let retry_budget = retry_budget(next_retry, self.request_retry_limit);
+        match reason {
+            RetryReason::SendError => warn!(
+                "request failed before response, retrying in {:?} ({})",
+                delay, retry_budget
+            ),
+            RetryReason::Status(status) => warn!(
+                "registry returned {}, retrying in {:?} ({})",
+                status, delay, retry_budget
+            ),
+        }
+        sleep(delay).await;
+        *retries = next_retry;
+        Ok(())
     }
 
     async fn refresh_token(
