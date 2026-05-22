@@ -196,14 +196,18 @@ impl Store {
     pub async fn finalize_download(&self, descriptor: &Descriptor) -> Result<()> {
         let partial = self.partial_path(&descriptor.digest)?;
         let final_path = self.blob_path(&descriptor.digest)?;
-        if !partial.exists() {
-            return Err(DockerPullError::MissingBlobFile(
-                descriptor.digest.clone(),
-                partial,
-            ));
-        }
         let computed =
-            digest_file_for_digest_blocking(descriptor.digest.clone(), partial.clone()).await?;
+            match digest_file_for_digest_blocking(descriptor.digest.clone(), partial.clone()).await
+            {
+                Ok(computed) => computed,
+                Err(DockerPullError::Io(error)) if error.kind() == ErrorKind::NotFound => {
+                    return Err(DockerPullError::MissingBlobFile(
+                        descriptor.digest.clone(),
+                        partial,
+                    ));
+                }
+                Err(error) => return Err(error),
+            };
         if computed != descriptor.digest {
             return Err(DockerPullError::DigestMismatch {
                 digest: descriptor.digest.clone(),
@@ -217,9 +221,7 @@ impl Store {
         tokio_fs::rename(&partial, &final_path).await?;
 
         let metadata_path = self.partial_metadata_path(&descriptor.digest)?;
-        if metadata_path.exists() {
-            tokio_fs::remove_file(metadata_path).await?;
-        }
+        remove_file_if_exists(&metadata_path).await?;
         Ok(())
     }
 
@@ -724,6 +726,32 @@ mod tests {
             .await
             .expect("cached blob should be readable");
         assert_eq!(cached.as_deref(), Some(bytes.as_slice()));
+    }
+
+    #[tokio::test]
+    async fn finalize_download_reports_missing_partial_without_exists_precheck() {
+        let dir = tempdir().expect("tempdir should create");
+        let store = Store::open(dir.path().to_path_buf())
+            .await
+            .expect("store should open");
+        let descriptor = Descriptor {
+            media_type: "application/octet-stream".into(),
+            digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .into(),
+            size: 0,
+            platform: None,
+            annotations: None,
+        };
+
+        let error = store
+            .finalize_download(&descriptor)
+            .await
+            .expect_err("missing partial should be reported");
+
+        assert!(matches!(
+            error,
+            DockerPullError::MissingBlobFile(digest, _) if digest == descriptor.digest
+        ));
     }
 
     #[tokio::test]
