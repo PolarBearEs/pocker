@@ -310,9 +310,7 @@ impl Store {
             .iter()
             .fold(0_u64, |total, file| total.saturating_add(file.size));
 
-        if self.root.exists() {
-            tokio_fs::remove_dir_all(&self.root).await?;
-        }
+        remove_cache_contents(&self.root).await?;
 
         Self::open(self.root.clone()).await?;
         Ok(ClearedCache {
@@ -351,13 +349,29 @@ fn open_lock_file(root: &Path) -> Result<File> {
 }
 
 fn cache_lock_path(root: &Path) -> PathBuf {
-    let file_name = root
-        .file_name()
-        .map(|name| format!("{}.lock", name.to_string_lossy()))
-        .unwrap_or_else(|| ".pocker-cache.lock".to_string());
-    root.parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join(file_name)
+    root.join(".lock")
+}
+
+async fn remove_cache_contents(root: &Path) -> Result<()> {
+    if !root.exists() {
+        return Ok(());
+    }
+
+    let mut entries = tokio_fs::read_dir(root).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        if path.file_name().is_some_and(|name| name == ".lock") {
+            continue;
+        }
+        let file_type = entry.file_type().await?;
+        if file_type.is_dir() {
+            tokio_fs::remove_dir_all(path).await?;
+        } else {
+            tokio_fs::remove_file(path).await?;
+        }
+    }
+
+    Ok(())
 }
 
 fn digest_path(root: PathBuf, digest: &str) -> Result<PathBuf> {
@@ -393,6 +407,9 @@ fn collect_cache_files_recursive(
     for entry in std::fs::read_dir(current)? {
         let entry = entry?;
         let path = entry.path();
+        if path == cache_lock_path(root) {
+            continue;
+        }
         let file_type = entry.file_type()?;
         if file_type.is_symlink() {
             continue;
@@ -656,6 +673,7 @@ mod tests {
         let store = Store::open(dir.path().to_path_buf())
             .await
             .expect("store should open");
+        let lock = super::cache_lock_path(store.root());
         let blob = store
             .blob_path("sha256:4444444444444444444444444444444444444444444444444444444444444444")
             .expect("blob path");
@@ -687,6 +705,8 @@ mod tests {
             store.root().join("partials").join("sha256").exists(),
             "sha256 partial cache layout should be recreated"
         );
+        assert!(lock.exists(), "cache lock should remain inside cache root");
+        assert_eq!(lock, store.root().join(".lock"));
         for algorithm in ["sha384", "sha512"] {
             assert!(
                 store.root().join("blobs").join(algorithm).exists(),
