@@ -58,19 +58,19 @@ pub async fn run() -> Result<()> {
         },
         Commands::Serve(args) => {
             let store = Arc::new(Store::open_active(cli.global.cache_dir.clone()).await?);
-            let credentials = read_credentials(args.username, args.password_stdin)?;
+            let credentials = read_credentials(args.auth.username, args.auth.password_stdin)?;
             let auth = Arc::new(AuthResolver::new(credentials)?);
             let client = Arc::new(RegistryClient::new(
                 build_http_client(
-                    args.plain_http,
-                    args.insecure_skip_tls_verify,
-                    args.ca_file.as_deref(),
+                    args.registry.plain_http,
+                    args.registry.insecure_skip_tls_verify,
+                    args.registry.ca_file.as_deref(),
                 )?,
                 auth,
-                args.plain_http,
+                args.registry.plain_http,
                 retry_limit(
-                    args.request_retries,
-                    args.retry_forever,
+                    args.retry.request_retries,
+                    args.retry.retry_forever,
                     DEFAULT_REQUEST_RETRIES,
                 ),
             ));
@@ -92,8 +92,8 @@ pub async fn run() -> Result<()> {
                 registry: client,
                 pull_missing: args.pull_missing,
                 blob_retry_limit: retry_limit(
-                    args.blob_retries,
-                    args.retry_forever,
+                    args.retry.blob_retries,
+                    args.retry.retry_forever,
                     pull::DEFAULT_BLOB_RETRIES,
                 ),
                 concurrency: args.concurrency.max(1),

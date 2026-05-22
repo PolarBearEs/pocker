@@ -291,56 +291,12 @@ pub struct ServeArgs {
         help = "Maximum concurrent layer downloads"
     )]
     pub concurrency: usize,
-    #[arg(
-        long = "blob-retries",
-        value_name = "N",
-        help_heading = "Retry options",
-        help = "Maximum retries for interrupted blob downloads; use 0 to disable [default: 8]"
-    )]
-    pub blob_retries: Option<u32>,
-    #[arg(
-        long = "request-retries",
-        value_name = "N",
-        help_heading = "Retry options",
-        help = "Maximum retries for registry requests before any response or on retryable HTTP status; use 0 to disable [default: 5]"
-    )]
-    pub request_retries: Option<u32>,
-    #[arg(
-        long,
-        help_heading = "Retry options",
-        help = "Retry retryable blob downloads and registry requests forever"
-    )]
-    pub retry_forever: bool,
-    #[arg(
-        long,
-        help_heading = "Registry options",
-        help = "Use plain HTTP instead of HTTPS for upstream registry requests"
-    )]
-    pub plain_http: bool,
-    #[arg(
-        long,
-        help_heading = "Registry options",
-        help = "Disable TLS certificate verification for upstream registry requests"
-    )]
-    pub insecure_skip_tls_verify: bool,
-    #[arg(
-        long,
-        help_heading = "Registry options",
-        help = "Additional upstream CA certificate bundle in PEM format"
-    )]
-    pub ca_file: Option<PathBuf>,
-    #[arg(
-        long,
-        help_heading = "Registry options",
-        help = "Upstream registry username; requires --password-stdin"
-    )]
-    pub username: Option<String>,
-    #[arg(
-        long,
-        help_heading = "Registry options",
-        help = "Read the upstream registry password from stdin"
-    )]
-    pub password_stdin: bool,
+    #[command(flatten)]
+    pub retry: RetryArgs,
+    #[command(flatten)]
+    pub registry: RegistryArgs,
+    #[command(flatten)]
+    pub auth: AuthArgs,
     #[arg(
         long,
         short = 'q',
@@ -717,8 +673,8 @@ mod tests {
             panic!("expected serve command");
         };
 
-        assert_eq!(args.request_retries, Some(1));
-        assert!(args.retry_forever);
+        assert_eq!(args.retry.request_retries, Some(1));
+        assert!(args.retry.retry_forever);
     }
 
     #[test]
