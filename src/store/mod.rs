@@ -75,7 +75,7 @@ impl Store {
         } else {
             None
         };
-        for algorithm in DigestAlgorithm::ALL {
+        for algorithm in DigestAlgorithm::SUPPORTED {
             let algorithm = algorithm.to_string();
             ensure_directory(&root.join("blobs").join(&algorithm))?;
             ensure_directory(&root.join("partials").join(&algorithm))?;

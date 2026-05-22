@@ -20,7 +20,7 @@ pub(crate) struct ParsedDigest<'a> {
 }
 
 impl DigestAlgorithm {
-    pub const ALL: [Self; 3] = [Self::Sha256, Self::Sha384, Self::Sha512];
+    pub const SUPPORTED: &'static [Self] = &[Self::Sha256, Self::Sha384, Self::Sha512];
 
     pub fn parse(value: &str) -> Result<Self> {
         match value {
