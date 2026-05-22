@@ -10,11 +10,14 @@ use tokio::time::sleep;
 use tracing::{debug, warn};
 use url::Url;
 
-use super::MANIFEST_ACCEPT;
 use super::cache::{cache_url, resource_url};
 use super::types::{
     BlobMetadata, Descriptor, ImageIndex, ImageManifest, ManifestEnvelope, RawManifest,
     ResolvedImage,
+};
+use super::{
+    DOCKER_IMAGE_MANIFEST_MEDIA_TYPE, DOCKER_MANIFEST_LIST_MEDIA_TYPE, MANIFEST_ACCEPT,
+    OCI_IMAGE_INDEX_MEDIA_TYPE, OCI_IMAGE_MANIFEST_MEDIA_TYPE,
 };
 use crate::auth::{AuthResolver, Credentials};
 use crate::digest::canonical_digest_bytes;
@@ -715,16 +718,14 @@ fn split_auth_attributes(value: &str) -> Vec<&str> {
 fn is_image_manifest(media_type: &str) -> bool {
     matches!(
         media_type,
-        "application/vnd.oci.image.manifest.v1+json"
-            | "application/vnd.docker.distribution.manifest.v2+json"
+        OCI_IMAGE_MANIFEST_MEDIA_TYPE | DOCKER_IMAGE_MANIFEST_MEDIA_TYPE
     )
 }
 
 fn is_image_index(media_type: &str) -> bool {
     matches!(
         media_type,
-        "application/vnd.oci.image.index.v1+json"
-            | "application/vnd.docker.distribution.manifest.list.v2+json"
+        OCI_IMAGE_INDEX_MEDIA_TYPE | DOCKER_MANIFEST_LIST_MEDIA_TYPE
     )
 }
 

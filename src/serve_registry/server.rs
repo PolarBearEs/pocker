@@ -14,14 +14,14 @@ use crate::error::{DockerPullError, Result};
 use crate::platform::Platform;
 use crate::pull::{BlobDownloadLocks, PullContext, download};
 use crate::reference::ImageReference;
-use crate::registry::{Descriptor, MANIFEST_ACCEPT, RegistryClient, decode_cache_repository};
+use crate::registry::{
+    Descriptor, MANIFEST_ACCEPT, OCI_IMAGE_MANIFEST_MEDIA_TYPE, OCTET_STREAM_MEDIA_TYPE,
+    RegistryClient, decode_cache_repository,
+};
 use crate::store::{Store, StoredReference};
 use crate::ui::Ui;
 
 use super::response::{RegistryResponse, write_response};
-
-const DEFAULT_MANIFEST_CONTENT_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";
-const BLOB_CONTENT_TYPE: &str = "application/octet-stream";
 
 pub struct ServeConfig {
     pub listen: SocketAddr,
@@ -258,7 +258,7 @@ async fn blob_response(
         return RegistryResponse::file(
             200,
             "OK",
-            BLOB_CONTENT_TYPE.to_string(),
+            OCTET_STREAM_MEDIA_TYPE.to_string(),
             path,
             size,
             request.method == "HEAD",
@@ -276,7 +276,7 @@ async fn blob_response(
             Ok((path, size)) => RegistryResponse::file(
                 200,
                 "OK",
-                BLOB_CONTENT_TYPE.to_string(),
+                OCTET_STREAM_MEDIA_TYPE.to_string(),
                 path,
                 size,
                 request.method == "HEAD",
@@ -329,7 +329,7 @@ async fn fetch_blob(state: &ServeState, reference: &ImageReference, digest: &str
     let Some(size) = metadata.size else {
         let bytes = state.registry.get_blob_bytes(reference, digest).await?;
         let descriptor = Descriptor {
-            media_type: BLOB_CONTENT_TYPE.to_string(),
+            media_type: OCTET_STREAM_MEDIA_TYPE.to_string(),
             digest: digest.to_string(),
             size: bytes.len() as i64,
             platform: None,
@@ -338,7 +338,7 @@ async fn fetch_blob(state: &ServeState, reference: &ImageReference, digest: &str
         return state.store.save_blob_bytes(&descriptor, &bytes).await;
     };
     let descriptor = Descriptor {
-        media_type: BLOB_CONTENT_TYPE.to_string(),
+        media_type: OCTET_STREAM_MEDIA_TYPE.to_string(),
         digest: digest.to_string(),
         size: size as i64,
         platform: None,
@@ -368,7 +368,7 @@ async fn serve_manifest_blob(
         }
     };
     let content_type = if descriptor.media_type.is_empty() {
-        DEFAULT_MANIFEST_CONTENT_TYPE.to_string()
+        OCI_IMAGE_MANIFEST_MEDIA_TYPE.to_string()
     } else {
         descriptor.media_type.clone()
     };
