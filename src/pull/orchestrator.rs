@@ -6,7 +6,10 @@ use std::sync::atomic::AtomicBool;
 use tokio::task::JoinSet;
 
 use crate::auth::{AuthResolver, read_credentials};
-use crate::cli::{ComposePullArgs, PullArgs};
+use crate::cli::{
+    AuthArgs, CacheSourceArgs, ComposePullArgs, ImageParallelArgs, ImportArgs, PullArgs,
+    PullDownloadArgs, PullOutputArgs, RegistryArgs, RetryArgs,
+};
 use crate::error::{DockerPullError, Result};
 use crate::http::build_http_client;
 use crate::platform::Platform;
@@ -43,63 +46,73 @@ impl PullRequestOptions {
     pub(crate) fn from_pull_args(args: PullArgs) -> (Vec<String>, Self) {
         (
             args.references,
-            Self {
-                platform: args.download.platform,
-                concurrency: args.download.concurrency,
-                image_concurrency: args.image_parallel.image_concurrency,
-                blob_retry_limit: retry_limit(
-                    args.retry.blob_retries,
-                    args.retry.retry_forever,
-                    DEFAULT_BLOB_RETRIES,
-                ),
-                request_retry_limit: retry_limit(
-                    args.retry.request_retries,
-                    args.retry.retry_forever,
-                    DEFAULT_REQUEST_RETRIES,
-                ),
-                no_load: args.import.no_load,
-                keep_layer_blobs: args.import.keep_layer_blobs,
-                load_mode: args.import.load_mode,
-                plain_http: args.registry.plain_http,
-                insecure_skip_tls_verify: args.registry.insecure_skip_tls_verify,
-                ca_file: args.registry.ca_file,
-                username: args.auth.username,
-                password_stdin: args.auth.password_stdin,
-                quiet: args.output.quiet,
-                no_animations: args.no_animations,
-                cache_from: args.cache.cache_from,
-                cache_only: args.cache.cache_only,
-            },
+            Self::from_args(
+                args.download,
+                args.image_parallel,
+                args.retry,
+                args.import,
+                args.registry,
+                args.auth,
+                args.output,
+                args.cache,
+                args.no_animations,
+            ),
         )
     }
 
     pub(crate) fn from_compose_pull_args(args: ComposePullArgs) -> Self {
         Self {
-            platform: args.download.platform,
-            concurrency: args.download.concurrency,
-            image_concurrency: args.image_parallel.image_concurrency,
+            ..Self::from_args(
+                args.download,
+                args.image_parallel,
+                args.retry,
+                args.import,
+                args.registry,
+                args.auth,
+                args.output,
+                args.cache,
+                true,
+            )
+        }
+    }
+
+    fn from_args(
+        download: PullDownloadArgs,
+        image_parallel: ImageParallelArgs,
+        retry: RetryArgs,
+        import: ImportArgs,
+        registry: RegistryArgs,
+        auth: AuthArgs,
+        output: PullOutputArgs,
+        cache: CacheSourceArgs,
+        no_animations: bool,
+    ) -> Self {
+        Self {
+            platform: download.platform,
+            concurrency: download.concurrency,
+            image_concurrency: image_parallel.image_concurrency,
             blob_retry_limit: retry_limit(
-                args.retry.blob_retries,
-                args.retry.retry_forever,
+                retry.blob_retries,
+                retry.retry_forever,
                 DEFAULT_BLOB_RETRIES,
             ),
             request_retry_limit: retry_limit(
-                args.retry.request_retries,
-                args.retry.retry_forever,
+                retry.request_retries,
+                retry.retry_forever,
                 DEFAULT_REQUEST_RETRIES,
             ),
-            no_load: args.import.no_load,
-            keep_layer_blobs: args.import.keep_layer_blobs,
-            load_mode: args.import.load_mode,
-            plain_http: args.registry.plain_http,
-            insecure_skip_tls_verify: args.registry.insecure_skip_tls_verify,
-            ca_file: args.registry.ca_file,
-            username: args.auth.username,
-            password_stdin: args.auth.password_stdin,
-            quiet: args.output.quiet,
-            no_animations: true,
-            cache_from: args.cache.cache_from,
-            cache_only: args.cache.cache_only,
+            no_load: import.no_load,
+            keep_layer_blobs: import.keep_layer_blobs,
+            load_mode: import.load_mode,
+            plain_http: registry.plain_http,
+            insecure_skip_tls_verify: registry.insecure_skip_tls_verify,
+            ca_file: registry.ca_file,
+            username: auth.username,
+            password_stdin: auth.password_stdin,
+            quiet: output.quiet,
+            no_animations,
+            cache_from: cache.cache_from,
+            cache_only: cache.cache_only,
         }
     }
 }
