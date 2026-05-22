@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use futures_util::stream::{FuturesUnordered, StreamExt};
+use futures_util::stream::{self, FuturesUnordered, StreamExt};
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 use tracing::warn;
 
@@ -165,14 +165,24 @@ impl Puller {
             Default::default()
         };
         let mut downloads = Vec::new();
+        let mut cache_checks = stream::iter(layers)
+            .map(|layer| {
+                let store = Arc::clone(&self.context.store);
+                async move {
+                    let cached = store
+                        .ensure_blob_complete(
+                            &layer.descriptor.digest,
+                            layer.descriptor.expected_size()?,
+                        )
+                        .await?;
+                    Result::Ok((layer, cached))
+                }
+            })
+            .buffer_unordered(options.concurrency.max(1));
 
-        for layer in layers {
-            if self
-                .context
-                .store
-                .ensure_blob_complete(&layer.descriptor.digest, layer.descriptor.expected_size()?)
-                .await?
-            {
+        while let Some(result) = cache_checks.next().await {
+            let (layer, cached) = result?;
+            if cached {
                 self.context.ui.mark_layer_cached(&layer.descriptor.digest);
                 continue;
             }
@@ -199,9 +209,8 @@ impl Puller {
             }
             let context = self.context.clone();
             let reference = reference.clone();
-            let normalized = normalized.clone();
             queue.push(tokio::spawn(async move {
-                download::download_blob(&context, &reference, &normalized, descriptor).await
+                download::download_blob(&context, &reference, descriptor).await
             }));
         }
 

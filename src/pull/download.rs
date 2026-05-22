@@ -19,7 +19,6 @@ const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(2);
 pub async fn download_blob(
     context: &PullContext,
     reference: &ImageReference,
-    normalized_reference: &str,
     descriptor: Descriptor,
 ) -> Result<()> {
     let _blob_guard = context.blob_locks.lock(&descriptor.digest).await;
@@ -39,7 +38,7 @@ pub async fn download_blob(
     let expected_size = head.size.unwrap_or(descriptor.expected_size()?);
     let mut plan = context
         .store
-        .prepare_download(normalized_reference, &descriptor, expected_size)
+        .prepare_download(&descriptor, expected_size)
         .await?;
     let mut offset = plan.durable_offset;
     context
@@ -75,15 +74,8 @@ pub async fn download_blob(
                 "registry ignored range request for {}, restarting blob",
                 descriptor.digest
             );
-            reset_download_state(
-                context,
-                normalized_reference,
-                &descriptor,
-                expected_size,
-                &mut plan,
-                &mut offset,
-            )
-            .await?;
+            reset_download_state(context, &descriptor, expected_size, &mut plan, &mut offset)
+                .await?;
             reset_checkpoint_tracking(&mut bytes_since_checkpoint, &mut last_checkpoint);
             tokio::time::sleep(delay).await;
             continue;
@@ -132,11 +124,10 @@ pub async fn download_blob(
                     {
                         file.flush().await?;
                         file.sync_data().await?;
-                        context.store.checkpoint_download(
-                            &descriptor.digest,
-                            offset,
-                            expected_size,
-                        )?;
+                        context
+                            .store
+                            .checkpoint_download(&descriptor.digest, offset, expected_size)
+                            .await?;
                         bytes_since_checkpoint = 0;
                         last_checkpoint = Instant::now();
                     }
@@ -155,7 +146,8 @@ pub async fn download_blob(
                     file.sync_data().await?;
                     context
                         .store
-                        .checkpoint_download(&descriptor.digest, offset, expected_size)?;
+                        .checkpoint_download(&descriptor.digest, offset, expected_size)
+                        .await?;
                     tokio::time::sleep(delay).await;
                     stream_failed = true;
                     break;
@@ -171,17 +163,20 @@ pub async fn download_blob(
         file.sync_data().await?;
         context
             .store
-            .checkpoint_download(&descriptor.digest, offset, expected_size)?;
+            .checkpoint_download(&descriptor.digest, offset, expected_size)
+            .await?;
     }
 
     context
         .ui
         .set_layer_status(&descriptor.digest, "Verifying checksum");
     context.store.finalize_download(&descriptor).await?;
-    if let Ok(partial) = context.store.partial_path(&descriptor.digest)
-        && partial.exists()
-    {
-        let _ = fs::remove_file(partial).await;
+    if let Ok(partial) = context.store.partial_path(&descriptor.digest) {
+        match fs::remove_file(partial).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => {}
+        }
     }
     context.ui.finish_layer_download(&descriptor.digest);
     Ok(())
@@ -235,7 +230,6 @@ fn content_range_start(value: &str) -> Option<u64> {
 
 async fn reset_download_state(
     context: &PullContext,
-    normalized_reference: &str,
     descriptor: &Descriptor,
     expected_size: u64,
     plan: &mut DownloadPlan,
@@ -247,7 +241,7 @@ async fn reset_download_state(
         .await?;
     *plan = context
         .store
-        .prepare_download(normalized_reference, descriptor, expected_size)
+        .prepare_download(descriptor, expected_size)
         .await?;
     reset_download_progress(context, &descriptor.digest, expected_size, offset);
     Ok(())

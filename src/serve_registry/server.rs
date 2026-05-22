@@ -352,7 +352,7 @@ async fn fetch_blob(state: &ServeState, reference: &ImageReference, digest: &str
         blob_retry_limit: state.blob_retry_limit,
         blob_locks: Arc::clone(&state.blob_locks),
     };
-    download::download_blob(&context, reference, &reference.normalized(), descriptor).await
+    download::download_blob(&context, reference, descriptor).await
 }
 
 async fn serve_manifest_blob(

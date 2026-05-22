@@ -1,6 +1,7 @@
 mod fs;
 
 use std::fs::{File, OpenOptions};
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -51,8 +52,6 @@ pub struct ClearedCacheFile {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DownloadCheckpoint {
-    reference: String,
-    media_type: String,
     expected_size: u64,
     durable_offset: u64,
 }
@@ -87,11 +86,11 @@ impl Store {
         })
     }
 
-    pub fn blob_path(&self, digest: &str) -> Result<PathBuf> {
+    pub(crate) fn blob_path(&self, digest: &str) -> Result<PathBuf> {
         digest_path(self.root.join("blobs"), digest)
     }
 
-    pub fn partial_path(&self, digest: &str) -> Result<PathBuf> {
+    pub(crate) fn partial_path(&self, digest: &str) -> Result<PathBuf> {
         let path = digest_path(self.root.join("partials"), digest)?;
         Ok(path.with_extension("part"))
     }
@@ -109,20 +108,7 @@ impl Store {
 
     pub async fn ensure_blob_complete(&self, digest: &str, expected_size: u64) -> Result<bool> {
         let path = self.blob_path(digest)?;
-        if !path.exists() {
-            return Ok(false);
-        }
-        let metadata = tokio_fs::metadata(&path).await?;
-        if metadata.len() != expected_size {
-            tokio_fs::remove_file(&path).await?;
-            return Ok(false);
-        }
-        let computed = digest_file_for_digest(digest, &path)?;
-        if computed != digest {
-            tokio_fs::remove_file(&path).await?;
-            return Ok(false);
-        }
-        Ok(true)
+        verify_blob_file(path, digest.to_string(), expected_size).await
     }
 
     pub async fn save_blob_bytes(&self, descriptor: &Descriptor, bytes: &[u8]) -> Result<()> {
@@ -160,76 +146,33 @@ impl Store {
         descriptor: &Descriptor,
     ) -> Result<Option<Vec<u8>>> {
         let path = self.blob_path(&descriptor.digest)?;
-        if !path.exists() {
-            return Ok(None);
-        }
-        let bytes = tokio_fs::read(&path).await?;
-        if bytes.len() as u64 != descriptor.expected_size()? {
-            tokio_fs::remove_file(&path).await?;
-            return Ok(None);
-        }
-        let actual_digest = digest_bytes_for_digest(&descriptor.digest, &bytes)?;
-        if actual_digest != descriptor.digest {
-            tokio_fs::remove_file(&path).await?;
-            return Ok(None);
-        }
-        Ok(Some(bytes))
+        read_blob_file_if_verified(path, descriptor.digest.clone(), descriptor.expected_size()?)
+            .await
     }
 
     pub async fn prepare_download(
         &self,
-        reference: &str,
         descriptor: &Descriptor,
         expected_size: u64,
     ) -> Result<DownloadPlan> {
         let partial_path = self.partial_path(&descriptor.digest)?;
         let metadata_path = self.partial_metadata_path(&descriptor.digest)?;
-        let stored = read_json_if_exists::<DownloadCheckpoint>(&metadata_path)?;
-        let durable_offset = reconcile_partial_file(
-            &partial_path,
-            stored
-                .as_ref()
-                .map(|record| record.durable_offset)
-                .unwrap_or(0),
-        )?;
-        atomic_write_json(
-            &metadata_path,
-            &DownloadCheckpoint {
-                reference: reference.to_string(),
-                media_type: descriptor.media_type.clone(),
-                expected_size,
-                durable_offset,
-            },
-        )?;
+        let durable_offset =
+            prepare_download_blocking(partial_path.clone(), metadata_path, expected_size).await?;
         Ok(DownloadPlan {
             durable_offset,
             partial_path,
         })
     }
 
-    pub fn checkpoint_download(
+    pub async fn checkpoint_download(
         &self,
         digest: &str,
         durable_offset: u64,
         expected_size: u64,
     ) -> Result<()> {
         let path = self.partial_metadata_path(digest)?;
-        let stored =
-            read_json_if_exists::<DownloadCheckpoint>(&path)?.unwrap_or(DownloadCheckpoint {
-                reference: String::new(),
-                media_type: String::new(),
-                expected_size,
-                durable_offset: 0,
-            });
-        atomic_write_json(
-            &path,
-            &DownloadCheckpoint {
-                reference: stored.reference,
-                media_type: stored.media_type,
-                expected_size,
-                durable_offset,
-            },
-        )
+        write_download_checkpoint_blocking(path, durable_offset, expected_size).await
     }
 
     pub async fn reset_partial(&self, digest: &str, expected_size: u64) -> Result<()> {
@@ -237,7 +180,7 @@ impl Store {
         if partial.exists() {
             tokio_fs::remove_file(&partial).await?;
         }
-        self.checkpoint_download(digest, 0, expected_size)?;
+        self.checkpoint_download(digest, 0, expected_size).await?;
         Ok(())
     }
 
@@ -250,7 +193,8 @@ impl Store {
                 partial,
             ));
         }
-        let computed = digest_file_for_digest(&descriptor.digest, &partial)?;
+        let computed =
+            digest_file_for_digest_blocking(descriptor.digest.clone(), partial.clone()).await?;
         if computed != descriptor.digest {
             return Err(DockerPullError::DigestMismatch {
                 digest: descriptor.digest.clone(),
@@ -305,6 +249,16 @@ impl Store {
     }
 
     pub async fn clear(&self) -> Result<ClearedCache> {
+        self.clear_with_report(true)
+            .await
+            .map(|report| report.expect("clear_with_report(true) must return Some"))
+    }
+
+    pub async fn clear_quiet(&self) -> Result<()> {
+        self.clear_with_report(false).await.map(|_| ())
+    }
+
+    async fn clear_with_report(&self, collect_report: bool) -> Result<Option<ClearedCache>> {
         let root = self.root.clone();
         let _exclusive_lock = tokio::task::spawn_blocking(move || {
             let lock = open_lock_file(&root)?;
@@ -314,25 +268,28 @@ impl Store {
         .await
         .map_err(|e| DockerPullError::InvalidInput(format!("cache lock task panicked: {e}")))??;
 
-        let root = self.root.clone();
-        let files = tokio::task::spawn_blocking(move || collect_cache_files(&root))
-            .await
-            .map_err(|e| {
-                DockerPullError::InvalidInput(format!("cache scan task panicked: {e}"))
-            })??;
-        let reclaimed_bytes = files
-            .iter()
-            .fold(0_u64, |total, file| total.saturating_add(file.size));
+        let report = if collect_report {
+            let root = self.root.clone();
+            let files = tokio::task::spawn_blocking(move || collect_cache_files(&root))
+                .await
+                .map_err(|e| {
+                    DockerPullError::InvalidInput(format!("cache scan task panicked: {e}"))
+                })??;
+            let reclaimed_bytes = files
+                .iter()
+                .fold(0_u64, |total, file| total.saturating_add(file.size));
+            Some(ClearedCache {
+                files,
+                reclaimed_bytes,
+            })
+        } else {
+            None
+        };
 
-        if self.root.exists() {
-            tokio_fs::remove_dir_all(&self.root).await?;
-        }
+        remove_cache_contents(&self.root).await?;
 
         Self::open(self.root.clone()).await?;
-        Ok(ClearedCache {
-            files,
-            reclaimed_bytes,
-        })
+        Ok(report)
     }
 
     pub fn root(&self) -> &Path {
@@ -365,13 +322,132 @@ fn open_lock_file(root: &Path) -> Result<File> {
 }
 
 fn cache_lock_path(root: &Path) -> PathBuf {
-    let file_name = root
-        .file_name()
-        .map(|name| format!("{}.lock", name.to_string_lossy()))
-        .unwrap_or_else(|| ".pocker-cache.lock".to_string());
-    root.parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join(file_name)
+    root.join(".lock")
+}
+
+async fn remove_cache_contents(root: &Path) -> Result<()> {
+    if !root.exists() {
+        return Ok(());
+    }
+
+    let mut entries = tokio_fs::read_dir(root).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        if path.file_name().is_some_and(|name| name == ".lock") {
+            continue;
+        }
+        let file_type = entry.file_type().await?;
+        if file_type.is_dir() {
+            tokio_fs::remove_dir_all(path).await?;
+        } else {
+            tokio_fs::remove_file(path).await?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn verify_blob_file(path: PathBuf, digest: String, expected_size: u64) -> Result<bool> {
+    let metadata = match tokio_fs::metadata(&path).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.len() != expected_size {
+        remove_file_if_exists(&path).await?;
+        return Ok(false);
+    }
+
+    let computed = digest_file_for_digest_blocking(digest.clone(), path.clone()).await?;
+    if computed != digest {
+        remove_file_if_exists(&path).await?;
+        return Ok(false);
+    }
+
+    Ok(true)
+}
+
+async fn read_blob_file_if_verified(
+    path: PathBuf,
+    digest: String,
+    expected_size: u64,
+) -> Result<Option<Vec<u8>>> {
+    let bytes = match tokio_fs::read(&path).await {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if bytes.len() as u64 != expected_size {
+        remove_file_if_exists(&path).await?;
+        return Ok(None);
+    }
+
+    let computed = digest_bytes_for_digest(&digest, &bytes)?;
+    if computed != digest {
+        remove_file_if_exists(&path).await?;
+        return Ok(None);
+    }
+
+    Ok(Some(bytes))
+}
+
+async fn prepare_download_blocking(
+    partial_path: PathBuf,
+    metadata_path: PathBuf,
+    expected_size: u64,
+) -> Result<u64> {
+    tokio::task::spawn_blocking(move || {
+        let stored = read_json_if_exists::<DownloadCheckpoint>(&metadata_path)?;
+        let durable_offset = reconcile_partial_file(
+            &partial_path,
+            stored
+                .as_ref()
+                .map(|record| record.durable_offset)
+                .unwrap_or(0),
+        )?;
+        atomic_write_json(
+            &metadata_path,
+            &DownloadCheckpoint {
+                expected_size,
+                durable_offset,
+            },
+        )?;
+        Result::Ok(durable_offset)
+    })
+    .await
+    .map_err(|e| DockerPullError::InvalidInput(format!("download plan task panicked: {e}")))?
+}
+
+async fn write_download_checkpoint_blocking(
+    path: PathBuf,
+    durable_offset: u64,
+    expected_size: u64,
+) -> Result<()> {
+    tokio::task::spawn_blocking(move || {
+        atomic_write_json(
+            &path,
+            &DownloadCheckpoint {
+                expected_size,
+                durable_offset,
+            },
+        )
+    })
+    .await
+    .map_err(|e| DockerPullError::InvalidInput(format!("checkpoint task panicked: {e}")))?
+}
+
+async fn digest_file_for_digest_blocking(digest: String, path: PathBuf) -> Result<String> {
+    tokio::task::spawn_blocking(move || digest_file_for_digest(&digest, &path))
+        .await
+        .map_err(|e| DockerPullError::InvalidInput(format!("digest task panicked: {e}")))?
+}
+
+async fn remove_file_if_exists(path: &Path) -> Result<()> {
+    match tokio_fs::remove_file(path).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn digest_path(root: PathBuf, digest: &str) -> Result<PathBuf> {
@@ -407,6 +483,9 @@ fn collect_cache_files_recursive(
     for entry in std::fs::read_dir(current)? {
         let entry = entry?;
         let path = entry.path();
+        if path == cache_lock_path(root) {
+            continue;
+        }
         let file_type = entry.file_type()?;
         if file_type.is_symlink() {
             continue;
@@ -467,11 +546,7 @@ mod tests {
             annotations: None,
         };
         store
-            .prepare_download(
-                "registry-1.docker.io/library/alpine:latest",
-                &descriptor,
-                10,
-            )
+            .prepare_download(&descriptor, 10)
             .await
             .expect("download checkpoint should be created");
         let partial = store
@@ -480,13 +555,10 @@ mod tests {
         std::fs::write(&partial, b"1234").expect("partial file should be written");
         store
             .checkpoint_download(&descriptor.digest, 8, 10)
+            .await
             .expect("download state should be updated");
         let plan = store
-            .prepare_download(
-                "registry-1.docker.io/library/alpine:latest",
-                &descriptor,
-                10,
-            )
+            .prepare_download(&descriptor, 10)
             .await
             .expect("download plan should be created");
         assert_eq!(plan.durable_offset, 4);
@@ -678,6 +750,7 @@ mod tests {
         let store = Store::open(dir.path().to_path_buf())
             .await
             .expect("store should open");
+        let lock = super::cache_lock_path(store.root());
         let blob = store
             .blob_path("sha256:4444444444444444444444444444444444444444444444444444444444444444")
             .expect("blob path");
@@ -709,6 +782,8 @@ mod tests {
             store.root().join("partials").join("sha256").exists(),
             "sha256 partial cache layout should be recreated"
         );
+        assert!(lock.exists(), "cache lock should remain inside cache root");
+        assert_eq!(lock, store.root().join(".lock"));
         for algorithm in ["sha384", "sha512"] {
             assert!(
                 store.root().join("blobs").join(algorithm).exists(),
@@ -735,6 +810,29 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn clear_quiet_removes_cache_without_collecting_report() {
+        let dir = tempdir().expect("tempdir should create");
+        let store = Store::open(dir.path().to_path_buf())
+            .await
+            .expect("store should open");
+        let blob = store
+            .blob_path("sha256:4444444444444444444444444444444444444444444444444444444444444444")
+            .expect("blob path");
+        std::fs::create_dir_all(blob.parent().expect("blob parent"))
+            .expect("blob parent should exist");
+        std::fs::write(&blob, b"blob").expect("blob should be written");
+
+        store
+            .clear_quiet()
+            .await
+            .expect("quiet clear should succeed");
+
+        assert!(!blob.exists(), "blob should be removed");
+        assert!(store.root().join(".lock").exists(), "lock should remain");
+        assert!(store.root().join("blobs").join("sha256").exists());
     }
 
     #[tokio::test]
