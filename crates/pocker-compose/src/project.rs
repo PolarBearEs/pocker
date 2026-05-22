@@ -266,11 +266,9 @@ impl ComposeProject {
                 name: service.to_string(),
             }));
         }
-        let mapping = value_mapping(value);
-        if mapping.is_none() {
+        let Some(mapping) = value_mapping(value) else {
             return Ok(None);
-        }
-        let mapping = mapping.unwrap();
+        };
         let Some(service) = mapping_get_string(Some(mapping), "service") else {
             return Ok(None);
         };
