@@ -137,7 +137,16 @@ impl Store {
                 actual: actual_digest,
             });
         }
-        atomic_write_bytes(&path, bytes)?;
+        if let Err(error) = atomic_write_bytes(&path, bytes) {
+            if is_concurrent_blob_save_race(&error)
+                && self
+                    .ensure_blob_complete(&descriptor.digest, expected_size)
+                    .await?
+            {
+                return Ok(());
+            }
+            return Err(error);
+        }
         Ok(())
     }
 
@@ -450,6 +459,14 @@ async fn remove_file_if_exists(path: &Path) -> Result<()> {
     }
 }
 
+fn is_concurrent_blob_save_race(error: &DockerPullError) -> bool {
+    matches!(
+        error,
+        DockerPullError::Io(error)
+            if matches!(error.kind(), ErrorKind::AlreadyExists | ErrorKind::PermissionDenied)
+    )
+}
+
 fn digest_path(root: PathBuf, digest: &str) -> Result<PathBuf> {
     let parsed = parse_digest(digest)?;
     Ok(root.join(parsed.algorithm.to_string()).join(parsed.value))
@@ -670,6 +687,42 @@ mod tests {
             .await
             .expect("cached config blob should be readable");
 
+        assert_eq!(cached.as_deref(), Some(bytes.as_slice()));
+    }
+
+    #[tokio::test]
+    async fn concurrent_blob_saves_for_same_digest_are_idempotent() {
+        let dir = tempdir().expect("tempdir should create");
+        let store = std::sync::Arc::new(
+            Store::open(dir.path().to_path_buf())
+                .await
+                .expect("store should open"),
+        );
+        let bytes = b"shared blob";
+        let descriptor = Descriptor {
+            media_type: "application/octet-stream".into(),
+            digest: super::digest_bytes(bytes),
+            size: bytes.len() as i64,
+            platform: None,
+            annotations: None,
+        };
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..16 {
+            let store = std::sync::Arc::clone(&store);
+            let descriptor = descriptor.clone();
+            tasks.spawn(async move { store.save_blob_bytes(&descriptor, bytes).await });
+        }
+
+        while let Some(result) = tasks.join_next().await {
+            result
+                .expect("save task should not panic")
+                .expect("concurrent save should succeed");
+        }
+
+        let cached = store
+            .read_blob_bytes_if_complete(&descriptor)
+            .await
+            .expect("cached blob should be readable");
         assert_eq!(cached.as_deref(), Some(bytes.as_slice()));
     }
 
