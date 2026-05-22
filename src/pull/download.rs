@@ -31,11 +31,7 @@ pub async fn download_blob(
         return Ok(());
     }
 
-    let head = context
-        .registry
-        .head_blob(reference, &descriptor.digest)
-        .await?;
-    let expected_size = head.size.unwrap_or(descriptor.expected_size()?);
+    let expected_size = descriptor.expected_size()?;
     let mut plan = context
         .store
         .prepare_download(&descriptor, expected_size)
