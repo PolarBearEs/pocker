@@ -880,10 +880,6 @@ mod tests {
     }
 
     fn sha256_digest(bytes: &[u8]) -> String {
-        use sha2::{Digest as _, Sha256};
-
-        let mut hasher = Sha256::new();
-        hasher.update(bytes);
-        format!("sha256:{}", hex::encode(hasher.finalize()))
+        crate::digest::canonical_digest_bytes(bytes)
     }
 }

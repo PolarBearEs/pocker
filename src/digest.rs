@@ -101,7 +101,11 @@ pub(crate) fn digest_file_for_digest(digest: &str, path: &Path) -> Result<String
 }
 
 pub(crate) fn canonical_digest_bytes(bytes: &[u8]) -> String {
-    DigestAlgorithm::Sha256.digest_bytes(bytes)
+    format!("sha256:{}", sha256_hex(bytes))
+}
+
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
+    hash_bytes::<Sha256>(bytes)
 }
 
 fn hash_bytes<D: sha2::Digest>(bytes: &[u8]) -> String {

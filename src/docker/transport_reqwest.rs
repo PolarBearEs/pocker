@@ -1,7 +1,6 @@
 use std::path::Path;
 #[cfg(unix)]
 use std::path::PathBuf;
-use std::time::Duration;
 
 use futures_util::StreamExt;
 use reqwest::{Client, Response};
@@ -10,10 +9,9 @@ use tokio::io::DuplexStream;
 use tokio_util::io::ReaderStream;
 
 use crate::error::{DockerPullError, Result};
+use crate::http::{CONNECT_TIMEOUT, DEFAULT_READ_TIMEOUT, USER_AGENT};
 
 use super::DockerResponse;
-
-const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone)]
 pub(in crate::docker) struct ReqwestTransport {
@@ -111,9 +109,9 @@ impl ReqwestTransport {
 
 fn builder() -> reqwest::ClientBuilder {
     Client::builder()
-        .connect_timeout(Duration::from_secs(20))
+        .connect_timeout(CONNECT_TIMEOUT)
         .read_timeout(DEFAULT_READ_TIMEOUT)
-        .user_agent(format!("pocker/{}", env!("CARGO_PKG_VERSION")))
+        .user_agent(USER_AGENT)
         .http1_only()
 }
 

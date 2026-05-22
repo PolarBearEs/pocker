@@ -5,7 +5,9 @@ use reqwest::{Certificate, Client, ClientBuilder};
 
 use crate::error::Result;
 
-const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(60);
+pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+pub(crate) const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(60);
+pub(crate) const USER_AGENT: &str = concat!("pocker/", env!("CARGO_PKG_VERSION"));
 
 pub fn build_http_client(
     plain_http: bool,
@@ -30,7 +32,7 @@ fn build_http_client_with_timeouts(
 ) -> Result<Client> {
     let mut builder =
         http_client_builder(plain_http, insecure_skip_tls_verify, timeout, read_timeout)
-            .user_agent(format!("pocker/{}", env!("CARGO_PKG_VERSION")));
+            .user_agent(USER_AGENT);
 
     if let Some(path) = ca_file {
         let pem = std::fs::read(path)?;
@@ -47,7 +49,7 @@ fn http_client_builder(
     read_timeout: Option<Duration>,
 ) -> ClientBuilder {
     let mut builder = Client::builder()
-        .connect_timeout(Duration::from_secs(20))
+        .connect_timeout(CONNECT_TIMEOUT)
         .danger_accept_invalid_certs(insecure_skip_tls_verify)
         .redirect(reqwest::redirect::Policy::limited(10));
 
