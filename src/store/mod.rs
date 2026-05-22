@@ -257,6 +257,14 @@ impl Store {
     }
 
     pub async fn clear(&self) -> Result<ClearedCache> {
+        self.clear_with_report(true).await.map(Option::unwrap)
+    }
+
+    pub async fn clear_quiet(&self) -> Result<()> {
+        self.clear_with_report(false).await.map(|_| ())
+    }
+
+    async fn clear_with_report(&self, collect_report: bool) -> Result<Option<ClearedCache>> {
         let root = self.root.clone();
         let _exclusive_lock = tokio::task::spawn_blocking(move || {
             let lock = open_lock_file(&root)?;
@@ -266,23 +274,28 @@ impl Store {
         .await
         .map_err(|e| DockerPullError::InvalidInput(format!("cache lock task panicked: {e}")))??;
 
-        let root = self.root.clone();
-        let files = tokio::task::spawn_blocking(move || collect_cache_files(&root))
-            .await
-            .map_err(|e| {
-                DockerPullError::InvalidInput(format!("cache scan task panicked: {e}"))
-            })??;
-        let reclaimed_bytes = files
-            .iter()
-            .fold(0_u64, |total, file| total.saturating_add(file.size));
+        let report = if collect_report {
+            let root = self.root.clone();
+            let files = tokio::task::spawn_blocking(move || collect_cache_files(&root))
+                .await
+                .map_err(|e| {
+                    DockerPullError::InvalidInput(format!("cache scan task panicked: {e}"))
+                })??;
+            let reclaimed_bytes = files
+                .iter()
+                .fold(0_u64, |total, file| total.saturating_add(file.size));
+            Some(ClearedCache {
+                files,
+                reclaimed_bytes,
+            })
+        } else {
+            None
+        };
 
         remove_cache_contents(&self.root).await?;
 
         Self::open(self.root.clone()).await?;
-        Ok(ClearedCache {
-            files,
-            reclaimed_bytes,
-        })
+        Ok(report)
     }
 
     pub fn root(&self) -> &Path {
@@ -779,6 +792,29 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn clear_quiet_removes_cache_without_collecting_report() {
+        let dir = tempdir().expect("tempdir should create");
+        let store = Store::open(dir.path().to_path_buf())
+            .await
+            .expect("store should open");
+        let blob = store
+            .blob_path("sha256:4444444444444444444444444444444444444444444444444444444444444444")
+            .expect("blob path");
+        std::fs::create_dir_all(blob.parent().expect("blob parent"))
+            .expect("blob parent should exist");
+        std::fs::write(&blob, b"blob").expect("blob should be written");
+
+        store
+            .clear_quiet()
+            .await
+            .expect("quiet clear should succeed");
+
+        assert!(!blob.exists(), "blob should be removed");
+        assert!(store.root().join(".lock").exists(), "lock should remain");
+        assert!(store.root().join("blobs").join("sha256").exists());
     }
 
     #[tokio::test]
