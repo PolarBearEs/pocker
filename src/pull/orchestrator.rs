@@ -46,75 +46,77 @@ impl PullRequestOptions {
     pub(crate) fn from_pull_args(args: PullArgs) -> (Vec<String>, Self) {
         (
             args.references,
-            Self::from_args(
-                args.download,
-                args.image_parallel,
-                args.retry,
-                args.import,
-                args.registry,
-                args.auth,
-                args.output,
-                args.cache,
-                args.no_animations,
-            ),
+            Self::from_args(PullOptionArgs {
+                download: args.download,
+                image_parallel: args.image_parallel,
+                retry: args.retry,
+                import: args.import,
+                registry: args.registry,
+                auth: args.auth,
+                output: args.output,
+                cache: args.cache,
+                no_animations: args.no_animations,
+            }),
         )
     }
 
     pub(crate) fn from_compose_pull_args(args: ComposePullArgs) -> Self {
         Self {
-            ..Self::from_args(
-                args.download,
-                args.image_parallel,
-                args.retry,
-                args.import,
-                args.registry,
-                args.auth,
-                args.output,
-                args.cache,
-                true,
-            )
+            ..Self::from_args(PullOptionArgs {
+                download: args.download,
+                image_parallel: args.image_parallel,
+                retry: args.retry,
+                import: args.import,
+                registry: args.registry,
+                auth: args.auth,
+                output: args.output,
+                cache: args.cache,
+                no_animations: true,
+            })
         }
     }
 
-    fn from_args(
-        download: PullDownloadArgs,
-        image_parallel: ImageParallelArgs,
-        retry: RetryArgs,
-        import: ImportArgs,
-        registry: RegistryArgs,
-        auth: AuthArgs,
-        output: PullOutputArgs,
-        cache: CacheSourceArgs,
-        no_animations: bool,
-    ) -> Self {
+    fn from_args(args: PullOptionArgs) -> Self {
         Self {
-            platform: download.platform,
-            concurrency: download.concurrency,
-            image_concurrency: image_parallel.image_concurrency,
+            platform: args.download.platform,
+            concurrency: args.download.concurrency,
+            image_concurrency: args.image_parallel.image_concurrency,
             blob_retry_limit: retry_limit(
-                retry.blob_retries,
-                retry.retry_forever,
+                args.retry.blob_retries,
+                args.retry.retry_forever,
                 DEFAULT_BLOB_RETRIES,
             ),
             request_retry_limit: retry_limit(
-                retry.request_retries,
-                retry.retry_forever,
+                args.retry.request_retries,
+                args.retry.retry_forever,
                 DEFAULT_REQUEST_RETRIES,
             ),
-            no_load: import.no_load,
-            keep_layer_blobs: import.keep_layer_blobs,
-            load_mode: import.load_mode,
-            plain_http: registry.plain_http,
-            insecure_skip_tls_verify: registry.insecure_skip_tls_verify,
-            ca_file: registry.ca_file,
-            username: auth.username,
-            password_stdin: auth.password_stdin,
-            quiet: output.quiet,
-            no_animations,
-            cache_from: cache.cache_from,
-            cache_only: cache.cache_only,
+            no_load: args.import.no_load,
+            keep_layer_blobs: args.import.keep_layer_blobs,
+            load_mode: args.import.load_mode,
+            plain_http: args.registry.plain_http,
+            insecure_skip_tls_verify: args.registry.insecure_skip_tls_verify,
+            ca_file: args.registry.ca_file,
+            username: args.auth.username,
+            password_stdin: args.auth.password_stdin,
+            quiet: args.output.quiet,
+            no_animations: args.no_animations,
+            cache_from: args.cache.cache_from,
+            cache_only: args.cache.cache_only,
         }
     }
+}
+
+struct PullOptionArgs {
+    download: PullDownloadArgs,
+    image_parallel: ImageParallelArgs,
+    retry: RetryArgs,
+    import: ImportArgs,
+    registry: RegistryArgs,
+    auth: AuthArgs,
+    output: PullOutputArgs,
+    cache: CacheSourceArgs,
+    no_animations: bool,
 }
 
 pub(crate) fn retry_limit(
