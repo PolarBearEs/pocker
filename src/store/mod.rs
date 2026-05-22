@@ -1,6 +1,7 @@
 mod fs;
 
 use std::fs::{File, OpenOptions};
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -107,20 +108,7 @@ impl Store {
 
     pub async fn ensure_blob_complete(&self, digest: &str, expected_size: u64) -> Result<bool> {
         let path = self.blob_path(digest)?;
-        if !path.exists() {
-            return Ok(false);
-        }
-        let metadata = tokio_fs::metadata(&path).await?;
-        if metadata.len() != expected_size {
-            tokio_fs::remove_file(&path).await?;
-            return Ok(false);
-        }
-        let computed = digest_file_for_digest(digest, &path)?;
-        if computed != digest {
-            tokio_fs::remove_file(&path).await?;
-            return Ok(false);
-        }
-        Ok(true)
+        verify_blob_file(path, digest.to_string(), expected_size).await
     }
 
     pub async fn save_blob_bytes(&self, descriptor: &Descriptor, bytes: &[u8]) -> Result<()> {
@@ -158,20 +146,16 @@ impl Store {
         descriptor: &Descriptor,
     ) -> Result<Option<Vec<u8>>> {
         let path = self.blob_path(&descriptor.digest)?;
-        if !path.exists() {
-            return Ok(None);
+        if verify_blob_file(
+            path.clone(),
+            descriptor.digest.clone(),
+            descriptor.expected_size()?,
+        )
+        .await?
+        {
+            return Ok(Some(tokio_fs::read(path).await?));
         }
-        let bytes = tokio_fs::read(&path).await?;
-        if bytes.len() as u64 != descriptor.expected_size()? {
-            tokio_fs::remove_file(&path).await?;
-            return Ok(None);
-        }
-        let actual_digest = digest_bytes_for_digest(&descriptor.digest, &bytes)?;
-        if actual_digest != descriptor.digest {
-            tokio_fs::remove_file(&path).await?;
-            return Ok(None);
-        }
-        Ok(Some(bytes))
+        Ok(None)
     }
 
     pub async fn prepare_download(
@@ -236,7 +220,8 @@ impl Store {
                 partial,
             ));
         }
-        let computed = digest_file_for_digest(&descriptor.digest, &partial)?;
+        let computed =
+            digest_file_for_digest_blocking(descriptor.digest.clone(), partial.clone()).await?;
         if computed != descriptor.digest {
             return Err(DockerPullError::DigestMismatch {
                 digest: descriptor.digest.clone(),
@@ -372,6 +357,40 @@ async fn remove_cache_contents(root: &Path) -> Result<()> {
     }
 
     Ok(())
+}
+
+async fn verify_blob_file(path: PathBuf, digest: String, expected_size: u64) -> Result<bool> {
+    let metadata = match tokio_fs::metadata(&path).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.len() != expected_size {
+        remove_file_if_exists(&path).await?;
+        return Ok(false);
+    }
+
+    let computed = digest_file_for_digest_blocking(digest.clone(), path.clone()).await?;
+    if computed != digest {
+        remove_file_if_exists(&path).await?;
+        return Ok(false);
+    }
+
+    Ok(true)
+}
+
+async fn digest_file_for_digest_blocking(digest: String, path: PathBuf) -> Result<String> {
+    tokio::task::spawn_blocking(move || digest_file_for_digest(&digest, &path))
+        .await
+        .map_err(|e| DockerPullError::InvalidInput(format!("digest task panicked: {e}")))?
+}
+
+async fn remove_file_if_exists(path: &Path) -> Result<()> {
+    match tokio_fs::remove_file(path).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn digest_path(root: PathBuf, digest: &str) -> Result<PathBuf> {
