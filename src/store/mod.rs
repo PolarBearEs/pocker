@@ -86,11 +86,11 @@ impl Store {
         })
     }
 
-    pub fn blob_path(&self, digest: &str) -> Result<PathBuf> {
+    pub(crate) fn blob_path(&self, digest: &str) -> Result<PathBuf> {
         digest_path(self.root.join("blobs"), digest)
     }
 
-    pub fn partial_path(&self, digest: &str) -> Result<PathBuf> {
+    pub(crate) fn partial_path(&self, digest: &str) -> Result<PathBuf> {
         let path = digest_path(self.root.join("partials"), digest)?;
         Ok(path.with_extension("part"))
     }
