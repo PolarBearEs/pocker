@@ -165,41 +165,22 @@ impl Store {
     ) -> Result<DownloadPlan> {
         let partial_path = self.partial_path(&descriptor.digest)?;
         let metadata_path = self.partial_metadata_path(&descriptor.digest)?;
-        let stored = read_json_if_exists::<DownloadCheckpoint>(&metadata_path)?;
-        let durable_offset = reconcile_partial_file(
-            &partial_path,
-            stored
-                .as_ref()
-                .map(|record| record.durable_offset)
-                .unwrap_or(0),
-        )?;
-        atomic_write_json(
-            &metadata_path,
-            &DownloadCheckpoint {
-                expected_size,
-                durable_offset,
-            },
-        )?;
+        let durable_offset =
+            prepare_download_blocking(partial_path.clone(), metadata_path, expected_size).await?;
         Ok(DownloadPlan {
             durable_offset,
             partial_path,
         })
     }
 
-    pub fn checkpoint_download(
+    pub async fn checkpoint_download(
         &self,
         digest: &str,
         durable_offset: u64,
         expected_size: u64,
     ) -> Result<()> {
         let path = self.partial_metadata_path(digest)?;
-        atomic_write_json(
-            &path,
-            &DownloadCheckpoint {
-                expected_size,
-                durable_offset,
-            },
-        )
+        write_download_checkpoint_blocking(path, durable_offset, expected_size).await
     }
 
     pub async fn reset_partial(&self, digest: &str, expected_size: u64) -> Result<()> {
@@ -207,7 +188,7 @@ impl Store {
         if partial.exists() {
             tokio_fs::remove_file(&partial).await?;
         }
-        self.checkpoint_download(digest, 0, expected_size)?;
+        self.checkpoint_download(digest, 0, expected_size).await?;
         Ok(())
     }
 
@@ -379,6 +360,51 @@ async fn verify_blob_file(path: PathBuf, digest: String, expected_size: u64) -> 
     Ok(true)
 }
 
+async fn prepare_download_blocking(
+    partial_path: PathBuf,
+    metadata_path: PathBuf,
+    expected_size: u64,
+) -> Result<u64> {
+    tokio::task::spawn_blocking(move || {
+        let stored = read_json_if_exists::<DownloadCheckpoint>(&metadata_path)?;
+        let durable_offset = reconcile_partial_file(
+            &partial_path,
+            stored
+                .as_ref()
+                .map(|record| record.durable_offset)
+                .unwrap_or(0),
+        )?;
+        atomic_write_json(
+            &metadata_path,
+            &DownloadCheckpoint {
+                expected_size,
+                durable_offset,
+            },
+        )?;
+        Result::Ok(durable_offset)
+    })
+    .await
+    .map_err(|e| DockerPullError::InvalidInput(format!("download plan task panicked: {e}")))?
+}
+
+async fn write_download_checkpoint_blocking(
+    path: PathBuf,
+    durable_offset: u64,
+    expected_size: u64,
+) -> Result<()> {
+    tokio::task::spawn_blocking(move || {
+        atomic_write_json(
+            &path,
+            &DownloadCheckpoint {
+                expected_size,
+                durable_offset,
+            },
+        )
+    })
+    .await
+    .map_err(|e| DockerPullError::InvalidInput(format!("checkpoint task panicked: {e}")))?
+}
+
 async fn digest_file_for_digest_blocking(digest: String, path: PathBuf) -> Result<String> {
     tokio::task::spawn_blocking(move || digest_file_for_digest(&digest, &path))
         .await
@@ -498,6 +524,7 @@ mod tests {
         std::fs::write(&partial, b"1234").expect("partial file should be written");
         store
             .checkpoint_download(&descriptor.digest, 8, 10)
+            .await
             .expect("download state should be updated");
         let plan = store
             .prepare_download(&descriptor, 10)

@@ -124,11 +124,10 @@ pub async fn download_blob(
                     {
                         file.flush().await?;
                         file.sync_data().await?;
-                        context.store.checkpoint_download(
-                            &descriptor.digest,
-                            offset,
-                            expected_size,
-                        )?;
+                        context
+                            .store
+                            .checkpoint_download(&descriptor.digest, offset, expected_size)
+                            .await?;
                         bytes_since_checkpoint = 0;
                         last_checkpoint = Instant::now();
                     }
@@ -147,7 +146,8 @@ pub async fn download_blob(
                     file.sync_data().await?;
                     context
                         .store
-                        .checkpoint_download(&descriptor.digest, offset, expected_size)?;
+                        .checkpoint_download(&descriptor.digest, offset, expected_size)
+                        .await?;
                     tokio::time::sleep(delay).await;
                     stream_failed = true;
                     break;
@@ -163,7 +163,8 @@ pub async fn download_blob(
         file.sync_data().await?;
         context
             .store
-            .checkpoint_download(&descriptor.digest, offset, expected_size)?;
+            .checkpoint_download(&descriptor.digest, offset, expected_size)
+            .await?;
     }
 
     context
