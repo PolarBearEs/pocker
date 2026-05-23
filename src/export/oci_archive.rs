@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 use tar::{Builder, Header};
+use tokio::fs as tokio_fs;
 
 use crate::digest::{canonical_digest_bytes, digest_hex, parse_digest};
 use crate::docker;
@@ -72,7 +73,7 @@ pub(crate) async fn prepare_oci_archive(
     store: &Store,
     reference: &StoredReference,
 ) -> Result<PreparedOciArchive> {
-    let inputs = load_archive_inputs(store, reference)?;
+    let inputs = load_archive_inputs(store, reference).await?;
     let daemon_layers = if inputs.missing_diff_ids.is_empty() {
         None
     } else {
@@ -185,11 +186,11 @@ fn write_oci_archive_to_writer_with_fallbacks<W: Write>(
     Ok(())
 }
 
-fn load_archive_inputs(store: &Store, reference: &StoredReference) -> Result<ArchiveInputs> {
+async fn load_archive_inputs(store: &Store, reference: &StoredReference) -> Result<ArchiveInputs> {
     let manifest_path = store.blob_path(&reference.manifest.digest)?;
-    let manifest_bytes = std::fs::read(manifest_path)?;
+    let manifest_bytes = tokio_fs::read(manifest_path).await?;
     let config_blob_path = store.blob_path(&reference.config_digest)?;
-    let config_bytes = std::fs::read(config_blob_path)?;
+    let config_bytes = tokio_fs::read(config_blob_path).await?;
     let manifest: OciManifest = serde_json::from_slice(&manifest_bytes)?;
     let diff_ids = parse_diff_ids(&config_bytes)?;
     if diff_ids.len() != manifest.layers.len() {
@@ -537,8 +538,9 @@ mod tests {
             manifest,
             config_digest: config.digest.clone(),
         };
-        let inputs =
-            load_archive_inputs(&store, &stored_reference).expect("archive inputs should load");
+        let inputs = load_archive_inputs(&store, &stored_reference)
+            .await
+            .expect("archive inputs should load");
 
         let mut archive = Vec::new();
         write_oci_archive_to_writer_with_fallbacks(

@@ -1,3 +1,4 @@
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -7,33 +8,15 @@ use predicates::str::contains;
 use sha2::{Digest, Sha256, Sha384, Sha512};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::task::JoinHandle;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pulls_oci_image_from_fake_registry_into_cache() {
     let fixture = Arc::new(Fixture::build());
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("fake registry should bind");
-    let address = listener
-        .local_addr()
-        .expect("listener should expose address");
-
-    let server_fixture = Arc::clone(&fixture);
-    let server = tokio::spawn(async move {
-        loop {
-            let (stream, _peer) = match listener.accept().await {
-                Ok(pair) => pair,
-                Err(_) => return,
-            };
-            let request_fixture = Arc::clone(&server_fixture);
-            tokio::spawn(async move {
-                let _ = handle_connection(stream, request_fixture).await;
-            });
-        }
-    });
+    let server = RegistryFixtureServer::spawn(Arc::clone(&fixture)).await;
 
     let cache_dir = tempfile::tempdir().expect("cache tempdir should create");
-    let reference = format!("{address}/library/test:latest");
+    let reference = format!("{}/library/test:latest", server.address());
 
     let pocker_run = tokio::task::spawn_blocking({
         let cache = cache_dir.path().to_path_buf();
@@ -60,7 +43,6 @@ async fn pulls_oci_image_from_fake_registry_into_cache() {
     });
 
     pocker_run.await.expect("pocker subprocess should run");
-    server.abort();
 
     let manifest_path = cache_dir
         .path()
@@ -93,34 +75,13 @@ async fn pulls_oci_image_from_fake_registry_into_cache() {
 async fn pulls_multiple_oci_images_from_fake_registry_into_cache() {
     let fixture = Arc::new(Fixture::build());
     let layer_gets = Arc::new(AtomicUsize::new(0));
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("fake registry should bind");
-    let address = listener
-        .local_addr()
-        .expect("listener should expose address");
-
-    let server_fixture = Arc::clone(&fixture);
-    let server_layer_gets = Arc::clone(&layer_gets);
-    let server = tokio::spawn(async move {
-        loop {
-            let (stream, _peer) = match listener.accept().await {
-                Ok(pair) => pair,
-                Err(_) => return,
-            };
-            let request_fixture = Arc::clone(&server_fixture);
-            let request_layer_gets = Arc::clone(&server_layer_gets);
-            tokio::spawn(async move {
-                let _ =
-                    handle_connection_with_layer_gets(stream, request_fixture, request_layer_gets)
-                        .await;
-            });
-        }
-    });
+    let server =
+        RegistryFixtureServer::spawn_with_layer_gets(Arc::clone(&fixture), Arc::clone(&layer_gets))
+            .await;
 
     let cache_dir = tempfile::tempdir().expect("cache tempdir should create");
-    let first_reference = format!("{address}/library/test:first");
-    let second_reference = format!("{address}/library/test:second");
+    let first_reference = format!("{}/library/test:first", server.address());
+    let second_reference = format!("{}/library/test:second", server.address());
 
     let pocker_run = tokio::task::spawn_blocking({
         let cache = cache_dir.path().to_path_buf();
@@ -148,7 +109,6 @@ async fn pulls_multiple_oci_images_from_fake_registry_into_cache() {
     });
 
     pocker_run.await.expect("pocker subprocess should run");
-    server.abort();
 
     let manifest_path = cache_dir
         .path()
@@ -194,29 +154,10 @@ async fn pulls_oci_image_with_sha512_layer_digest_into_cache() {
 
 async fn pulls_oci_image_with_layer_algorithm_into_cache(algorithm: &'static str) {
     let fixture = Arc::new(Fixture::build_with_layer_algorithm(algorithm));
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("fake registry should bind");
-    let address = listener
-        .local_addr()
-        .expect("listener should expose address");
-
-    let server_fixture = Arc::clone(&fixture);
-    let server = tokio::spawn(async move {
-        loop {
-            let (stream, _peer) = match listener.accept().await {
-                Ok(pair) => pair,
-                Err(_) => return,
-            };
-            let request_fixture = Arc::clone(&server_fixture);
-            tokio::spawn(async move {
-                let _ = handle_connection(stream, request_fixture).await;
-            });
-        }
-    });
+    let server = RegistryFixtureServer::spawn(Arc::clone(&fixture)).await;
 
     let cache_dir = tempfile::tempdir().expect("cache tempdir should create");
-    let reference = format!("{address}/library/test:latest");
+    let reference = format!("{}/library/test:latest", server.address());
 
     let pocker_run = tokio::task::spawn_blocking({
         let cache = cache_dir.path().to_path_buf();
@@ -243,7 +184,6 @@ async fn pulls_oci_image_with_layer_algorithm_into_cache(algorithm: &'static str
     });
 
     pocker_run.await.expect("pocker subprocess should run");
-    server.abort();
 
     let layer_path = cache_dir
         .path()
@@ -259,29 +199,10 @@ async fn pull_rejects_malformed_layer_digest_before_cache_path_use() {
     let fixture = Arc::new(Fixture::build_with_layer_digest(
         "sha256:../../outside".to_string(),
     ));
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("fake registry should bind");
-    let address = listener
-        .local_addr()
-        .expect("listener should expose address");
-
-    let server_fixture = Arc::clone(&fixture);
-    let server = tokio::spawn(async move {
-        loop {
-            let (stream, _peer) = match listener.accept().await {
-                Ok(pair) => pair,
-                Err(_) => return,
-            };
-            let request_fixture = Arc::clone(&server_fixture);
-            tokio::spawn(async move {
-                let _ = handle_connection(stream, request_fixture).await;
-            });
-        }
-    });
+    let server = RegistryFixtureServer::spawn(Arc::clone(&fixture)).await;
 
     let cache_dir = tempfile::tempdir().expect("cache tempdir should create");
-    let reference = format!("{address}/library/test:latest");
+    let reference = format!("{}/library/test:latest", server.address());
 
     let pocker_run = tokio::task::spawn_blocking({
         let cache = cache_dir.path().to_path_buf();
@@ -309,12 +230,69 @@ async fn pull_rejects_malformed_layer_digest_before_cache_path_use() {
     });
 
     pocker_run.await.expect("pocker subprocess should run");
-    server.abort();
 
     assert!(
         !cache_dir.path().join("outside").exists(),
         "malformed digest must not create paths outside the digest cache"
     );
+}
+
+struct RegistryFixtureServer {
+    address: SocketAddr,
+    task: JoinHandle<()>,
+}
+
+impl RegistryFixtureServer {
+    async fn spawn(fixture: Arc<Fixture>) -> Self {
+        Self::spawn_with_optional_layer_gets(fixture, None).await
+    }
+
+    async fn spawn_with_layer_gets(fixture: Arc<Fixture>, layer_gets: Arc<AtomicUsize>) -> Self {
+        Self::spawn_with_optional_layer_gets(fixture, Some(layer_gets)).await
+    }
+
+    async fn spawn_with_optional_layer_gets(
+        fixture: Arc<Fixture>,
+        layer_gets: Option<Arc<AtomicUsize>>,
+    ) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("fake registry should bind");
+        let address = listener
+            .local_addr()
+            .expect("listener should expose address");
+
+        let task = tokio::spawn(async move {
+            loop {
+                let (stream, _peer) = match listener.accept().await {
+                    Ok(pair) => pair,
+                    Err(_) => return,
+                };
+                let request_fixture = Arc::clone(&fixture);
+                let request_layer_gets = layer_gets.clone();
+                tokio::spawn(async move {
+                    let _ = handle_connection_with_optional_layer_gets(
+                        stream,
+                        request_fixture,
+                        request_layer_gets,
+                    )
+                    .await;
+                });
+            }
+        });
+
+        Self { address, task }
+    }
+
+    fn address(&self) -> SocketAddr {
+        self.address
+    }
+}
+
+impl Drop for RegistryFixtureServer {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
 }
 
 struct Fixture {
@@ -333,12 +311,7 @@ impl Fixture {
 
     fn build_with_layer_algorithm(algorithm: &str) -> Self {
         let layer_bytes = b"fake layer payload".to_vec();
-        let layer_digest = match algorithm {
-            "sha256" => sha256_hex(&layer_bytes),
-            "sha384" => sha384_hex(&layer_bytes),
-            "sha512" => sha512_hex(&layer_bytes),
-            other => panic!("unsupported test digest algorithm {other}"),
-        };
+        let layer_digest = digest_hex(algorithm, &layer_bytes);
         Self::build_with_layer_digest(format!("{algorithm}:{layer_digest}"))
     }
 
@@ -375,33 +348,22 @@ impl Fixture {
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
-    let mut hasher = Sha256::new();
+    digest_hex("sha256", bytes)
+}
+
+fn digest_hex(algorithm: &str, bytes: &[u8]) -> String {
+    match algorithm {
+        "sha256" => hash_hex::<Sha256>(bytes),
+        "sha384" => hash_hex::<Sha384>(bytes),
+        "sha512" => hash_hex::<Sha512>(bytes),
+        other => panic!("unsupported test digest algorithm {other}"),
+    }
+}
+
+fn hash_hex<D: Digest>(bytes: &[u8]) -> String {
+    let mut hasher = D::new();
     hasher.update(bytes);
     hex::encode(hasher.finalize())
-}
-
-fn sha384_hex(bytes: &[u8]) -> String {
-    let mut hasher = Sha384::new();
-    hasher.update(bytes);
-    hex::encode(hasher.finalize())
-}
-
-fn sha512_hex(bytes: &[u8]) -> String {
-    let mut hasher = Sha512::new();
-    hasher.update(bytes);
-    hex::encode(hasher.finalize())
-}
-
-async fn handle_connection(stream: TcpStream, fixture: Arc<Fixture>) -> std::io::Result<()> {
-    handle_connection_with_optional_layer_gets(stream, fixture, None).await
-}
-
-async fn handle_connection_with_layer_gets(
-    stream: TcpStream,
-    fixture: Arc<Fixture>,
-    layer_gets: Arc<AtomicUsize>,
-) -> std::io::Result<()> {
-    handle_connection_with_optional_layer_gets(stream, fixture, Some(layer_gets)).await
 }
 
 async fn handle_connection_with_optional_layer_gets(
