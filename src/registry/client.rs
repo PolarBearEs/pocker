@@ -232,13 +232,10 @@ impl RegistryClient {
             if response.status() == StatusCode::NOT_FOUND {
                 return Err(DockerPullError::ManifestNotFound);
             }
-            if !response.status().is_success() {
-                return Err(DockerPullError::BadResponse(format!(
-                    "registry returned {} for manifest {}",
-                    response.status(),
-                    descriptor.digest
-                )));
-            }
+            ensure_success_status(
+                response.status(),
+                &format!("manifest {}", descriptor.digest),
+            )?;
             let body = response.bytes().await?.to_vec();
             let manifest: ImageManifest = serde_json::from_slice(&body)?;
             return Ok(ResolvedImage {
