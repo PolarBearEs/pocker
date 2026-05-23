@@ -287,11 +287,11 @@ impl Ui {
 
     pub fn warn(&self, message: impl Into<String>) {
         let message = format!("warning: {}", message.into());
-        let plain_message = message.clone();
-        self.dispatch_mode(
-            |inner| inner.image.println(message),
-            || self.plain_line(plain_message),
-        );
+        match &self.mode {
+            UiMode::Progress(inner) => inner.image.println(message),
+            UiMode::Plain { .. } => self.plain_line(message),
+            UiMode::Quiet => {}
+        }
     }
 
     fn finish_layer_status(&self, digest: &str, progress_status: &str, plain_status: &str) {
@@ -477,13 +477,13 @@ impl ProgressUiInner {
         let render = aggregate_render(&aggregate, status);
 
         if !force {
-            if aggregate.last_rendered.as_ref() == Some(&render) {
-                return;
-            }
             if aggregate
                 .last_rendered_at
                 .is_some_and(|last| last.elapsed() < AGGREGATE_RENDER_INTERVAL)
             {
+                return;
+            }
+            if aggregate.last_rendered.as_ref() == Some(&render) {
                 return;
             }
         }
