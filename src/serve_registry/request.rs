@@ -6,7 +6,7 @@ use tokio::time::{Duration, timeout};
 use crate::error::{DockerPullError, Result};
 
 const MAX_REQUEST_HEAD_BYTES: usize = 64 * 1024;
-const REQUEST_HEAD_TIMEOUT: Duration = Duration::from_secs(30);
+const REQUEST_HEAD_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Debug)]
 pub(super) struct Request {
