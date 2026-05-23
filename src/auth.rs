@@ -98,37 +98,47 @@ impl AuthResolver {
 }
 
 fn resolve_docker_config(config: &DockerConfig, registry: &str) -> Result<Option<Credentials>> {
-    for key in registry_keys(registry) {
-        if let Some(helper) = config.cred_helpers.get(key)
+    let keys = registry_keys(registry);
+
+    for key in &keys {
+        if let Some(helper) = config.cred_helpers.get(*key)
             && let Some(credentials) = invoke_helper(helper, key)?
         {
             return Ok(Some(credentials));
         }
+    }
 
-        if let Some(helper) = &config.creds_store
-            && let Some(credentials) = invoke_helper(helper, key)?
-        {
-            return Ok(Some(credentials));
+    if let Some(helper) = &config.creds_store {
+        for key in &keys {
+            if let Some(credentials) = invoke_helper(helper, key)? {
+                return Ok(Some(credentials));
+            }
         }
+    }
 
-        if let Some(entry) = config.auths.get(key)
+    for key in &keys {
+        if let Some(entry) = config.auths.get(*key)
             && let Some(auth) = &entry.auth
         {
-            let decoded = base64::engine::general_purpose::STANDARD.decode(auth)?;
-            let value = String::from_utf8(decoded).map_err(|error| {
-                DockerPullError::InvalidInput(format!("invalid docker auth entry: {error}"))
-            })?;
-            let (username, password) = value.split_once(':').ok_or_else(|| {
-                DockerPullError::InvalidInput("docker auth entry is missing separator".into())
-            })?;
-            return Ok(Some(Credentials::Basic {
-                username: username.to_string(),
-                password: password.to_string(),
-            }));
+            return decode_auth_entry(auth).map(Some);
         }
     }
 
     Ok(None)
+}
+
+fn decode_auth_entry(auth: &str) -> Result<Credentials> {
+    let decoded = base64::engine::general_purpose::STANDARD.decode(auth)?;
+    let value = String::from_utf8(decoded).map_err(|error| {
+        DockerPullError::InvalidInput(format!("invalid docker auth entry: {error}"))
+    })?;
+    let (username, password) = value.split_once(':').ok_or_else(|| {
+        DockerPullError::InvalidInput("docker auth entry is missing separator".into())
+    })?;
+    Ok(Credentials::Basic {
+        username: username.to_string(),
+        password: password.to_string(),
+    })
 }
 
 fn load_docker_config() -> Result<Option<DockerConfig>> {
@@ -587,6 +597,82 @@ printf '{{"Username":"helper-user","Secret":"helper-pass"}}'
             "x",
             "concurrent callers should share one in-flight helper invocation"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn docker_hub_cred_helper_alias_takes_priority_over_creds_store() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let lock = lock_docker_config_env();
+        let dir = tempdir().expect("tempdir should create");
+        let bin_dir = dir.path().join("bin");
+        fs::create_dir(&bin_dir).expect("bin dir should create");
+        for (helper, username, password) in [
+            (
+                "docker-credential-osxkeychain",
+                "helper-user",
+                "helper-pass",
+            ),
+            ("docker-credential-pass", "store-user", "store-pass"),
+        ] {
+            let helper_path = bin_dir.join(helper);
+            fs::write(
+                &helper_path,
+                format!(
+                    r#"#!/bin/sh
+printf '{{"Username":"{username}","Secret":"{password}"}}'
+"#
+                ),
+            )
+            .expect("helper should be written");
+            let mut permissions = fs::metadata(&helper_path)
+                .expect("helper metadata")
+                .permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&helper_path, permissions).expect("helper should be executable");
+        }
+        fs::write(
+            dir.path().join("config.json"),
+            r#"{
+                "credHelpers": {
+                    "https://index.docker.io/v1/": "osxkeychain"
+                },
+                "credsStore": "pass"
+            }"#,
+        )
+        .expect("config should be written");
+
+        let previous_path = std::env::var_os("PATH");
+        unsafe {
+            std::env::set_var(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    bin_dir.display(),
+                    previous_path
+                        .as_deref()
+                        .and_then(std::ffi::OsStr::to_str)
+                        .unwrap_or_default()
+                ),
+            );
+        }
+        let mut docker_config = DockerConfigEnvGuard::new_with_lock(lock, dir.path());
+        let resolver = AuthResolver::new(None).expect("resolver should build");
+
+        let credentials = resolver
+            .resolve("registry-1.docker.io")
+            .await
+            .expect("auth resolution should succeed");
+
+        docker_config.restore();
+        restore_path_env(previous_path.as_deref());
+
+        assert!(matches!(
+            credentials,
+            Some(Credentials::Basic { username, password })
+                if username == "helper-user" && password == "helper-pass"
+        ));
     }
 
     #[test]
