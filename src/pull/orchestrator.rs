@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -147,7 +146,7 @@ pub(crate) async fn pull_references(
     references: Vec<String>,
     request: PullRequestOptions,
 ) -> Result<()> {
-    let references = unique_references(references);
+    let references = pocker_compose::unique_images(&references);
     let store = Arc::new(Store::open_active(cache_dir.to_path_buf()).await?);
     let quiet = global_quiet || request.quiet;
     let platform = request
@@ -261,36 +260,4 @@ async fn pull_reference_with_group(state: SharedPullState, reference: String) ->
         daemon_layer_cache: state.daemon_layer_cache,
     };
     Puller::new(context).pull(reference, state.options).await
-}
-
-fn unique_references(references: Vec<String>) -> Vec<String> {
-    let mut seen = HashSet::new();
-    let mut unique = Vec::new();
-    for reference in references {
-        if seen.insert(reference.clone()) {
-            unique.push(reference);
-        }
-    }
-    unique
-}
-
-#[cfg(test)]
-mod tests {
-    use super::unique_references;
-
-    #[test]
-    fn unique_references_preserves_first_seen_order() {
-        let references = unique_references(vec![
-            "alpine:latest".to_string(),
-            "busybox:latest".to_string(),
-            "alpine:latest".to_string(),
-            "ghcr.io/acme/app:latest".to_string(),
-            "busybox:latest".to_string(),
-        ]);
-
-        assert_eq!(
-            references,
-            vec!["alpine:latest", "busybox:latest", "ghcr.io/acme/app:latest"]
-        );
-    }
 }
