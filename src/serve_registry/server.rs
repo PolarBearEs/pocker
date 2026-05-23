@@ -8,6 +8,7 @@ use reqwest::header::RANGE;
 use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Semaphore, oneshot};
+use tokio::task::JoinSet;
 use tracing::warn;
 
 use crate::digest::parse_digest;
@@ -25,6 +26,7 @@ use crate::ui::Ui;
 use super::response::{RegistryResponse, write_response};
 
 const MAX_REQUEST_HEAD_BYTES: usize = 64 * 1024;
+const MAX_CONNECTIONS: usize = 1024;
 
 pub struct ServeConfig {
     pub listen: SocketAddr,
@@ -90,14 +92,22 @@ async fn run_server(
     state: Arc<ServeState>,
     mut shutdown: Option<oneshot::Receiver<()>>,
 ) -> Result<()> {
+    let mut connections = JoinSet::new();
     loop {
         tokio::select! {
-            result = listener.accept() => {
+            result = listener.accept(), if connections.len() < MAX_CONNECTIONS => {
                 let (stream, _) = result?;
                 let state = Arc::clone(&state);
-                tokio::spawn(async move {
-                    let _ = handle_connection(stream, state).await;
+                connections.spawn(async move {
+                    if let Err(error) = handle_connection(stream, state).await {
+                        warn!("cache registry connection failed: {error}");
+                    }
                 });
+            }
+            Some(result) = connections.join_next(), if !connections.is_empty() => {
+                if let Err(error) = result {
+                    warn!("cache registry connection task failed: {error}");
+                }
             }
             _ = async {
                 if let Some(shutdown) = shutdown.as_mut() {
@@ -107,6 +117,8 @@ async fn run_server(
                 }
             } => {
                 state.pull_context.stop.store(true, Ordering::SeqCst);
+                connections.abort_all();
+                while connections.join_next().await.is_some() {}
                 break;
             },
         }
