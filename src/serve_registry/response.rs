@@ -4,6 +4,7 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use crate::error::Result;
+use crate::registry::OCTET_STREAM_MEDIA_TYPE;
 
 pub(super) enum RegistryBody {
     Empty,
@@ -118,12 +119,15 @@ pub(super) async fn write_response(
     stream: &mut TcpStream,
     response: RegistryResponse,
 ) -> Result<()> {
+    let content_type = safe_header_value(&response.content_type).unwrap_or(OCTET_STREAM_MEDIA_TYPE);
     let mut headers = format!(
         "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n",
-        response.status, response.reason, response.content_type, response.content_length
+        response.status, response.reason, content_type, response.content_length
     );
     headers.push_str("Docker-Distribution-API-Version: registry/2.0\r\n");
-    if let Some(digest) = &response.digest {
+    if let Some(digest) = &response.digest
+        && let Some(digest) = safe_header_value(digest)
+    {
         headers.push_str(&format!("Docker-Content-Digest: {digest}\r\n"));
     }
     if let Some(range) = response.range {
@@ -151,4 +155,37 @@ pub(super) async fn write_response(
     stream.flush().await?;
     stream.shutdown().await?;
     Ok(())
+}
+
+fn safe_header_value(value: &str) -> Option<&str> {
+    if value.bytes().any(|byte| matches!(byte, b'\r' | b'\n')) {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::safe_header_value;
+
+    #[test]
+    fn header_value_rejects_crlf() {
+        assert_eq!(
+            safe_header_value("application/octet-stream"),
+            Some("application/octet-stream")
+        );
+        assert_eq!(safe_header_value("text/plain\r\nInjected: yes"), None);
+        assert_eq!(safe_header_value("text/plain\nInjected: yes"), None);
+    }
+
+    #[test]
+    fn header_value_accepts_digest() {
+        assert_eq!(
+            safe_header_value(
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            ),
+            Some("sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
+    }
 }

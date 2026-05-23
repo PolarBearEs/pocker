@@ -1,12 +1,12 @@
+use std::future::Future;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use reqwest::header::RANGE;
-use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Semaphore, oneshot};
+use tokio::task::JoinSet;
 use tracing::warn;
 
 use crate::digest::parse_digest;
@@ -21,7 +21,10 @@ use crate::registry::{
 use crate::store::{Store, StoredReference};
 use crate::ui::Ui;
 
+use super::request::{Request, read_request};
 use super::response::{RegistryResponse, write_response};
+
+const MAX_CONNECTIONS: usize = 1024;
 
 pub struct ServeConfig {
     pub listen: SocketAddr,
@@ -65,13 +68,19 @@ pub(crate) async fn serve_listener(
     shutdown: Option<oneshot::Receiver<()>>,
 ) -> Result<()> {
     let state = Arc::new(ServeState {
-        store: config.store,
-        registry: config.registry,
+        store: Arc::clone(&config.store),
+        registry: Arc::clone(&config.registry),
         pull_missing: config.pull_missing,
-        blob_retry_limit: config.blob_retry_limit,
-        quiet: config.quiet,
         downloads: Arc::new(Semaphore::new(config.concurrency)),
-        blob_locks: Arc::new(BlobDownloadLocks::default()),
+        pull_context: Arc::new(PullContext {
+            store: config.store,
+            registry: config.registry,
+            stop: Arc::new(AtomicBool::new(false)),
+            ui: Arc::new(Ui::new(config.quiet, false)),
+            blob_retry_limit: config.blob_retry_limit,
+            blob_locks: Arc::new(BlobDownloadLocks::default()),
+            daemon_layer_cache: None,
+        }),
     });
     run_server(listener, state, shutdown).await
 }
@@ -81,14 +90,22 @@ async fn run_server(
     state: Arc<ServeState>,
     mut shutdown: Option<oneshot::Receiver<()>>,
 ) -> Result<()> {
+    let mut connections = JoinSet::new();
     loop {
         tokio::select! {
-            result = listener.accept() => {
+            result = listener.accept(), if connections.len() < MAX_CONNECTIONS => {
                 let (stream, _) = result?;
                 let state = Arc::clone(&state);
-                tokio::spawn(async move {
-                    let _ = handle_connection(stream, state).await;
+                connections.spawn(async move {
+                    if let Err(error) = handle_connection(stream, state).await {
+                        warn!("cache registry connection failed: {error}");
+                    }
                 });
+            }
+            Some(result) = connections.join_next(), if !connections.is_empty() => {
+                if let Err(error) = result {
+                    warn!("cache registry connection task failed: {error}");
+                }
             }
             _ = async {
                 if let Some(shutdown) = shutdown.as_mut() {
@@ -96,7 +113,12 @@ async fn run_server(
                 } else {
                     std::future::pending::<()>().await;
                 }
-            } => break,
+            } => {
+                state.pull_context.stop.store(true, Ordering::SeqCst);
+                connections.abort_all();
+                while connections.join_next().await.is_some() {}
+                break;
+            },
         }
     }
     Ok(())
@@ -106,78 +128,14 @@ struct ServeState {
     store: Arc<Store>,
     registry: Arc<RegistryClient>,
     pull_missing: bool,
-    blob_retry_limit: Option<u32>,
-    quiet: bool,
     downloads: Arc<Semaphore>,
-    blob_locks: Arc<BlobDownloadLocks>,
-}
-
-#[derive(Debug)]
-struct Request {
-    method: String,
-    path: String,
-    range: Option<String>,
+    pull_context: Arc<PullContext>,
 }
 
 async fn handle_connection(mut stream: TcpStream, state: Arc<ServeState>) -> Result<()> {
     let request = read_request(&mut stream).await?;
     let response = route_request(&request, state).await;
     write_response(&mut stream, response).await
-}
-
-async fn read_request(stream: &mut TcpStream) -> Result<Request> {
-    let mut bytes = Vec::new();
-    let mut buffer = [0_u8; 4096];
-    loop {
-        let read = stream.read(&mut buffer).await?;
-        if read == 0 {
-            break;
-        }
-        bytes.extend_from_slice(&buffer[..read]);
-        if !looks_like_http_request(&bytes) {
-            return Err(DockerPullError::BadResponse(
-                "cache registry received non-HTTP request".into(),
-            ));
-        }
-        if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
-            break;
-        }
-        if bytes.len() > 64 * 1024 {
-            return Err(DockerPullError::InvalidInput(
-                "cache registry request headers are too large".into(),
-            ));
-        }
-    }
-
-    let text = std::str::from_utf8(&bytes)
-        .map_err(|error| DockerPullError::BadResponse(format!("invalid HTTP request: {error}")))?;
-    let mut lines = text.lines();
-    let request_line = lines
-        .next()
-        .ok_or_else(|| DockerPullError::BadResponse("empty HTTP request".into()))?;
-    let mut parts = request_line.split_whitespace();
-    let method = parts
-        .next()
-        .ok_or_else(|| DockerPullError::BadResponse("missing HTTP method".into()))?
-        .to_string();
-    let path = parts
-        .next()
-        .ok_or_else(|| DockerPullError::BadResponse("missing HTTP path".into()))?
-        .to_string();
-    let mut range = None;
-    for line in lines {
-        let Some((name, value)) = line.split_once(':') else {
-            continue;
-        };
-        if name.eq_ignore_ascii_case(RANGE.as_str()) {
-            range = Some(value.trim().to_string());
-        }
-    }
-    Ok(Request {
-        method,
-        path,
-        range,
-    })
 }
 
 async fn route_request(request: &Request, state: Arc<ServeState>) -> RegistryResponse {
@@ -215,32 +173,13 @@ async fn manifest_response(
         Err(error) => return RegistryResponse::text(400, "Bad Request", error.to_string()),
     };
 
-    let normalized = decoded.normalized();
-    if let Ok(Some(record)) = state.store.load_reference(&normalized).await {
-        return serve_manifest_blob(&state, &record.manifest, request.method == "HEAD").await;
-    }
-
-    if let Ok(path) = state.store.blob_path(reference)
-        && path.exists()
-    {
-        let descriptor = match manifest_descriptor_from_blob(&state.store, reference).await {
-            Ok(descriptor) => descriptor,
-            Err(error) => {
-                return RegistryResponse::text(500, "Internal Server Error", error.to_string());
-            }
-        };
-        return serve_manifest_blob(&state, &descriptor, request.method == "HEAD").await;
-    }
-
-    if !state.pull_missing {
-        return RegistryResponse::empty(404, "Not Found");
-    }
-
-    match fetch_manifest(&state, &decoded, reference).await {
-        Ok(descriptor) => serve_manifest_blob(&state, &descriptor, request.method == "HEAD").await,
-        Err(DockerPullError::ManifestNotFound) => RegistryResponse::empty(404, "Not Found"),
-        Err(error) => RegistryResponse::text(502, "Bad Gateway", error.to_string()),
-    }
+    cached_or_fetched(
+        cached_manifest_response(&state, &decoded, reference, request.method == "HEAD").await,
+        state.pull_missing,
+        || fetch_manifest_response(&state, &decoded, reference, request.method == "HEAD"),
+        |error| matches!(error, DockerPullError::ManifestNotFound),
+    )
+    .await
 }
 
 async fn blob_response(
@@ -254,40 +193,119 @@ async fn blob_response(
         Err(error) => return RegistryResponse::text(400, "Bad Request", error.to_string()),
     };
 
-    if let Ok((path, size)) = blob_path_and_size(&state.store, digest).await {
-        return RegistryResponse::file(
-            200,
-            "OK",
-            OCTET_STREAM_MEDIA_TYPE.to_string(),
-            path,
-            size,
-            request.method == "HEAD",
-        )
-        .with_digest(digest)
-        .with_range(request.range.as_deref());
+    cached_or_fetched(
+        cached_blob_response(&state, digest, request).await,
+        state.pull_missing,
+        || fetch_blob_response(&state, &decoded, digest, request),
+        |error| matches!(error, DockerPullError::BlobNotFound(_)),
+    )
+    .await
+}
+
+async fn cached_or_fetched<F, Fut, IsNotFound>(
+    cached: Result<Option<RegistryResponse>>,
+    pull_missing: bool,
+    fetch: F,
+    is_not_found: IsNotFound,
+) -> RegistryResponse
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<RegistryResponse>>,
+    IsNotFound: Fn(&DockerPullError) -> bool,
+{
+    match cached {
+        Ok(Some(response)) => return response,
+        Ok(None) => {}
+        Err(error) => {
+            return RegistryResponse::text(500, "Internal Server Error", error.to_string());
+        }
     }
 
-    if !state.pull_missing {
+    if !pull_missing {
         return RegistryResponse::empty(404, "Not Found");
     }
 
-    match fetch_blob(&state, &decoded, digest).await {
-        Ok(()) => match blob_path_and_size(&state.store, digest).await {
-            Ok((path, size)) => RegistryResponse::file(
-                200,
-                "OK",
-                OCTET_STREAM_MEDIA_TYPE.to_string(),
-                path,
-                size,
-                request.method == "HEAD",
-            )
-            .with_digest(digest)
-            .with_range(request.range.as_deref()),
-            Err(error) => RegistryResponse::text(500, "Internal Server Error", error.to_string()),
-        },
-        Err(DockerPullError::BlobNotFound(_)) => RegistryResponse::empty(404, "Not Found"),
+    match fetch().await {
+        Ok(response) => response,
+        Err(error) if is_not_found(&error) => RegistryResponse::empty(404, "Not Found"),
         Err(error) => RegistryResponse::text(502, "Bad Gateway", error.to_string()),
     }
+}
+
+async fn cached_manifest_response(
+    state: &ServeState,
+    reference: &ImageReference,
+    requested_reference: &str,
+    headers_only: bool,
+) -> Result<Option<RegistryResponse>> {
+    let normalized = reference.normalized();
+    if let Some(record) = state.store.load_reference(&normalized).await? {
+        return Ok(Some(
+            serve_manifest_blob(state, &record.manifest, headers_only).await,
+        ));
+    }
+
+    let Ok(path) = state.store.blob_path(requested_reference) else {
+        return Ok(None);
+    };
+    if path.exists() {
+        let descriptor = manifest_descriptor_from_blob(&state.store, requested_reference).await?;
+        return Ok(Some(
+            serve_manifest_blob(state, &descriptor, headers_only).await,
+        ));
+    }
+
+    Ok(None)
+}
+
+async fn fetch_manifest_response(
+    state: &ServeState,
+    reference: &ImageReference,
+    requested_reference: &str,
+    headers_only: bool,
+) -> Result<RegistryResponse> {
+    let descriptor = fetch_manifest(state, reference, requested_reference).await?;
+    Ok(serve_manifest_blob(state, &descriptor, headers_only).await)
+}
+
+async fn cached_blob_response(
+    state: &ServeState,
+    digest: &str,
+    request: &Request,
+) -> Result<Option<RegistryResponse>> {
+    let Ok((path, size)) = blob_path_and_size(&state.store, digest).await else {
+        return Ok(None);
+    };
+    Ok(Some(blob_file_response(path, size, digest, request)))
+}
+
+async fn fetch_blob_response(
+    state: &ServeState,
+    reference: &ImageReference,
+    digest: &str,
+    request: &Request,
+) -> Result<RegistryResponse> {
+    fetch_blob(state, reference, digest).await?;
+    let (path, size) = blob_path_and_size(&state.store, digest).await?;
+    Ok(blob_file_response(path, size, digest, request))
+}
+
+fn blob_file_response(
+    path: PathBuf,
+    size: u64,
+    digest: &str,
+    request: &Request,
+) -> RegistryResponse {
+    RegistryResponse::file(
+        200,
+        "OK",
+        OCTET_STREAM_MEDIA_TYPE.to_string(),
+        path,
+        size,
+        request.method == "HEAD",
+    )
+    .with_digest(digest)
+    .with_range(request.range.as_deref())
 }
 
 async fn fetch_manifest(
@@ -315,7 +333,9 @@ async fn fetch_manifest(
         .save_reference(&StoredReference {
             reference: reference.normalized(),
             manifest: raw.descriptor.clone(),
-            config_digest: manifest_config_digest(&raw.bytes).unwrap_or_default(),
+            config_digest: manifest_summary(&raw.bytes)
+                .config_digest
+                .unwrap_or_default(),
         })
         .await?;
     Ok(raw.descriptor)
@@ -344,16 +364,7 @@ async fn fetch_blob(state: &ServeState, reference: &ImageReference, digest: &str
         platform: None,
         annotations: None,
     };
-    let context = PullContext {
-        store: Arc::clone(&state.store),
-        registry: Arc::clone(&state.registry),
-        stop: Arc::new(AtomicBool::new(false)),
-        ui: Arc::new(Ui::new(state.quiet, false)),
-        blob_retry_limit: state.blob_retry_limit,
-        blob_locks: Arc::clone(&state.blob_locks),
-        daemon_layer_cache: None,
-    };
-    download::download_blob(&context, reference, descriptor).await
+    download::download_blob(&state.pull_context, reference, descriptor).await
 }
 
 async fn serve_manifest_blob(
@@ -403,14 +414,7 @@ fn is_supported_digest_reference(reference: &str) -> bool {
 }
 
 fn split_route<'a>(path: &'a str, separator: &str) -> Option<(&'a str, &'a str)> {
-    path.split_once(separator)
-}
-
-fn looks_like_http_request(bytes: &[u8]) -> bool {
-    const METHODS: [&[u8]; 3] = [b"GET", b"HEAD", b"POST"];
-    METHODS
-        .iter()
-        .any(|method| method.starts_with(bytes) || bytes.starts_with(method))
+    path.rsplit_once(separator)
 }
 
 async fn blob_path_and_size(store: &Store, digest: &str) -> Result<(PathBuf, u64)> {
@@ -428,8 +432,9 @@ async fn blob_path_and_size(store: &Store, digest: &str) -> Result<(PathBuf, u64
 async fn manifest_descriptor_from_blob(store: &Store, digest: &str) -> Result<Descriptor> {
     let path = store.blob_path(digest)?;
     let bytes = tokio::fs::read(&path).await?;
+    let summary = manifest_summary(&bytes);
     Ok(Descriptor {
-        media_type: manifest_media_type(&bytes).unwrap_or_default(),
+        media_type: summary.media_type.unwrap_or_default(),
         digest: digest.to_string(),
         size: bytes.len() as i64,
         platform: Some(Platform::host()),
@@ -437,21 +442,27 @@ async fn manifest_descriptor_from_blob(store: &Store, digest: &str) -> Result<De
     })
 }
 
-fn manifest_media_type(bytes: &[u8]) -> Option<String> {
-    serde_json::from_slice::<serde_json::Value>(bytes)
-        .ok()?
-        .get("mediaType")?
-        .as_str()
-        .map(ToString::to_string)
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ManifestSummary {
+    media_type: Option<String>,
+    config_digest: Option<String>,
 }
 
-fn manifest_config_digest(bytes: &[u8]) -> Option<String> {
-    serde_json::from_slice::<serde_json::Value>(bytes)
-        .ok()?
-        .get("config")?
-        .get("digest")?
-        .as_str()
-        .map(ToString::to_string)
+fn manifest_summary(bytes: &[u8]) -> ManifestSummary {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+        return ManifestSummary::default();
+    };
+    ManifestSummary {
+        media_type: value
+            .get("mediaType")
+            .and_then(|value| value.as_str())
+            .map(ToString::to_string),
+        config_digest: value
+            .get("config")
+            .and_then(|value| value.get("digest"))
+            .and_then(|value| value.as_str())
+            .map(ToString::to_string),
+    }
 }
 
 #[cfg(test)]
@@ -465,7 +476,10 @@ mod tests {
     use tokio::net::TcpListener;
     use tokio::sync::Semaphore;
 
-    use super::{ServeState, is_supported_digest_reference, run_server};
+    use super::{
+        ManifestSummary, ServeState, is_supported_digest_reference, manifest_summary, run_server,
+        split_route,
+    };
     use crate::auth::AuthResolver;
     use crate::platform::Platform;
     use crate::pull::{BlobDownloadLocks, PullContext, PullOptions, Puller};
@@ -639,6 +653,36 @@ mod tests {
             "a".repeat(56)
         )));
         assert!(!is_supported_digest_reference("sha512:"));
+    }
+
+    #[test]
+    fn split_route_uses_last_route_separator() {
+        let (repository, reference) = split_route(
+            "registry.test/team/manifests/app/manifests/latest",
+            "/manifests/",
+        )
+        .expect("route should split");
+
+        assert_eq!(repository, "registry.test/team/manifests/app");
+        assert_eq!(reference, "latest");
+    }
+
+    #[test]
+    fn manifest_summary_reads_media_type_and_config_digest() {
+        let summary = manifest_summary(
+            br#"{"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}"#,
+        );
+
+        assert_eq!(
+            summary,
+            ManifestSummary {
+                media_type: Some("application/vnd.oci.image.manifest.v1+json".into()),
+                config_digest: Some(
+                    "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                        .into()
+                ),
+            }
+        );
     }
 
     #[tokio::test]
@@ -843,13 +887,19 @@ mod tests {
             Some(0),
         ));
         let state = Arc::new(ServeState {
-            store,
-            registry,
+            store: Arc::clone(&store),
+            registry: Arc::clone(&registry),
             pull_missing,
-            blob_retry_limit: Some(1),
-            quiet: true,
             downloads: Arc::new(Semaphore::new(1)),
-            blob_locks: Arc::new(BlobDownloadLocks::default()),
+            pull_context: Arc::new(PullContext {
+                store,
+                registry,
+                stop: Arc::new(AtomicBool::new(false)),
+                ui: Arc::new(Ui::new(true, false)),
+                blob_retry_limit: Some(1),
+                blob_locks: Arc::new(BlobDownloadLocks::default()),
+                daemon_layer_cache: None,
+            }),
         });
         tokio::spawn(async move {
             let _ = run_server(listener, state, None).await;
