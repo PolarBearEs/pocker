@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::IsTerminal;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anstyle::{AnsiColor, Style};
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
@@ -14,6 +14,8 @@ pub(crate) const GREEN: Style = AnsiColor::Green.on_default();
 pub(crate) const YELLOW: Style = AnsiColor::Yellow.on_default();
 pub(crate) const CYAN: Style = AnsiColor::Cyan.on_default();
 pub(crate) const DIM: Style = Style::new().dimmed();
+
+const AGGREGATE_RENDER_INTERVAL: Duration = Duration::from_millis(50);
 
 pub(crate) fn paint(value: &str, style: Style) -> String {
     if should_color_stderr() {
@@ -64,6 +66,8 @@ struct ProgressUiInner {
 struct AggregateProgress {
     order: Vec<String>,
     layers: HashMap<String, AggregateLayer>,
+    last_rendered: Option<AggregateRender>,
+    last_rendered_at: Option<Instant>,
 }
 
 #[derive(Default)]
@@ -73,10 +77,28 @@ struct AggregateLayer {
     complete: bool,
 }
 
+#[derive(Clone, PartialEq, Eq)]
+struct AggregateRender {
+    strip: String,
+    total_bytes: u64,
+    position: u64,
+    hide_bytes: bool,
+    status: String,
+}
+
 impl AggregateProgress {
     fn clear(&mut self) {
         self.order.clear();
         self.layers.clear();
+        self.last_rendered = None;
+        self.last_rendered_at = None;
+    }
+
+    fn touch_layer(&mut self, digest: &str) -> &mut AggregateLayer {
+        if !self.layers.contains_key(digest) {
+            self.order.push(digest.to_string());
+        }
+        self.layers.entry(digest.to_string()).or_default()
     }
 }
 
@@ -115,51 +137,55 @@ impl Ui {
     }
 
     pub fn begin_image(&self, image: &str) {
-        if let Some(inner) = self.progress() {
-            inner.reset_for_image();
-            *inner.image_name.lock().expect("ui state poisoned") = image.to_string();
-            if inner.aggregate_layers {
-                inner.image.set_style(compose_image_style());
-            }
-            inner.image.set_message(format!("{image} Pulling"));
-        } else if self.is_plain() {
-            self.plain_line(format!("image {image}: Pulling"));
-        }
+        self.dispatch_mode(
+            |inner| {
+                inner.reset_for_image();
+                *inner.image_name.lock().expect("ui state poisoned") = image.to_string();
+                if inner.aggregate_layers {
+                    inner.image.set_style(compose_image_style());
+                }
+                inner.image.set_message(format!("{image} Pulling"));
+            },
+            || self.plain_line(format!("image {image}: Pulling")),
+        );
     }
 
     pub fn begin_load(&self, image: &str) {
-        if let Some(inner) = self.progress() {
-            if inner.aggregate_layers {
-                inner.image.set_style(image_status_style(false));
-            }
-            inner.image.set_message(format!("{image} Loading"));
-        } else if self.is_plain() {
-            self.plain_line(format!("image {image}: Loading"));
-        }
+        self.dispatch_mode(
+            |inner| {
+                if inner.aggregate_layers {
+                    inner.image.set_style(image_status_style(false));
+                }
+                inner.image.set_message(format!("{image} Loading"));
+            },
+            || self.plain_line(format!("image {image}: Loading")),
+        );
     }
 
     pub fn set_image_status(&self, image: &str, status: &str) {
-        if let Some(inner) = self.progress() {
-            if inner.aggregate_layers {
-                inner.image.set_style(image_status_style(false));
-            }
-            inner.image.set_message(format!("{image} {status}"));
-        } else if self.is_plain() {
-            self.plain_line(format!("image {image}: {status}"));
-        }
+        self.dispatch_mode(
+            |inner| {
+                if inner.aggregate_layers {
+                    inner.image.set_style(image_status_style(false));
+                }
+                inner.image.set_message(format!("{image} {status}"));
+            },
+            || self.plain_line(format!("image {image}: {status}")),
+        );
     }
 
     pub fn finish_image(&self, image: &str, status: &str) {
-        if let Some(inner) = self.progress() {
-            inner.clear_layers();
-            inner.image.disable_steady_tick();
-            if inner.aggregate_layers {
-                inner.image.set_style(image_status_style(false));
-            }
-            inner.image.finish_with_message(format!("{image} {status}"));
-        } else if self.is_plain() {
-            self.plain_line(format!("image {image}: {status}"));
-        }
+        self.dispatch_mode(
+            |inner| {
+                inner.clear_layers();
+                inner.image.disable_steady_tick();
+                if inner.aggregate_layers {
+                    inner.image.set_style(image_status_style(false));
+                }
+                inner.image.finish_with_message(format!("{image} {status}"));
+            },
+            || self.plain_line(format!("image {image}: {status}")),
+        );
     }
 
     pub fn prepare_layers(&self, digests: &[String]) {
@@ -200,37 +226,41 @@ impl Ui {
     }
 
     pub fn start_layer_download(&self, digest: &str, total_bytes: u64, starting_offset: u64) {
-        if let Some(inner) = self.progress()
-            && inner.aggregate_layers
-        {
-            inner.start_aggregate_layer(digest, total_bytes, starting_offset);
-        }
-        let Some(bar) = self.layer_bar(digest) else {
-            if self.is_plain() {
+        self.dispatch_mode(
+            |inner| {
+                if inner.aggregate_layers {
+                    inner.start_aggregate_layer(digest, total_bytes, starting_offset);
+                }
+                let Some(bar) = inner.layer_bar(digest) else {
+                    return;
+                };
+                bar.set_style(layer_download_style());
+                bar.set_length(total_bytes);
+                bar.set_position(starting_offset);
+                bar.set_message(short_digest(digest));
+            },
+            || {
                 self.plain_line(plain_layer_download_message(
                     digest,
                     total_bytes,
                     starting_offset,
                 ));
-            }
-            return;
-        };
-        bar.set_style(layer_download_style());
-        bar.set_length(total_bytes);
-        bar.set_position(starting_offset);
-        bar.set_message(short_digest(digest));
+            },
+        );
     }
 
     pub fn advance_layer_download(&self, digest: &str, amount: u64) {
-        if let Some(inner) = self.progress()
-            && inner.aggregate_layers
-        {
-            inner.advance_aggregate_layer(digest, amount);
-        }
-        let Some(bar) = self.layer_bar(digest) else {
-            return;
-        };
-        bar.inc(amount);
+        self.dispatch_mode(
+            |inner| {
+                if inner.aggregate_layers {
+                    inner.advance_aggregate_layer(digest, amount);
+                }
+                if let Some(bar) = inner.layer_bar(digest) {
+                    bar.inc(amount);
+                }
+            },
+            || {},
+        );
     }
 
     pub fn finish_layer_download(&self, digest: &str) {
@@ -238,55 +268,49 @@ impl Ui {
     }
 
     pub fn set_layer_status(&self, digest: &str, status: &str) {
-        let Some(bar) = self.layer_bar(digest) else {
-            if self.is_plain() {
+        self.dispatch_mode(
+            |inner| {
+                let Some(bar) = inner.layer_bar(digest) else {
+                    return;
+                };
+                bar.set_style(layer_status_style(inner.animated));
+                if inner.animated {
+                    bar.enable_steady_tick(Duration::from_millis(120));
+                }
+                bar.set_message(format!("{} {status}", short_digest(digest)));
+            },
+            || {
                 self.plain_line(format!("layer {}: {status}", short_digest(digest)));
-            }
-            return;
-        };
-        bar.set_style(layer_status_style(self.is_animated()));
-        if self.is_animated() {
-            bar.enable_steady_tick(Duration::from_millis(120));
-        }
-        bar.set_message(format!("{} {status}", short_digest(digest)));
+            },
+        );
     }
 
     pub fn warn(&self, message: impl Into<String>) {
         let message = format!("warning: {}", message.into());
-        if let Some(inner) = self.progress() {
-            inner.image.println(message);
-        } else if self.is_plain() {
-            self.plain_line(message);
+        match &self.mode {
+            UiMode::Progress(inner) => inner.image.println(message),
+            UiMode::Plain { .. } => self.plain_line(message),
+            UiMode::Quiet => {}
         }
     }
 
     fn finish_layer_status(&self, digest: &str, progress_status: &str, plain_status: &str) {
-        if let Some(inner) = self.progress()
-            && inner.aggregate_layers
-        {
-            inner.finish_aggregate_layer(digest);
-        }
-        let Some(bar) = self.layer_bar(digest) else {
-            if self.is_plain() {
+        self.dispatch_mode(
+            |inner| {
+                if inner.aggregate_layers {
+                    inner.finish_aggregate_layer(digest);
+                }
+                let Some(bar) = inner.layer_bar(digest) else {
+                    return;
+                };
+                bar.set_style(layer_status_style(inner.animated));
+                bar.disable_steady_tick();
+                bar.finish_with_message(format!("{} {progress_status}", short_digest(digest)));
+            },
+            || {
                 self.plain_line(format!("layer {}: {plain_status}", short_digest(digest)));
-            }
-            return;
-        };
-        bar.set_style(layer_status_style(self.is_animated()));
-        bar.disable_steady_tick();
-        bar.finish_with_message(format!("{} {progress_status}", short_digest(digest)));
-    }
-
-    fn layer_bar(&self, digest: &str) -> Option<ProgressBar> {
-        let UiMode::Progress(inner) = &self.mode else {
-            return None;
-        };
-        inner
-            .layers
-            .lock()
-            .expect("ui state poisoned")
-            .get(digest)
-            .cloned()
+            },
+        );
     }
 
     fn progress(&self) -> Option<&Arc<ProgressUiInner>> {
@@ -296,12 +320,12 @@ impl Ui {
         }
     }
 
-    fn is_animated(&self) -> bool {
-        self.progress().map(|inner| inner.animated).unwrap_or(false)
-    }
-
-    fn is_plain(&self) -> bool {
-        matches!(self.mode, UiMode::Plain { .. })
+    fn dispatch_mode(&self, progress: impl FnOnce(&Arc<ProgressUiInner>), plain: impl FnOnce()) {
+        match &self.mode {
+            UiMode::Progress(inner) => progress(inner),
+            UiMode::Plain { .. } => plain(),
+            UiMode::Quiet => {}
+        }
     }
 
     fn plain_line(&self, message: impl AsRef<str>) {
@@ -370,6 +394,14 @@ impl UiGroup {
 }
 
 impl ProgressUiInner {
+    fn layer_bar(&self, digest: &str) -> Option<ProgressBar> {
+        self.layers
+            .lock()
+            .expect("ui state poisoned")
+            .get(digest)
+            .cloned()
+    }
+
     fn reset_for_image(&self) {
         self.image.reset();
         self.image.set_style(image_status_style(self.animated));
@@ -404,10 +436,7 @@ impl ProgressUiInner {
 
     fn start_aggregate_layer(&self, digest: &str, total_bytes: u64, starting_offset: u64) {
         let mut aggregate = self.aggregate.lock().expect("ui state poisoned");
-        if !aggregate.layers.contains_key(digest) {
-            aggregate.order.push(digest.to_string());
-        }
-        let layer = aggregate.layers.entry(digest.to_string()).or_default();
+        let layer = aggregate.touch_layer(digest);
         layer.total = total_bytes;
         layer.position = starting_offset.min(total_bytes);
         layer.complete = layer.position >= total_bytes && total_bytes > 0;
@@ -417,22 +446,16 @@ impl ProgressUiInner {
 
     fn advance_aggregate_layer(&self, digest: &str, amount: u64) {
         let mut aggregate = self.aggregate.lock().expect("ui state poisoned");
-        if !aggregate.layers.contains_key(digest) {
-            aggregate.order.push(digest.to_string());
-        }
-        let layer = aggregate.layers.entry(digest.to_string()).or_default();
+        let layer = aggregate.touch_layer(digest);
         layer.position = layer.position.saturating_add(amount).min(layer.total);
         layer.complete = layer.total > 0 && layer.position >= layer.total;
         drop(aggregate);
-        self.render_aggregate_progress("Pulling");
+        self.render_aggregate_progress_throttled("Pulling");
     }
 
     fn finish_aggregate_layer(&self, digest: &str) {
         let mut aggregate = self.aggregate.lock().expect("ui state poisoned");
-        if !aggregate.layers.contains_key(digest) {
-            aggregate.order.push(digest.to_string());
-        }
-        let layer = aggregate.layers.entry(digest.to_string()).or_default();
+        let layer = aggregate.touch_layer(digest);
         if layer.total > 0 {
             layer.position = layer.total;
         }
@@ -442,39 +465,74 @@ impl ProgressUiInner {
     }
 
     fn render_aggregate_progress(&self, status: &str) {
-        let aggregate = self.aggregate.lock().expect("ui state poisoned");
-        let mut strip = String::new();
-        let mut total_bytes = 0;
-        let mut position = 0;
-        let mut hide_bytes = false;
-        for digest in &aggregate.order {
-            let Some(layer) = aggregate.layers.get(digest) else {
-                continue;
-            };
-            total_bytes += layer.total;
-            position += layer.position;
-            if !layer.complete && layer.total == 0 {
-                hide_bytes = true;
+        self.render_aggregate_progress_with_throttle(status, true);
+    }
+
+    fn render_aggregate_progress_throttled(&self, status: &str) {
+        self.render_aggregate_progress_with_throttle(status, false);
+    }
+
+    fn render_aggregate_progress_with_throttle(&self, status: &str, force: bool) {
+        let mut aggregate = self.aggregate.lock().expect("ui state poisoned");
+        let render = aggregate_render(&aggregate, status);
+
+        if !force {
+            if aggregate
+                .last_rendered_at
+                .is_some_and(|last| last.elapsed() < AGGREGATE_RENDER_INTERVAL)
+            {
+                return;
             }
-            strip.push(layer_progress_char(layer));
+            if aggregate.last_rendered.as_ref() == Some(&render) {
+                return;
+            }
         }
+        aggregate.last_rendered = Some(render.clone());
+        aggregate.last_rendered_at = Some(Instant::now());
         drop(aggregate);
 
         self.image.set_style(compose_image_style());
         let image = self.image_name.lock().expect("ui state poisoned").clone();
-        let bytes = if total_bytes > 0 && !hide_bytes {
+        let bytes = if render.total_bytes > 0 && !render.hide_bytes {
             format!(
                 " {} / {}",
-                format_bytes(position.min(total_bytes)),
-                format_bytes(total_bytes)
+                format_bytes(render.position.min(render.total_bytes)),
+                format_bytes(render.total_bytes)
             )
         } else {
             String::new()
         };
         self.image.set_message(format!(
-            "{image} [{}]{bytes} {status}",
-            paint(&strip, GREEN)
+            "{image} [{}]{bytes} {}",
+            paint(&render.strip, GREEN),
+            render.status
         ));
+    }
+}
+
+fn aggregate_render(aggregate: &AggregateProgress, status: &str) -> AggregateRender {
+    let mut strip = String::new();
+    let mut total_bytes = 0;
+    let mut position = 0;
+    let mut hide_bytes = false;
+    for digest in &aggregate.order {
+        let Some(layer) = aggregate.layers.get(digest) else {
+            continue;
+        };
+        total_bytes += layer.total;
+        position += layer.position;
+        if !layer.complete && layer.total == 0 {
+            hide_bytes = true;
+        }
+        strip.push(layer_progress_char(layer));
+    }
+
+    AggregateRender {
+        strip,
+        total_bytes,
+        position,
+        hide_bytes,
+        status: status.to_string(),
     }
 }
 
