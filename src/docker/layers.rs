@@ -4,13 +4,12 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
-use sha2::{Digest as _, Sha256};
 use tar::Archive;
 use tempfile::{NamedTempFile, TempDir};
 use tokio::sync::OnceCell;
 use tokio::task::JoinSet;
 
-use crate::digest::parse_digest;
+use crate::digest::{copy_reader_with_digest, parse_digest};
 use crate::error::{DockerPullError, Result};
 use crate::image::LayerSpec;
 use crate::store::Store;
@@ -320,19 +319,9 @@ fn copy_archive_entry_with_digest<R: Read>(
     expected_digest: &str,
 ) -> Result<()> {
     let mut file = File::create(path)?;
-    let mut hasher = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let read = reader.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        file.write_all(&buffer[..read])?;
-        hasher.update(&buffer[..read]);
-    }
+    let actual_digest = copy_reader_with_digest(expected_digest, reader, &mut file)?;
     file.flush()?;
     file.sync_data()?;
-    let actual_digest = format!("sha256:{}", hex::encode(hasher.finalize()));
     if actual_digest != expected_digest {
         return Err(DockerPullError::DigestMismatch {
             digest: expected_digest.to_string(),
