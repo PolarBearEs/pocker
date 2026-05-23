@@ -1,12 +1,15 @@
 use std::collections::HashMap;
-use std::io::Write;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::Arc;
+use std::time::Duration;
 
 use base64::Engine;
 use serde::Deserialize;
+use tokio::io::AsyncWriteExt;
+use tokio::process::Command;
 use tokio::sync::{Mutex, OnceCell};
+use tokio::time::timeout;
 use tracing::warn;
 
 use crate::error::{DockerPullError, Result};
@@ -19,6 +22,7 @@ const DOCKER_HUB_AUTH_KEYS: &[&str] = &[
     "index.docker.io",
     "docker.io",
 ];
+const CREDENTIAL_HELPER_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone)]
 pub enum Credentials {
@@ -83,26 +87,21 @@ impl AuthResolver {
         };
 
         let credentials = cell
-            .get_or_try_init(|| async move {
-                tokio::task::spawn_blocking(move || resolve_docker_config(&config, &registry))
-                    .await
-                    .map_err(|error| {
-                        DockerPullError::InvalidInput(format!(
-                            "auth resolver task panicked: {error}"
-                        ))
-                    })?
-            })
+            .get_or_try_init(|| async move { resolve_docker_config(&config, &registry).await })
             .await?;
         Ok(credentials.clone())
     }
 }
 
-fn resolve_docker_config(config: &DockerConfig, registry: &str) -> Result<Option<Credentials>> {
+async fn resolve_docker_config(
+    config: &DockerConfig,
+    registry: &str,
+) -> Result<Option<Credentials>> {
     let keys = registry_keys(registry);
 
     for key in &keys {
         if let Some(helper) = config.cred_helpers.get(*key)
-            && let Some(credentials) = invoke_helper(helper, key)?
+            && let Some(credentials) = invoke_helper(helper, key).await?
         {
             return Ok(Some(credentials));
         }
@@ -110,7 +109,7 @@ fn resolve_docker_config(config: &DockerConfig, registry: &str) -> Result<Option
 
     if let Some(helper) = &config.creds_store {
         for key in &keys {
-            if let Some(credentials) = invoke_helper(helper, key)? {
+            if let Some(credentials) = invoke_helper(helper, key).await? {
                 return Ok(Some(credentials));
             }
         }
@@ -182,22 +181,33 @@ fn docker_config_path() -> PathBuf {
         .join("config.json")
 }
 
-fn invoke_helper(helper: &str, registry: &str) -> Result<Option<Credentials>> {
+async fn invoke_helper(helper: &str, registry: &str) -> Result<Option<Credentials>> {
     let helper_binary = format!("docker-credential-{helper}");
     let mut command = Command::new(&helper_binary);
     command.arg("get");
-    invoke_helper_command(command, &helper_binary, registry)
+    invoke_helper_command(command, &helper_binary, registry).await
 }
 
-fn invoke_helper_command(
+async fn invoke_helper_command(
+    command: Command,
+    helper_binary: &str,
+    registry: &str,
+) -> Result<Option<Credentials>> {
+    invoke_helper_command_with_timeout(command, helper_binary, registry, CREDENTIAL_HELPER_TIMEOUT)
+        .await
+}
+
+async fn invoke_helper_command_with_timeout(
     mut command: Command,
     helper_binary: &str,
     registry: &str,
+    helper_timeout: Duration,
 ) -> Result<Option<Credentials>> {
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    command.kill_on_drop(true);
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -217,22 +227,30 @@ fn invoke_helper_command(
     };
 
     if let Some(mut stdin) = child.stdin.take()
-        && let Err(error) = stdin.write_all(registry.as_bytes())
+        && let Err(error) = stdin.write_all(registry.as_bytes()).await
     {
         drop(stdin);
-        let _ = child.wait();
+        let _ = child.kill().await;
+        let _ = child.wait().await;
         warn!(
             "failed to write registry to docker credential helper `{}` for `{}`: {}",
             helper_binary, registry, error
         );
         return Ok(None);
     }
-    let output = match child.wait_with_output() {
-        Ok(output) => output,
-        Err(error) => {
+    let output = match timeout(helper_timeout, child.wait_with_output()).await {
+        Ok(Ok(output)) => output,
+        Ok(Err(error)) => {
             warn!(
                 "failed to wait for docker credential helper `{}` for `{}`: {}",
                 helper_binary, registry, error
+            );
+            return Ok(None);
+        }
+        Err(_) => {
+            warn!(
+                "docker credential helper `{}` timed out for `{}` after {:?}",
+                helper_binary, registry, helper_timeout
             );
             return Ok(None);
         }
@@ -331,17 +349,19 @@ mod tests {
     use std::ffi::OsString;
     use std::fs;
     use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
-    #[cfg(unix)]
-    use std::process::Command;
     use std::sync::{Mutex, MutexGuard, OnceLock};
 
     use base64::Engine as _;
     use tempfile::tempdir;
-
     #[cfg(unix)]
-    use super::invoke_helper_command;
+    use tokio::process::Command;
+
     use super::{
         AuthResolver, Credentials, credentials_from_parts, load_docker_config, registry_keys,
+    };
+    #[cfg(unix)]
+    use super::{
+        CREDENTIAL_HELPER_TIMEOUT, invoke_helper_command, invoke_helper_command_with_timeout,
     };
     use crate::error::DockerPullError;
 
@@ -446,18 +466,41 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn failing_helper_falls_back_instead_of_aborting_auth_resolution() {
+    #[tokio::test]
+    async fn failing_helper_falls_back_instead_of_aborting_auth_resolution() {
         let mut command = Command::new("sh");
         command.arg("-c").arg("echo helper-broke >&2; exit 1");
 
         let result =
             invoke_helper_command(command, "docker-credential-test", "registry-1.docker.io")
+                .await
                 .expect("helper failure should fall back");
 
         assert!(
             result.is_none(),
             "failed helper should not return credentials"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn slow_helper_times_out() {
+        let mut command = Command::new("sh");
+        command.arg("-c").arg("sleep 5");
+
+        let result = invoke_helper_command_with_timeout(
+            command,
+            "docker-credential-test",
+            "registry-1.docker.io",
+            std::time::Duration::from_millis(10),
+        )
+        .await
+        .expect("helper timeout should fall back");
+
+        assert!(result.is_none(), "timed out helper should fall back");
+        assert_eq!(
+            CREDENTIAL_HELPER_TIMEOUT,
+            std::time::Duration::from_secs(30)
         );
     }
 

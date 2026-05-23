@@ -46,17 +46,17 @@ pub async fn download_blob(
     let mut retries = 0_u32;
 
     loop {
-        if context.stop.load(std::sync::atomic::Ordering::SeqCst) {
+        if context.stop.is_cancelled() {
             return Err(DockerPullError::Interrupted);
         }
         if progress.offset >= expected_size {
             break;
         }
 
-        let response = context
-            .registry
-            .get_blob(reference, &descriptor.digest, progress.offset)
-            .await?;
+        let response = tokio::select! {
+            result = context.registry.get_blob(reference, &descriptor.digest, progress.offset) => result?,
+            _ = context.stop.cancelled() => return Err(DockerPullError::Interrupted),
+        };
         let status = response.status();
         if status == StatusCode::OK && progress.offset > 0 {
             let delay = jittered_backoff_delay(retries);
@@ -79,7 +79,7 @@ pub async fn download_blob(
                 &mut progress,
             )
             .await?;
-            tokio::time::sleep(delay).await;
+            sleep_or_interrupt(context, delay).await?;
             continue;
         }
         if status == StatusCode::RANGE_NOT_SATISFIABLE {
@@ -96,7 +96,7 @@ pub async fn download_blob(
                 .reset_partial(&descriptor.digest, expected_size)
                 .await?;
             progress.reset(context, &descriptor.digest, expected_size);
-            tokio::time::sleep(delay).await;
+            sleep_or_interrupt(context, delay).await?;
             continue;
         }
         validate_blob_response_status(
@@ -116,7 +116,14 @@ pub async fn download_blob(
         let mut stream = response.bytes_stream();
         let mut stream_failed = false;
 
-        while let Some(chunk) = stream.next().await {
+        loop {
+            let chunk = tokio::select! {
+                chunk = stream.next() => chunk,
+                _ = context.stop.cancelled() => return Err(DockerPullError::Interrupted),
+            };
+            let Some(chunk) = chunk else {
+                break;
+            };
             match chunk {
                 Ok(chunk) => {
                     file.write_all(&chunk).await?;
@@ -148,7 +155,7 @@ pub async fn download_blob(
                         .store
                         .checkpoint_download(&descriptor.digest, progress.offset, expected_size)
                         .await?;
-                    tokio::time::sleep(delay).await;
+                    sleep_or_interrupt(context, delay).await?;
                     stream_failed = true;
                     break;
                 }
@@ -171,7 +178,7 @@ pub async fn download_blob(
                 "stream ended early for {} at byte {} of {}",
                 descriptor.digest, progress.offset, expected_size
             );
-            tokio::time::sleep(delay).await;
+            sleep_or_interrupt(context, delay).await?;
         }
     }
 
@@ -188,6 +195,13 @@ pub async fn download_blob(
     }
     context.ui.finish_layer_download(&descriptor.digest);
     Ok(())
+}
+
+async fn sleep_or_interrupt(context: &PullContext, delay: Duration) -> Result<()> {
+    tokio::select! {
+        _ = tokio::time::sleep(delay) => Ok(()),
+        _ = context.stop.cancelled() => Err(DockerPullError::Interrupted),
+    }
 }
 
 struct DownloadProgress {

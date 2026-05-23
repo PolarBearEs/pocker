@@ -1,10 +1,15 @@
 use std::path::PathBuf;
+use std::time::Duration;
 
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::time::timeout;
 
-use crate::error::Result;
+use crate::error::{DockerPullError, Result};
 use crate::registry::OCTET_STREAM_MEDIA_TYPE;
+
+const RESPONSE_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+const RESPONSE_COPY_BUFFER_BYTES: usize = 64 * 1024;
 
 pub(super) enum RegistryBody {
     Empty,
@@ -137,24 +142,53 @@ pub(super) async fn write_response(
         ));
     }
     headers.push_str("\r\n");
-    stream.write_all(headers.as_bytes()).await?;
+    write_all_with_idle_timeout(stream, headers.as_bytes()).await?;
     match response.body {
         RegistryBody::Empty => {}
-        RegistryBody::Text(bytes) => stream.write_all(&bytes).await?,
+        RegistryBody::Text(bytes) => write_all_with_idle_timeout(stream, &bytes).await?,
         RegistryBody::File(path) => {
             let mut file = tokio::fs::File::open(path).await?;
             if let Some(range) = response.range {
                 file.seek(std::io::SeekFrom::Start(range.start)).await?;
                 let mut take = file.take(response.content_length);
-                tokio::io::copy(&mut take, stream).await?;
+                copy_with_idle_timeout(&mut take, stream).await?;
             } else {
-                tokio::io::copy(&mut file, stream).await?;
+                copy_with_idle_timeout(&mut file, stream).await?;
             }
         }
     }
-    stream.flush().await?;
-    stream.shutdown().await?;
+    timeout(RESPONSE_IDLE_TIMEOUT, stream.flush())
+        .await
+        .map_err(|_| DockerPullError::BadResponse("cache registry response stalled".into()))??;
+    timeout(RESPONSE_IDLE_TIMEOUT, stream.shutdown())
+        .await
+        .map_err(|_| DockerPullError::BadResponse("cache registry response stalled".into()))??;
     Ok(())
+}
+
+async fn write_all_with_idle_timeout(stream: &mut TcpStream, bytes: &[u8]) -> Result<()> {
+    timeout(RESPONSE_IDLE_TIMEOUT, stream.write_all(bytes))
+        .await
+        .map_err(|_| DockerPullError::BadResponse("cache registry response stalled".into()))??;
+    Ok(())
+}
+
+async fn copy_with_idle_timeout(
+    reader: &mut (impl AsyncRead + Unpin),
+    stream: &mut TcpStream,
+) -> Result<()> {
+    let mut buffer = vec![0_u8; RESPONSE_COPY_BUFFER_BYTES];
+    loop {
+        let read = timeout(RESPONSE_IDLE_TIMEOUT, reader.read(&mut buffer))
+            .await
+            .map_err(|_| {
+                DockerPullError::BadResponse("cache registry file read stalled".into())
+            })??;
+        if read == 0 {
+            return Ok(());
+        }
+        write_all_with_idle_timeout(stream, &buffer[..read]).await?;
+    }
 }
 
 fn safe_header_value(value: &str) -> Option<&str> {

@@ -1,10 +1,12 @@
 use reqwest::header::RANGE;
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
+use tokio::time::{Duration, timeout};
 
 use crate::error::{DockerPullError, Result};
 
 const MAX_REQUEST_HEAD_BYTES: usize = 64 * 1024;
+const REQUEST_HEAD_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Debug)]
 pub(super) struct Request {
@@ -14,6 +16,12 @@ pub(super) struct Request {
 }
 
 pub(super) async fn read_request(stream: &mut TcpStream) -> Result<Request> {
+    timeout(REQUEST_HEAD_TIMEOUT, read_request_inner(stream))
+        .await
+        .map_err(|_| DockerPullError::BadResponse("cache registry request timed out".into()))?
+}
+
+async fn read_request_inner(stream: &mut TcpStream) -> Result<Request> {
     let mut bytes = Vec::new();
     let mut buffer = [0_u8; 4096];
     loop {

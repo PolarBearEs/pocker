@@ -8,6 +8,7 @@ use tar::Archive;
 use tempfile::{NamedTempFile, TempDir};
 use tokio::sync::OnceCell;
 use tokio::task::{self, JoinSet};
+use tracing::warn;
 
 use crate::digest::{copy_reader_with_digest, parse_digest};
 use crate::error::{DockerPullError, Result};
@@ -115,11 +116,11 @@ async fn list_daemon_images(daemon: &DockerDaemon) -> Result<Vec<DaemonImage>> {
         let (index, image) = match result {
             Ok(Ok(result)) => result,
             Ok(Err(error)) => {
-                queue.abort_all();
+                abort_inspect_tasks(&mut queue).await;
                 return Err(error);
             }
             Err(error) => {
-                queue.abort_all();
+                abort_inspect_tasks(&mut queue).await;
                 return Err(DockerPullError::CommandFailed(format!(
                     "docker image inspect task failed: {error}"
                 )));
@@ -142,6 +143,17 @@ fn spawn_inspect_task(
     id: String,
 ) {
     queue.spawn(async move { Ok((index, daemon.inspect_daemon_image(&id).await?)) });
+}
+
+async fn abort_inspect_tasks(queue: &mut JoinSet<Result<(usize, Option<DaemonImage>)>>) {
+    queue.abort_all();
+    while let Some(result) = queue.join_next().await {
+        if let Err(error) = result
+            && !error.is_cancelled()
+        {
+            warn!("docker image inspect task failed while aborting: {error}");
+        }
+    }
 }
 
 pub(super) fn ordered_unique_image_ids(summaries: Vec<DaemonImageSummary>) -> Vec<String> {
