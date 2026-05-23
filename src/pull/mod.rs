@@ -202,7 +202,7 @@ impl Puller {
         for descriptor in downloads {
             while queue.len() >= options.concurrency {
                 if let Some(result) = queue.next().await {
-                    handle_download_result(result, &mut queue)?;
+                    handle_download_result(result, &mut queue).await?;
                 }
             }
             let context = self.context.clone();
@@ -213,7 +213,7 @@ impl Puller {
         }
 
         while let Some(result) = queue.next().await {
-            handle_download_result(result, &mut queue)?;
+            handle_download_result(result, &mut queue).await?;
         }
 
         self.context.store.save_reference(&stored_reference).await?;
@@ -228,18 +228,18 @@ impl Puller {
     }
 }
 
-fn handle_download_result(
+async fn handle_download_result(
     result: std::result::Result<Result<()>, tokio::task::JoinError>,
     queue: &mut FuturesUnordered<tokio::task::JoinHandle<Result<()>>>,
 ) -> Result<()> {
     match result {
         Ok(Ok(())) => Ok(()),
         Ok(Err(error)) => {
-            abort_downloads(queue);
+            abort_downloads(queue).await;
             Err(error)
         }
         Err(error) => {
-            abort_downloads(queue);
+            abort_downloads(queue).await;
             Err(DockerPullError::InvalidInput(format!(
                 "download worker failed: {error}"
             )))
@@ -247,11 +247,17 @@ fn handle_download_result(
     }
 }
 
-fn abort_downloads(queue: &mut FuturesUnordered<tokio::task::JoinHandle<Result<()>>>) {
+async fn abort_downloads(queue: &mut FuturesUnordered<tokio::task::JoinHandle<Result<()>>>) {
     for task in queue.iter() {
         task.abort();
     }
-    queue.clear();
+    while let Some(result) = queue.next().await {
+        if let Err(error) = result
+            && !error.is_cancelled()
+        {
+            warn!("download worker failed while aborting: {error}");
+        }
+    }
 }
 
 async fn load_blob_bytes(

@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use tokio::task::JoinSet;
+use tracing::warn;
 
 use crate::auth::{AuthResolver, read_credentials};
 use crate::cli::{ComposePullArgs, PullArgs, PullCommonArgs};
@@ -189,11 +190,11 @@ async fn pull_references_parallel(
         match result {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
-                queue.abort_all();
+                abort_pull_tasks(&mut queue).await;
                 return Err(error);
             }
             Err(error) => {
-                queue.abort_all();
+                abort_pull_tasks(&mut queue).await;
                 return Err(DockerPullError::CommandFailed(format!(
                     "pull task failed: {error}"
                 )));
@@ -210,6 +211,17 @@ async fn pull_references_parallel(
 
 fn spawn_pull_task(queue: &mut JoinSet<Result<()>>, state: SharedPullState, reference: String) {
     queue.spawn(async move { pull_reference_with_group(state, reference).await });
+}
+
+async fn abort_pull_tasks(queue: &mut JoinSet<Result<()>>) {
+    queue.abort_all();
+    while let Some(result) = queue.join_next().await {
+        if let Err(error) = result
+            && !error.is_cancelled()
+        {
+            warn!("pull task failed while aborting: {error}");
+        }
+    }
 }
 
 async fn pull_reference_with_group(state: SharedPullState, reference: String) -> Result<()> {
