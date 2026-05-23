@@ -8,7 +8,7 @@ use crate::auth::{AuthResolver, read_credentials};
 use crate::cli::{
     CacheCommands, Cli, Commands, ComposeCommands, ComposeConfigFormat, ImageCommands,
 };
-use crate::error::Result;
+use crate::error::{DockerPullError, Result};
 use crate::http::build_http_client;
 use crate::image_view::{format_size, print_image_inspect, print_image_list};
 use crate::pull::orchestrator::{PullRequestOptions, pull_references, retry_limit};
@@ -28,7 +28,7 @@ pub async fn run() -> Result<()> {
         }
         Commands::Compose(args) => match args.command {
             ComposeCommands::Config(config_args) => {
-                let resolved = compose::resolve_images(&args.file, &std::env::current_dir()?)?;
+                let resolved = resolve_compose_images(args.file).await?;
                 let resolved = compose::select_services(&resolved, &config_args.services)?;
                 print_compose_config(
                     &resolved,
@@ -39,7 +39,7 @@ pub async fn run() -> Result<()> {
                 )?;
             }
             ComposeCommands::Pull(pull_args) => {
-                let resolved = compose::resolve_images(&args.file, &std::env::current_dir()?)?;
+                let resolved = resolve_compose_images(args.file).await?;
                 let resolved = compose::select_services(&resolved, &pull_args.services)?;
                 if !(resolved.skipped_build_only.is_empty()
                     || cli.global.quiet
@@ -216,6 +216,16 @@ fn print_compose_pull_plan(resolved: &compose::ComposeImages, quiet: bool) {
 fn init_tracing() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
     let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
+}
+
+async fn resolve_compose_images(files: Vec<std::path::PathBuf>) -> Result<compose::ComposeImages> {
+    let working_dir = std::env::current_dir()?;
+    tokio::task::spawn_blocking(move || compose::resolve_images(&files, &working_dir))
+        .await
+        .map_err(|error| {
+            DockerPullError::InvalidInput(format!("compose resolver task panicked: {error}"))
+        })?
+        .map_err(Into::into)
 }
 
 async fn clean_cache(store: &Store, quiet: bool) -> Result<()> {
