@@ -310,12 +310,13 @@ where
 #[cfg(any(test, windows))]
 async fn write_chunked_body_to_file<R>(
     reader: &mut R,
-    mut buffer: Vec<u8>,
+    buffer: Vec<u8>,
     file: &mut tokio::fs::File,
 ) -> Result<()>
 where
     R: tokio::io::AsyncRead + Unpin,
 {
+    let mut buffer = ChunkReadBuffer::new(buffer);
     loop {
         let size = read_chunk_size(reader, &mut buffer).await?;
         if size == 0 {
@@ -328,17 +329,19 @@ where
 }
 
 #[cfg(any(test, windows))]
-async fn read_chunk_size<R>(reader: &mut R, buffer: &mut Vec<u8>) -> Result<usize>
+async fn read_chunk_size<R>(reader: &mut R, buffer: &mut ChunkReadBuffer) -> Result<usize>
 where
     R: tokio::io::AsyncRead + Unpin,
 {
     loop {
-        if let Some(line_end) = find_bytes(buffer, b"\r\n") {
-            let line = buffer.drain(..line_end + 2).collect::<Vec<_>>();
-            let size_line = std::str::from_utf8(&line[..line_end]).map_err(|error| {
-                DockerPullError::BadResponse(format!("invalid chunk size: {error}"))
-            })?;
-            return parse_chunk_size(size_line);
+        if let Some(line_end) = find_crlf(buffer.available(), 0) {
+            let size_line =
+                std::str::from_utf8(&buffer.available()[..line_end]).map_err(|error| {
+                    DockerPullError::BadResponse(format!("invalid chunk size: {error}"))
+                })?;
+            let size = parse_chunk_size(size_line)?;
+            buffer.consume(line_end + 2);
+            return Ok(size);
         }
         read_more(reader, buffer).await?;
     }
@@ -347,7 +350,7 @@ where
 #[cfg(any(test, windows))]
 async fn write_chunk_data<R>(
     reader: &mut R,
-    buffer: &mut Vec<u8>,
+    buffer: &mut ChunkReadBuffer,
     file: &mut tokio::fs::File,
     mut remaining: usize,
 ) -> Result<()>
@@ -355,37 +358,37 @@ where
     R: tokio::io::AsyncRead + Unpin,
 {
     while remaining > 0 {
-        if buffer.is_empty() {
+        if buffer.available().is_empty() {
             read_more(reader, buffer).await?;
         }
 
-        let count = remaining.min(buffer.len());
-        file.write_all(&buffer[..count]).await?;
-        buffer.drain(..count);
+        let count = remaining.min(buffer.available().len());
+        file.write_all(&buffer.available()[..count]).await?;
+        buffer.consume(count);
         remaining -= count;
     }
     Ok(())
 }
 
 #[cfg(any(test, windows))]
-async fn consume_chunk_crlf<R>(reader: &mut R, buffer: &mut Vec<u8>) -> Result<()>
+async fn consume_chunk_crlf<R>(reader: &mut R, buffer: &mut ChunkReadBuffer) -> Result<()>
 where
     R: tokio::io::AsyncRead + Unpin,
 {
-    while buffer.len() < 2 {
+    while buffer.available().len() < 2 {
         read_more(reader, buffer).await?;
     }
-    if &buffer[..2] != b"\r\n" {
+    if &buffer.available()[..2] != b"\r\n" {
         return Err(DockerPullError::BadResponse(
             "chunked docker API response is missing chunk terminator".into(),
         ));
     }
-    buffer.drain(..2);
+    buffer.consume(2);
     Ok(())
 }
 
 #[cfg(any(test, windows))]
-async fn read_more<R>(reader: &mut R, buffer: &mut Vec<u8>) -> Result<()>
+async fn read_more<R>(reader: &mut R, buffer: &mut ChunkReadBuffer) -> Result<()>
 where
     R: tokio::io::AsyncRead + Unpin,
 {
@@ -398,6 +401,38 @@ where
     }
     buffer.extend_from_slice(&chunk[..read]);
     Ok(())
+}
+
+#[cfg(any(test, windows))]
+struct ChunkReadBuffer {
+    bytes: Vec<u8>,
+    position: usize,
+}
+
+#[cfg(any(test, windows))]
+impl ChunkReadBuffer {
+    fn new(bytes: Vec<u8>) -> Self {
+        Self { bytes, position: 0 }
+    }
+
+    fn available(&self) -> &[u8] {
+        &self.bytes[self.position..]
+    }
+
+    fn consume(&mut self, count: usize) {
+        self.position += count;
+        if self.position == self.bytes.len() {
+            self.bytes.clear();
+            self.position = 0;
+        } else if self.position > 8192 && self.position * 2 > self.bytes.len() {
+            self.bytes.drain(..self.position);
+            self.position = 0;
+        }
+    }
+
+    fn extend_from_slice(&mut self, bytes: &[u8]) {
+        self.bytes.extend_from_slice(bytes);
+    }
 }
 
 #[cfg(any(test, windows))]
@@ -441,7 +476,7 @@ pub(crate) fn header_value<'a>(headers: &'a [(String, String)], name: &str) -> O
         .map(|(_, value)| value.as_str())
 }
 
-#[cfg(any(test, windows))]
+#[cfg(windows)]
 fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack
         .windows(needle.len())
@@ -453,20 +488,22 @@ pub(crate) fn decode_chunked_body(bytes: &[u8]) -> Result<Vec<u8>> {
     let mut decoded = Vec::new();
     let mut index = 0;
     loop {
-        let Some(line_end) = find_bytes(&bytes[index..], b"\r\n") else {
+        let Some(line_end) = find_crlf(bytes, index) else {
             return Err(DockerPullError::BadResponse(
                 "chunked docker API response is missing chunk size".into(),
             ));
         };
-        let size_line = std::str::from_utf8(&bytes[index..index + line_end]).map_err(|error| {
+        let size_line = std::str::from_utf8(&bytes[index..line_end]).map_err(|error| {
             DockerPullError::BadResponse(format!("invalid chunk size: {error}"))
         })?;
         let size = parse_chunk_size(size_line)?;
-        index += line_end + 2;
+        index = line_end + 2;
         if size == 0 {
             return Ok(decoded);
         }
-        let chunk_end = index + size;
+        let chunk_end = index.checked_add(size).ok_or_else(|| {
+            DockerPullError::BadResponse("chunked docker API response is too large".into())
+        })?;
         if bytes.len() < chunk_end + 2 || &bytes[chunk_end..chunk_end + 2] != b"\r\n" {
             return Err(DockerPullError::BadResponse(
                 "chunked docker API response is truncated".into(),
@@ -475,6 +512,18 @@ pub(crate) fn decode_chunked_body(bytes: &[u8]) -> Result<Vec<u8>> {
         decoded.extend_from_slice(&bytes[index..chunk_end]);
         index = chunk_end + 2;
     }
+}
+
+#[cfg(any(test, windows))]
+fn find_crlf(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut index = start;
+    while index + 1 < bytes.len() {
+        if bytes[index] == b'\r' && bytes[index + 1] == b'\n' {
+            return Some(index);
+        }
+        index += 1;
+    }
+    None
 }
 
 #[cfg(any(test, windows))]
