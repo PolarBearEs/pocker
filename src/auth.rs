@@ -1,8 +1,9 @@
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use base64::Engine;
 use serde::Deserialize;
@@ -19,6 +20,7 @@ const DOCKER_HUB_AUTH_KEYS: &[&str] = &[
     "index.docker.io",
     "docker.io",
 ];
+const CREDENTIAL_HELPER_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone)]
 pub enum Credentials {
@@ -227,8 +229,15 @@ fn invoke_helper_command(
         );
         return Ok(None);
     }
-    let output = match child.wait_with_output() {
-        Ok(output) => output,
+    let output = match wait_with_output_timeout(child, CREDENTIAL_HELPER_TIMEOUT) {
+        Ok(Some(output)) => output,
+        Ok(None) => {
+            warn!(
+                "docker credential helper `{}` timed out for `{}` after {:?}",
+                helper_binary, registry, CREDENTIAL_HELPER_TIMEOUT
+            );
+            return Ok(None);
+        }
         Err(error) => {
             warn!(
                 "failed to wait for docker credential helper `{}` for `{}`: {}",
@@ -274,6 +283,24 @@ fn invoke_helper_command(
         username: response.username,
         password: response.secret,
     }))
+}
+
+fn wait_with_output_timeout(
+    mut child: Child,
+    timeout: Duration,
+) -> std::io::Result<Option<Output>> {
+    let started = Instant::now();
+    loop {
+        if child.try_wait()?.is_some() {
+            return child.wait_with_output().map(Some);
+        }
+        if started.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(None);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 fn registry_keys(registry: &str) -> Vec<&str> {
@@ -338,11 +365,11 @@ mod tests {
     use base64::Engine as _;
     use tempfile::tempdir;
 
-    #[cfg(unix)]
-    use super::invoke_helper_command;
     use super::{
         AuthResolver, Credentials, credentials_from_parts, load_docker_config, registry_keys,
     };
+    #[cfg(unix)]
+    use super::{invoke_helper_command, wait_with_output_timeout};
     use crate::error::DockerPullError;
 
     #[test]
@@ -458,6 +485,22 @@ mod tests {
         assert!(
             result.is_none(),
             "failed helper should not return credentials"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn helper_wait_timeout_kills_process() {
+        let mut command = Command::new("sh");
+        command.arg("-c").arg("sleep 5");
+        let child = command.spawn().expect("sleep process should spawn");
+
+        let output = wait_with_output_timeout(child, std::time::Duration::from_millis(10))
+            .expect("timeout wait should not fail");
+
+        assert!(
+            output.is_none(),
+            "timed out helper should not return output"
         );
     }
 
