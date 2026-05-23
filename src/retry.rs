@@ -47,6 +47,10 @@ pub(crate) fn jittered_backoff_delay(attempt: u32) -> Duration {
     let max = exponential_delay(attempt);
     let min_ms = MIN_RETRY_DELAY.as_millis() as u64;
     let max_ms = max.as_millis() as u64;
+    debug_assert!(
+        max_ms >= min_ms,
+        "exponential_delay must never return less than MIN_RETRY_DELAY"
+    );
     let jitter_ms = fastrand::u64(min_ms..=max_ms);
     Duration::from_millis(jitter_ms)
 }

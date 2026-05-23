@@ -465,6 +465,9 @@ fn is_concurrent_blob_save_race(error: &DockerPullError) -> bool {
     matches!(
         error,
         DockerPullError::Io(error)
+            // Windows can report PermissionDenied when an atomic persist races
+            // with another writer. Callers still verify the final blob before
+            // treating this as success, so genuine permission failures surface.
             if matches!(error.kind(), ErrorKind::AlreadyExists | ErrorKind::PermissionDenied)
     )
 }
