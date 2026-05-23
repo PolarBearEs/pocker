@@ -85,10 +85,16 @@ async fn load_reference_through_cache_registry(
         TemporaryCacheRegistry::start(context.store.clone(), context.registry.clone(), reference)
             .await?;
     let synthetic = registry.synthetic_reference();
-    docker::pull_image(&synthetic).await?;
-    let tag_result = docker::tag_image(&synthetic, &reference.display_name()).await;
-    let _ = docker::remove_image_tag(&synthetic).await;
-    tag_result?;
+    let load_result = async {
+        docker::pull_image(&synthetic).await?;
+        let tag_result = docker::tag_image(&synthetic, &reference.display_name()).await;
+        let _ = docker::remove_image_tag(&synthetic).await;
+        tag_result
+    }
+    .await;
+    let shutdown_result = registry.shutdown().await;
+    load_result?;
+    shutdown_result?;
     Ok(())
 }
 
@@ -96,7 +102,7 @@ struct TemporaryCacheRegistry {
     address: String,
     repository: String,
     tag: String,
-    _task: JoinHandle<()>,
+    task: Option<JoinHandle<Result<()>>>,
     shutdown: Option<oneshot::Sender<()>>,
 }
 
@@ -119,7 +125,7 @@ impl TemporaryCacheRegistry {
         let repository = cache_repository(&reference.registry, &reference.repository);
         let (shutdown, shutdown_rx) = oneshot::channel();
         let task = tokio::spawn(async move {
-            let _ = serve_registry::serve_listener(
+            serve_registry::serve_listener(
                 listener,
                 ServeListenerConfig {
                     store,
@@ -131,20 +137,34 @@ impl TemporaryCacheRegistry {
                 },
                 Some(shutdown_rx),
             )
-            .await;
+            .await
         });
 
         Ok(Self {
             address,
             repository,
             tag,
-            _task: task,
+            task: Some(task),
             shutdown: Some(shutdown),
         })
     }
 
     fn synthetic_reference(&self) -> String {
         format!("{}/{}:{}", self.address, self.repository, self.tag)
+    }
+
+    async fn shutdown(mut self) -> Result<()> {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        if let Some(task) = self.task.take() {
+            task.await.map_err(|error| {
+                DockerPullError::CommandFailed(format!(
+                    "temporary cache registry task failed: {error}"
+                ))
+            })??;
+        }
+        Ok(())
     }
 }
 
