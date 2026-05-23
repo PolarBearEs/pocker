@@ -9,7 +9,7 @@ use crate::error::{DockerPullError, Result};
 use crate::export::oci_archive::{
     PreparedOciArchive, prepare_oci_archive, write_prepared_oci_archive_to_writer,
 };
-use crate::reference::{ImageReference, ReferenceTarget};
+use crate::reference::{ImageReference, ReferenceTarget, is_docker_hub};
 use crate::store::{Store, StoredReference};
 
 mod daemon;
@@ -56,7 +56,7 @@ pub async fn load_reference_archive_stream(
     store: &Store,
     reference: &StoredReference,
 ) -> Result<()> {
-    let daemon = DockerDaemon::connect()?;
+    let daemon = DockerDaemon::shared().await?;
     let prepared = prepare_oci_archive(store, reference).await?;
     let (reader, writer) = tokio::io::duplex(LOAD_ARCHIVE_STREAM_BUFFER_BYTES);
     let writer = SyncIoBridge::new(writer);
@@ -98,7 +98,7 @@ fn write_archive_to_stream(
 
 pub async fn daemon_has_reference(reference: &ImageReference, config_digest: &str) -> Result<bool> {
     let inspect_target = daemon_inspect_target(reference, config_digest);
-    let daemon = DockerDaemon::connect()?;
+    let daemon = DockerDaemon::shared().await?;
     let Some(image) = daemon.inspect_daemon_image(&inspect_target).await? else {
         return Ok(false);
     };
@@ -118,27 +118,36 @@ fn normalize_image_id(image_id: &str) -> &str {
 }
 
 pub async fn load_archive(path: &Path) -> Result<()> {
-    DockerDaemon::connect()?.load_archive(path).await
+    DockerDaemon::shared().await?.load_archive(path).await
 }
 
 pub async fn pull_image(reference: &str) -> Result<()> {
-    DockerDaemon::connect()?.pull_image(reference).await
+    DockerDaemon::shared().await?.pull_image(reference).await
 }
 
 pub async fn tag_image(source: &str, target: &str) -> Result<()> {
-    DockerDaemon::connect()?.tag_image(source, target).await
+    DockerDaemon::shared()
+        .await?
+        .tag_image(source, target)
+        .await
 }
 
 pub async fn remove_image_tag(reference: &str) -> Result<()> {
-    DockerDaemon::connect()?.remove_image_tag(reference).await
+    DockerDaemon::shared()
+        .await?
+        .remove_image_tag(reference)
+        .await
 }
 
 pub async fn inspect_image(reference: &str) -> Result<Option<Value>> {
-    DockerDaemon::connect()?.inspect_image_json(reference).await
+    DockerDaemon::shared()
+        .await?
+        .inspect_image_json(reference)
+        .await
 }
 
 pub async fn list_images() -> Result<Vec<ImageSummary>> {
-    let daemon = DockerDaemon::connect()?;
+    let daemon = DockerDaemon::shared().await?;
     let images = daemon.list_image_summaries().await?;
     Ok(images
         .into_iter()
@@ -152,7 +161,10 @@ pub async fn list_images() -> Result<Vec<ImageSummary>> {
 }
 
 pub async fn save_image(reference: &str, path: &Path) -> Result<()> {
-    DockerDaemon::connect()?.save_image(reference, path).await
+    DockerDaemon::shared()
+        .await?
+        .save_image(reference, path)
+        .await
 }
 
 fn encode_path_segment(value: &str) -> String {
@@ -163,22 +175,28 @@ fn encode_query_value(value: &str) -> String {
     utf8_percent_encode(value, QUERY_VALUE_ENCODE_SET).to_string()
 }
 
-fn split_tagged_reference(reference: &str) -> Result<(&str, &str)> {
-    if reference.contains('@') {
+fn split_tagged_reference(reference: &str) -> Result<(String, String)> {
+    let reference = ImageReference::parse(reference)?;
+    let ReferenceTarget::Tag(tag) = &reference.target else {
         return Err(DockerPullError::InvalidInput(format!(
-            "image reference `{reference}` is not a tagged reference"
+            "image reference `{}` is not a tagged reference",
+            reference.display_name()
         )));
+    };
+
+    Ok((tagged_repository_name(&reference), tag.clone()))
+}
+
+fn tagged_repository_name(reference: &ImageReference) -> String {
+    if is_docker_hub(&reference.registry) {
+        return reference
+            .repository
+            .strip_prefix("library/")
+            .unwrap_or(&reference.repository)
+            .to_string();
     }
-    let slash = reference.rfind('/');
-    let colon = reference.rfind(':').ok_or_else(|| {
-        DockerPullError::InvalidInput(format!("image reference `{reference}` is missing a tag"))
-    })?;
-    if slash.is_some_and(|slash| colon < slash) {
-        return Err(DockerPullError::InvalidInput(format!(
-            "image reference `{reference}` is missing a tag"
-        )));
-    }
-    Ok((&reference[..colon], &reference[colon + 1..]))
+
+    format!("{}/{}", reference.registry, reference.repository)
 }
 
 fn ensure_json_stream_success(body: String, action: &str) -> Result<()> {
@@ -213,10 +231,12 @@ mod tests {
     #[cfg(unix)]
     use std::path::Path;
 
+    use super::layers::ordered_unique_image_ids;
     use super::transport::windows::{decode_chunked_body, header_value, parse_response_head};
     use super::transport::{DEFAULT_DOCKER_HOST, DockerEndpoint, docker_endpoint_from_host};
-    use super::{daemon_inspect_target, encode_path_segment, encode_query_value};
-    use super::{layers::ordered_unique_image_ids, split_tagged_reference};
+    use super::{
+        daemon_inspect_target, encode_path_segment, encode_query_value, split_tagged_reference,
+    };
     use crate::reference::ImageReference;
 
     #[test]
@@ -271,7 +291,10 @@ mod tests {
         assert_eq!(
             split_tagged_reference("127.0.0.1:5000/pocker/image:latest")
                 .expect("reference should split"),
-            ("127.0.0.1:5000/pocker/image", "latest")
+            (
+                "127.0.0.1:5000/pocker/image".to_string(),
+                "latest".to_string()
+            )
         );
     }
 
@@ -362,5 +385,22 @@ mod tests {
             encode_query_value("example.com/acme/app&name=value+tag:latest"),
             "example.com%2Facme%2Fapp%26name%3Dvalue%2Btag%3Alatest"
         );
+    }
+
+    #[test]
+    fn tagged_reference_parts_use_parsed_reference() {
+        let (repository, tag) = super::split_tagged_reference("docker.io/library/alpine:3.20")
+            .expect("tagged reference should parse");
+
+        assert_eq!(repository, "alpine");
+        assert_eq!(tag, "3.20");
+    }
+
+    #[test]
+    fn tagged_reference_parts_reject_digest_references() {
+        super::split_tagged_reference(
+            "ghcr.io/acme/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+        .expect_err("digest reference is not a tagged target");
     }
 }

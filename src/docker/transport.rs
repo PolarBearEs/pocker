@@ -201,14 +201,20 @@ pub(super) fn ensure_success_status(status: StatusCode, body: Vec<u8>, action: &
         return Ok(());
     }
 
-    let body = String::from_utf8_lossy(&body);
+    Err(build_failure_error(status, &body, action))
+}
+
+pub(super) fn build_failure_error(
+    status: StatusCode,
+    body: &[u8],
+    action: &str,
+) -> DockerPullError {
+    let body = String::from_utf8_lossy(body);
     let body = body.trim();
     let detail = if body.is_empty() {
         format!("status {status}")
     } else {
         format!("status {status}: {body}")
     };
-    Err(DockerPullError::CommandFailed(format!(
-        "{action} failed: {detail}"
-    )))
+    DockerPullError::CommandFailed(format!("{action} failed: {detail}"))
 }

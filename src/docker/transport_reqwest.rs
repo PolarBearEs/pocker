@@ -11,7 +11,7 @@ use tokio_util::io::ReaderStream;
 use crate::error::{DockerPullError, Result};
 use crate::http::{CONNECT_TIMEOUT, DEFAULT_READ_TIMEOUT, USER_AGENT};
 
-use super::DockerResponse;
+use super::{DockerResponse, build_failure_error};
 
 #[derive(Debug, Clone)]
 pub(in crate::docker) struct ReqwestTransport {
@@ -122,13 +122,5 @@ async fn ensure_success(response: Response, action: &str) -> Result<Response> {
 
     let status = response.status();
     let body = response.text().await.unwrap_or_default();
-    let body = body.trim();
-    let detail = if body.is_empty() {
-        format!("status {status}")
-    } else {
-        format!("status {status}: {body}")
-    };
-    Err(DockerPullError::CommandFailed(format!(
-        "{action} failed: {detail}"
-    )))
+    Err(build_failure_error(status, body.as_bytes(), action))
 }

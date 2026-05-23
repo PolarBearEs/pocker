@@ -1,5 +1,5 @@
 use std::fmt;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::Path;
 
 use sha2::{Sha256, Sha384, Sha512};
@@ -60,6 +60,22 @@ impl DigestAlgorithm {
                 .map(|digest| format!("{}:{digest}", self)),
         }
     }
+
+    fn copy_reader_with_digest(
+        self,
+        mut reader: impl Read,
+        mut writer: impl Write,
+    ) -> Result<String> {
+        let mut buffer = [0_u8; 64 * 1024];
+        match self {
+            Self::Sha256 => copy_and_hash_reader::<Sha256>(&mut reader, &mut writer, &mut buffer)
+                .map(|digest| format!("{}:{digest}", self)),
+            Self::Sha384 => copy_and_hash_reader::<Sha384>(&mut reader, &mut writer, &mut buffer)
+                .map(|digest| format!("{}:{digest}", self)),
+            Self::Sha512 => copy_and_hash_reader::<Sha512>(&mut reader, &mut writer, &mut buffer)
+                .map(|digest| format!("{}:{digest}", self)),
+        }
+    }
 }
 
 impl fmt::Display for DigestAlgorithm {
@@ -102,6 +118,16 @@ pub(crate) fn digest_file_for_digest(digest: &str, path: &Path) -> Result<String
     parse_digest(digest)?.algorithm.digest_reader(file)
 }
 
+pub(crate) fn copy_reader_with_digest(
+    digest: &str,
+    reader: impl Read,
+    writer: impl Write,
+) -> Result<String> {
+    parse_digest(digest)?
+        .algorithm
+        .copy_reader_with_digest(reader, writer)
+}
+
 pub(crate) fn canonical_digest_bytes(bytes: &[u8]) -> String {
     format!("sha256:{}", sha256_hex(bytes))
 }
@@ -128,9 +154,28 @@ fn hash_reader<D: sha2::Digest>(reader: &mut impl Read, buffer: &mut [u8]) -> Re
     Ok(hex::encode(hasher.finalize()))
 }
 
+fn copy_and_hash_reader<D: sha2::Digest>(
+    reader: &mut impl Read,
+    writer: &mut impl Write,
+    buffer: &mut [u8],
+) -> Result<String> {
+    let mut hasher = D::new();
+    loop {
+        let read = reader.read(buffer)?;
+        if read == 0 {
+            break;
+        }
+        writer.write_all(&buffer[..read])?;
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{DigestAlgorithm, digest_bytes_for_digest, digest_hex, parse_digest};
+    use super::{
+        DigestAlgorithm, copy_reader_with_digest, digest_bytes_for_digest, digest_hex, parse_digest,
+    };
     use crate::error::DockerPullError;
 
     #[test]
@@ -185,5 +230,18 @@ mod tests {
 
         assert_eq!(actual, DigestAlgorithm::Sha384.digest_bytes(bytes));
         assert!(actual.starts_with("sha384:"));
+    }
+
+    #[test]
+    fn copy_reader_with_digest_uses_requested_algorithm() {
+        let bytes = b"pocker";
+        let expected = DigestAlgorithm::Sha512.digest_bytes(bytes);
+        let mut output = Vec::new();
+
+        let actual = copy_reader_with_digest(&expected, &bytes[..], &mut output)
+            .expect("supported digest should hash while copying");
+
+        assert_eq!(actual, expected);
+        assert_eq!(output, bytes);
     }
 }
