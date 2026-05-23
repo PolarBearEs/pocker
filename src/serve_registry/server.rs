@@ -23,6 +23,8 @@ use crate::ui::Ui;
 
 use super::response::{RegistryResponse, write_response};
 
+const MAX_REQUEST_HEAD_BYTES: usize = 64 * 1024;
+
 pub struct ServeConfig {
     pub listen: SocketAddr,
     pub store: Arc<Store>,
@@ -128,48 +130,54 @@ async fn handle_connection(mut stream: TcpStream, state: Arc<ServeState>) -> Res
 async fn read_request(stream: &mut TcpStream) -> Result<Request> {
     let mut bytes = Vec::new();
     let mut buffer = [0_u8; 4096];
-    loop {
+    let header_end = loop {
+        let scan_from = bytes.len().saturating_sub(3);
         let read = stream.read(&mut buffer).await?;
         if read == 0 {
-            break;
-        }
-        bytes.extend_from_slice(&buffer[..read]);
-        if !looks_like_http_request(&bytes) {
             return Err(DockerPullError::BadResponse(
-                "cache registry received non-HTTP request".into(),
+                "cache registry request ended before headers".into(),
             ));
         }
-        if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
-            break;
+        bytes.extend_from_slice(&buffer[..read]);
+        if let Some(index) = find_double_crlf(&bytes, scan_from) {
+            break index + 4;
         }
-        if bytes.len() > 64 * 1024 {
+        if bytes.len() > MAX_REQUEST_HEAD_BYTES {
             return Err(DockerPullError::InvalidInput(
                 "cache registry request headers are too large".into(),
             ));
         }
+    };
+
+    parse_request_head(&bytes[..header_end])
+}
+
+fn parse_request_head(bytes: &[u8]) -> Result<Request> {
+    let mut headers = [httparse::EMPTY_HEADER; 64];
+    let mut request = httparse::Request::new(&mut headers);
+    let parsed = request
+        .parse(bytes)
+        .map_err(|error| DockerPullError::BadResponse(format!("invalid HTTP request: {error}")))?;
+    if parsed.is_partial() {
+        return Err(DockerPullError::BadResponse(
+            "cache registry request headers are incomplete".into(),
+        ));
     }
 
-    let text = std::str::from_utf8(&bytes)
-        .map_err(|error| DockerPullError::BadResponse(format!("invalid HTTP request: {error}")))?;
-    let mut lines = text.lines();
-    let request_line = lines
-        .next()
-        .ok_or_else(|| DockerPullError::BadResponse("empty HTTP request".into()))?;
-    let mut parts = request_line.split_whitespace();
-    let method = parts
-        .next()
+    let method = request
+        .method
         .ok_or_else(|| DockerPullError::BadResponse("missing HTTP method".into()))?
         .to_string();
-    let path = parts
-        .next()
+    let path = request
+        .path
         .ok_or_else(|| DockerPullError::BadResponse("missing HTTP path".into()))?
         .to_string();
     let mut range = None;
-    for line in lines {
-        let Some((name, value)) = line.split_once(':') else {
-            continue;
-        };
-        if name.eq_ignore_ascii_case(RANGE.as_str()) {
+    for header in request.headers {
+        if header.name.eq_ignore_ascii_case(RANGE.as_str()) {
+            let value = std::str::from_utf8(header.value).map_err(|error| {
+                DockerPullError::BadResponse(format!("invalid HTTP header value: {error}"))
+            })?;
             range = Some(value.trim().to_string());
         }
     }
@@ -408,11 +416,15 @@ fn split_route<'a>(path: &'a str, separator: &str) -> Option<(&'a str, &'a str)>
     path.rsplit_once(separator)
 }
 
-fn looks_like_http_request(bytes: &[u8]) -> bool {
-    const METHODS: [&[u8]; 3] = [b"GET", b"HEAD", b"POST"];
-    METHODS
-        .iter()
-        .any(|method| method.starts_with(bytes) || bytes.starts_with(method))
+fn find_double_crlf(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut index = start;
+    while index + 3 < bytes.len() {
+        if &bytes[index..index + 4] == b"\r\n\r\n" {
+            return Some(index);
+        }
+        index += 1;
+    }
+    None
 }
 
 async fn blob_path_and_size(store: &Store, digest: &str) -> Result<(PathBuf, u64)> {
@@ -475,8 +487,8 @@ mod tests {
     use tokio::sync::Semaphore;
 
     use super::{
-        ManifestSummary, ServeState, is_supported_digest_reference, manifest_summary, run_server,
-        split_route,
+        ManifestSummary, ServeState, find_double_crlf, is_supported_digest_reference,
+        manifest_summary, parse_request_head, run_server, split_route,
     };
     use crate::auth::AuthResolver;
     use crate::platform::Platform;
@@ -680,6 +692,27 @@ mod tests {
                         .into()
                 ),
             }
+        );
+    }
+
+    #[test]
+    fn request_head_parses_method_path_and_range() {
+        let request =
+            parse_request_head(b"GET /v2/library/alpine/blobs/sha256:abc HTTP/1.1\r\nRange: bytes=4-\r\nHost: cache\r\n\r\n")
+                .expect("request should parse");
+
+        assert_eq!(request.method, "GET");
+        assert_eq!(request.path, "/v2/library/alpine/blobs/sha256:abc");
+        assert_eq!(request.range.as_deref(), Some("bytes=4-"));
+    }
+
+    #[test]
+    fn double_crlf_scan_can_start_near_new_bytes() {
+        let bytes = b"GET / HTTP/1.1\r\nHost: cache\r\n\r\n";
+
+        assert_eq!(
+            find_double_crlf(bytes, bytes.len() - 5),
+            Some(bytes.len() - 4)
         );
     }
 
