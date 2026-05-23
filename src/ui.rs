@@ -78,6 +78,13 @@ impl AggregateProgress {
         self.order.clear();
         self.layers.clear();
     }
+
+    fn touch_layer(&mut self, digest: &str) -> &mut AggregateLayer {
+        if !self.layers.contains_key(digest) {
+            self.order.push(digest.to_string());
+        }
+        self.layers.entry(digest.to_string()).or_default()
+    }
 }
 
 impl Ui {
@@ -404,10 +411,7 @@ impl ProgressUiInner {
 
     fn start_aggregate_layer(&self, digest: &str, total_bytes: u64, starting_offset: u64) {
         let mut aggregate = self.aggregate.lock().expect("ui state poisoned");
-        if !aggregate.layers.contains_key(digest) {
-            aggregate.order.push(digest.to_string());
-        }
-        let layer = aggregate.layers.entry(digest.to_string()).or_default();
+        let layer = aggregate.touch_layer(digest);
         layer.total = total_bytes;
         layer.position = starting_offset.min(total_bytes);
         layer.complete = layer.position >= total_bytes && total_bytes > 0;
@@ -417,10 +421,7 @@ impl ProgressUiInner {
 
     fn advance_aggregate_layer(&self, digest: &str, amount: u64) {
         let mut aggregate = self.aggregate.lock().expect("ui state poisoned");
-        if !aggregate.layers.contains_key(digest) {
-            aggregate.order.push(digest.to_string());
-        }
-        let layer = aggregate.layers.entry(digest.to_string()).or_default();
+        let layer = aggregate.touch_layer(digest);
         layer.position = layer.position.saturating_add(amount).min(layer.total);
         layer.complete = layer.total > 0 && layer.position >= layer.total;
         drop(aggregate);
@@ -429,10 +430,7 @@ impl ProgressUiInner {
 
     fn finish_aggregate_layer(&self, digest: &str) {
         let mut aggregate = self.aggregate.lock().expect("ui state poisoned");
-        if !aggregate.layers.contains_key(digest) {
-            aggregate.order.push(digest.to_string());
-        }
-        let layer = aggregate.layers.entry(digest.to_string()).or_default();
+        let layer = aggregate.touch_layer(digest);
         if layer.total > 0 {
             layer.position = layer.total;
         }
