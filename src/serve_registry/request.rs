@@ -60,6 +60,7 @@ fn parse_request_head(bytes: &[u8]) -> Result<Option<Request>> {
                 DockerPullError::BadResponse(format!("invalid HTTP header value: {error}"))
             })?;
             range = Some(value.trim().to_string());
+            break;
         }
     }
     Ok(Some(Request {
@@ -82,6 +83,16 @@ mod tests {
 
         assert_eq!(request.method, "GET");
         assert_eq!(request.path, "/v2/library/alpine/blobs/sha256:abc");
+        assert_eq!(request.range.as_deref(), Some("bytes=4-"));
+    }
+
+    #[test]
+    fn request_head_uses_first_range_header() {
+        let request =
+            parse_request_head(b"GET /v2/library/alpine/blobs/sha256:abc HTTP/1.1\r\nRange: bytes=4-\r\nRange: bytes=7-\r\n\r\n")
+                .expect("request should parse")
+                .expect("request should be complete");
+
         assert_eq!(request.range.as_deref(), Some("bytes=4-"));
     }
 

@@ -125,7 +125,9 @@ pub(super) async fn write_response(
         response.status, response.reason, content_type, response.content_length
     );
     headers.push_str("Docker-Distribution-API-Version: registry/2.0\r\n");
-    if let Some(digest) = &response.digest {
+    if let Some(digest) = &response.digest
+        && let Some(digest) = safe_header_value(digest)
+    {
         headers.push_str(&format!("Docker-Content-Digest: {digest}\r\n"));
     }
     if let Some(range) = response.range {
@@ -175,5 +177,15 @@ mod tests {
         );
         assert_eq!(safe_header_value("text/plain\r\nInjected: yes"), None);
         assert_eq!(safe_header_value("text/plain\nInjected: yes"), None);
+    }
+
+    #[test]
+    fn header_value_accepts_digest() {
+        assert_eq!(
+            safe_header_value(
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            ),
+            Some("sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
     }
 }
