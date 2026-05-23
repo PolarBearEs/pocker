@@ -9,7 +9,7 @@ use crate::error::{DockerPullError, Result};
 use crate::export::oci_archive::{
     PreparedOciArchive, prepare_oci_archive, write_prepared_oci_archive_to_writer,
 };
-use crate::reference::{ImageReference, ReferenceTarget};
+use crate::reference::{ImageReference, ReferenceTarget, is_docker_hub};
 use crate::store::{Store, StoredReference};
 
 mod daemon;
@@ -184,9 +184,19 @@ fn split_tagged_reference(reference: &str) -> Result<(String, String)> {
         )));
     };
 
-    let mut repository = reference.display_name();
-    repository.truncate(repository.len() - tag.len() - 1);
-    Ok((repository, tag.clone()))
+    Ok((tagged_repository_name(&reference), tag.clone()))
+}
+
+fn tagged_repository_name(reference: &ImageReference) -> String {
+    if is_docker_hub(&reference.registry) {
+        return reference
+            .repository
+            .strip_prefix("library/")
+            .unwrap_or(&reference.repository)
+            .to_string();
+    }
+
+    format!("{}/{}", reference.registry, reference.repository)
 }
 
 fn ensure_json_stream_success(body: String, action: &str) -> Result<()> {

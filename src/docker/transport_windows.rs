@@ -420,6 +420,10 @@ impl ChunkReadBuffer {
     }
 
     fn consume(&mut self, count: usize) {
+        debug_assert!(
+            count <= self.available().len(),
+            "consume count exceeds available bytes"
+        );
         self.position += count;
         if self.position == self.bytes.len() {
             self.bytes.clear();
