@@ -14,7 +14,7 @@ use crate::image_view::{format_size, print_image_inspect, print_image_list};
 use crate::pull::orchestrator::{PullRequestOptions, pull_references, retry_limit};
 use crate::registry::{DEFAULT_REQUEST_RETRIES, RegistryClient};
 use crate::store::Store;
-use crate::{docker, pull, serve_registry, ui};
+use crate::{docker, pull, serve_registry, signal, ui};
 
 pub async fn run() -> Result<()> {
     init_tracing();
@@ -89,6 +89,11 @@ pub async fn run() -> Result<()> {
                     }
                 );
             }
+            let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+            tokio::spawn(async move {
+                signal::wait_for_shutdown_signal().await;
+                let _ = shutdown_tx.send(());
+            });
             serve_registry::serve(serve_registry::ServeConfig {
                 listen: args.listen,
                 store,
@@ -101,6 +106,7 @@ pub async fn run() -> Result<()> {
                 ),
                 concurrency: args.concurrency.max(1),
                 quiet,
+                shutdown: Some(shutdown_rx),
             })
             .await?;
         }

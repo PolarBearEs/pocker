@@ -34,6 +34,7 @@ pub struct ServeConfig {
     pub blob_retry_limit: Option<u32>,
     pub concurrency: usize,
     pub quiet: bool,
+    pub shutdown: Option<oneshot::Receiver<()>>,
 }
 
 pub async fn serve(config: ServeConfig) -> Result<()> {
@@ -48,7 +49,7 @@ pub async fn serve(config: ServeConfig) -> Result<()> {
             concurrency: config.concurrency,
             quiet: config.quiet,
         },
-        None,
+        config.shutdown,
     )
     .await
 }
