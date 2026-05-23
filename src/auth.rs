@@ -28,7 +28,7 @@ pub enum Credentials {
 #[derive(Debug)]
 pub struct AuthResolver {
     cli_credentials: Option<Credentials>,
-    docker_config: Option<DockerConfig>,
+    docker_config: Option<Arc<DockerConfig>>,
     resolved: Mutex<HashMap<String, Arc<OnceCell<Option<Credentials>>>>>,
 }
 
@@ -59,7 +59,7 @@ impl AuthResolver {
     pub fn new(cli_credentials: Option<Credentials>) -> Result<Self> {
         Ok(Self {
             cli_credentials,
-            docker_config: load_docker_config()?,
+            docker_config: load_docker_config()?.map(Arc::new),
             resolved: Mutex::new(HashMap::new()),
         })
     }
@@ -69,7 +69,7 @@ impl AuthResolver {
             return Ok(Some(credentials.clone()));
         }
 
-        let Some(config) = self.docker_config.clone() else {
+        let Some(config) = self.docker_config.as_ref().cloned() else {
             return Ok(None);
         };
 
