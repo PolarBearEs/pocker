@@ -136,6 +136,7 @@ struct SharedPullState {
     stop: Arc<AtomicBool>,
     blob_retry_limit: Option<u32>,
     blob_locks: Arc<BlobDownloadLocks>,
+    daemon_layer_cache: Option<Arc<crate::docker::DaemonLayerCache>>,
     options: PullOptions,
     ui_group: UiGroup,
 }
@@ -181,6 +182,8 @@ pub(crate) async fn pull_references(
         keep_layer_blobs: request.keep_layer_blobs,
         load_mode: request.load_mode,
     };
+    let daemon_layer_cache = (options.load_mode == LoadMode::Stream)
+        .then(|| Arc::new(crate::docker::DaemonLayerCache::new()));
 
     let state = SharedPullState {
         store,
@@ -188,6 +191,7 @@ pub(crate) async fn pull_references(
         stop,
         blob_retry_limit: request.blob_retry_limit,
         blob_locks: Arc::new(BlobDownloadLocks::default()),
+        daemon_layer_cache,
         options,
         ui_group: UiGroup::new(quiet, !request.no_animations),
     };
@@ -254,6 +258,7 @@ async fn pull_reference_with_group(state: SharedPullState, reference: String) ->
         ui: Arc::new(state.ui_group.image_ui(label)),
         blob_retry_limit: state.blob_retry_limit,
         blob_locks: state.blob_locks,
+        daemon_layer_cache: state.daemon_layer_cache,
     };
     Puller::new(context).pull(reference, state.options).await
 }

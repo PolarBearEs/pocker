@@ -10,11 +10,9 @@ use crate::docker;
 use crate::error::{DockerPullError, Result};
 use crate::image::parse_diff_ids;
 use crate::reference::{ImageReference, ReferenceTarget};
-use crate::registry::Descriptor;
+use crate::registry::{Descriptor, OCI_IMAGE_LAYER_MEDIA_TYPE, OCI_IMAGE_MANIFEST_MEDIA_TYPE};
 use crate::store::Store;
 use crate::store::StoredReference;
-
-const OCI_IMAGE_MANIFEST_MEDIA_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";
 
 #[derive(Debug, Serialize)]
 struct OciLayout<'a> {
@@ -275,7 +273,7 @@ fn layer_archive_source(
     if let Some(local_path) = fallback_paths.and_then(|paths| paths.get(diff_id)) {
         return Ok(LayerArchiveSource {
             descriptor: Descriptor {
-                media_type: "application/vnd.oci.image.layer.v1.tar".into(),
+                media_type: OCI_IMAGE_LAYER_MEDIA_TYPE.into(),
                 digest: diff_id.to_string(),
                 size: std::fs::metadata(local_path)?.len() as i64,
                 platform: None,

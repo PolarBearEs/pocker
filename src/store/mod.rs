@@ -137,7 +137,16 @@ impl Store {
                 actual: actual_digest,
             });
         }
-        atomic_write_bytes(&path, bytes)?;
+        if let Err(error) = atomic_write_bytes(&path, bytes) {
+            if is_concurrent_blob_save_race(&error)
+                && self
+                    .ensure_blob_complete(&descriptor.digest, expected_size)
+                    .await?
+            {
+                return Ok(());
+            }
+            return Err(error);
+        }
         Ok(())
     }
 
@@ -187,14 +196,18 @@ impl Store {
     pub async fn finalize_download(&self, descriptor: &Descriptor) -> Result<()> {
         let partial = self.partial_path(&descriptor.digest)?;
         let final_path = self.blob_path(&descriptor.digest)?;
-        if !partial.exists() {
-            return Err(DockerPullError::MissingBlobFile(
-                descriptor.digest.clone(),
-                partial,
-            ));
-        }
         let computed =
-            digest_file_for_digest_blocking(descriptor.digest.clone(), partial.clone()).await?;
+            match digest_file_for_digest_blocking(descriptor.digest.clone(), partial.clone()).await
+            {
+                Ok(computed) => computed,
+                Err(DockerPullError::Io(error)) if error.kind() == ErrorKind::NotFound => {
+                    return Err(DockerPullError::MissingBlobFile(
+                        descriptor.digest.clone(),
+                        partial,
+                    ));
+                }
+                Err(error) => return Err(error),
+            };
         if computed != descriptor.digest {
             return Err(DockerPullError::DigestMismatch {
                 digest: descriptor.digest.clone(),
@@ -208,9 +221,7 @@ impl Store {
         tokio_fs::rename(&partial, &final_path).await?;
 
         let metadata_path = self.partial_metadata_path(&descriptor.digest)?;
-        if metadata_path.exists() {
-            tokio_fs::remove_file(metadata_path).await?;
-        }
+        remove_file_if_exists(&metadata_path).await?;
         Ok(())
     }
 
@@ -450,6 +461,17 @@ async fn remove_file_if_exists(path: &Path) -> Result<()> {
     }
 }
 
+fn is_concurrent_blob_save_race(error: &DockerPullError) -> bool {
+    matches!(
+        error,
+        DockerPullError::Io(error)
+            // Windows can report PermissionDenied when an atomic persist races
+            // with another writer. Callers still verify the final blob before
+            // treating this as success, so genuine permission failures surface.
+            if matches!(error.kind(), ErrorKind::AlreadyExists | ErrorKind::PermissionDenied)
+    )
+}
+
 fn digest_path(root: PathBuf, digest: &str) -> Result<PathBuf> {
     let parsed = parse_digest(digest)?;
     Ok(root.join(parsed.algorithm.to_string()).join(parsed.value))
@@ -671,6 +693,68 @@ mod tests {
             .expect("cached config blob should be readable");
 
         assert_eq!(cached.as_deref(), Some(bytes.as_slice()));
+    }
+
+    #[tokio::test]
+    async fn concurrent_blob_saves_for_same_digest_are_idempotent() {
+        let dir = tempdir().expect("tempdir should create");
+        let store = std::sync::Arc::new(
+            Store::open(dir.path().to_path_buf())
+                .await
+                .expect("store should open"),
+        );
+        let bytes = b"shared blob";
+        let descriptor = Descriptor {
+            media_type: "application/octet-stream".into(),
+            digest: super::digest_bytes(bytes),
+            size: bytes.len() as i64,
+            platform: None,
+            annotations: None,
+        };
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..16 {
+            let store = std::sync::Arc::clone(&store);
+            let descriptor = descriptor.clone();
+            tasks.spawn(async move { store.save_blob_bytes(&descriptor, bytes).await });
+        }
+
+        while let Some(result) = tasks.join_next().await {
+            result
+                .expect("save task should not panic")
+                .expect("concurrent save should succeed");
+        }
+
+        let cached = store
+            .read_blob_bytes_if_complete(&descriptor)
+            .await
+            .expect("cached blob should be readable");
+        assert_eq!(cached.as_deref(), Some(bytes.as_slice()));
+    }
+
+    #[tokio::test]
+    async fn finalize_download_reports_missing_partial_without_exists_precheck() {
+        let dir = tempdir().expect("tempdir should create");
+        let store = Store::open(dir.path().to_path_buf())
+            .await
+            .expect("store should open");
+        let descriptor = Descriptor {
+            media_type: "application/octet-stream".into(),
+            digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .into(),
+            size: 0,
+            platform: None,
+            annotations: None,
+        };
+
+        let error = store
+            .finalize_download(&descriptor)
+            .await
+            .expect_err("missing partial should be reported");
+
+        assert!(matches!(
+            error,
+            DockerPullError::MissingBlobFile(digest, _) if digest == descriptor.digest
+        ));
     }
 
     #[tokio::test]

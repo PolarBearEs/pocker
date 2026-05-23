@@ -11,7 +11,7 @@ use crate::error::{DockerPullError, Result};
 use crate::pull::PullContext;
 use crate::reference::ImageReference;
 use crate::registry::Descriptor;
-use crate::retry::{retry_budget, retry_limit_exceeded, retry_limit_exhausted};
+use crate::retry::{jittered_backoff_delay, record_retry_attempt};
 use crate::store::DownloadPlan;
 
 const CHECKPOINT_BYTES: u64 = 8 * 1024 * 1024;
@@ -61,7 +61,7 @@ pub async fn download_blob(
             .await?;
         let status = response.status();
         if status == StatusCode::OK && offset > 0 {
-            let delay = retry_delay(offset);
+            let delay = jittered_backoff_delay(retries);
             retries = register_retry(
                 context,
                 &descriptor.digest,
@@ -80,7 +80,7 @@ pub async fn download_blob(
             continue;
         }
         if status == StatusCode::RANGE_NOT_SATISFIABLE {
-            let delay = retry_delay(offset);
+            let delay = jittered_backoff_delay(retries);
             retries = register_retry(
                 context,
                 &descriptor.digest,
@@ -132,7 +132,7 @@ pub async fn download_blob(
                     }
                 }
                 Err(error) => {
-                    let delay = retry_delay(offset);
+                    let delay = jittered_backoff_delay(retries);
                     retries = register_retry(
                         context,
                         &descriptor.digest,
@@ -263,14 +263,6 @@ fn reset_checkpoint_tracking(bytes_since_checkpoint: &mut u64, last_checkpoint: 
     *last_checkpoint = Instant::now();
 }
 
-fn retry_delay(offset: u64) -> Duration {
-    if offset == 0 {
-        Duration::from_secs(2)
-    } else {
-        Duration::from_secs(1)
-    }
-}
-
 fn register_retry(
     context: &PullContext,
     digest: &str,
@@ -278,22 +270,19 @@ fn register_retry(
     detail: impl Into<String>,
     delay: Duration,
 ) -> Result<u32> {
+    let mut retries = retries;
     let detail = detail.into();
-    let next_retry = retries + 1;
-    if retry_limit_exhausted(retries, context.blob_retry_limit) {
-        return Err(retry_limit_exceeded(
-            format!("blob download {digest}"),
-            retries,
-            detail,
-        ));
-    }
-
-    let retry_budget = retry_budget(next_retry, context.blob_retry_limit);
+    let retry_budget = record_retry_attempt(
+        &mut retries,
+        context.blob_retry_limit,
+        format!("blob download {digest}"),
+        detail.clone(),
+    )?;
     context.ui.warn(format!(
         "{detail} for {digest}; retrying in {:?} ({retry_budget})",
         delay
     ));
-    Ok(next_retry)
+    Ok(retries)
 }
 
 #[cfg(test)]

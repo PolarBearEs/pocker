@@ -19,7 +19,7 @@ mod transport;
 use daemon::DockerDaemon;
 
 pub(crate) use layers::{
-    MaterializedDaemonLayers, daemon_layer_coverage, materialize_daemon_layers,
+    DaemonLayerCache, MaterializedDaemonLayers, daemon_layer_coverage, materialize_daemon_layers,
 };
 
 const PATH_SEGMENT_ENCODE_SET: &AsciiSet = &CONTROLS

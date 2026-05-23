@@ -935,6 +935,7 @@ dependencies = [
  "base64",
  "clap",
  "directories",
+ "fastrand",
  "futures-util",
  "hex",
  "http",

@@ -30,6 +30,7 @@ pub struct PullContext {
     pub ui: Arc<Ui>,
     pub blob_retry_limit: Option<u32>,
     pub blob_locks: Arc<BlobDownloadLocks>,
+    pub daemon_layer_cache: Option<Arc<docker::DaemonLayerCache>>,
 }
 
 #[derive(Debug, Clone)]
@@ -151,7 +152,11 @@ impl Puller {
             .collect::<Vec<_>>();
         self.context.ui.prepare_layers(&layer_digests);
         let daemon_layers = if options.load_mode == LoadMode::Stream {
-            match docker::daemon_layer_coverage(&layers).await {
+            let coverage = match &self.context.daemon_layer_cache {
+                Some(cache) => cache.coverage(&layers).await,
+                None => docker::daemon_layer_coverage(&layers).await,
+            };
+            match coverage {
                 Ok(coverage) => coverage,
                 Err(error) => {
                     warn!("failed to inspect Docker daemon layer coverage: {error}");
