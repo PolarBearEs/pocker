@@ -57,9 +57,8 @@ pub(super) async fn request_bytes(
 ) -> Result<DockerResponse> {
     let mut pipe = open_named_pipe(pipe_path).await?;
     let len = body.len();
-    let headers = format!(
-        "{method} {path} HTTP/1.1\r\nHost: docker\r\nUser-Agent: {USER_AGENT}\r\nConnection: close\r\nContent-Length: {len}\r\n\r\n"
-    );
+    let len = len.to_string();
+    let headers = build_request_head(method, path, &[("Content-Length", &len)]);
     pipe.write_all(headers.as_bytes()).await?;
     pipe.write_all(&body).await?;
     pipe.flush().await?;
@@ -76,8 +75,11 @@ pub(super) async fn request_file(
     len: u64,
 ) -> Result<DockerResponse> {
     let mut pipe = open_named_pipe(pipe_path).await?;
-    let headers = format!(
-        "{method} {path} HTTP/1.1\r\nHost: docker\r\nUser-Agent: {USER_AGENT}\r\nConnection: close\r\nContent-Type: {content_type}\r\nContent-Length: {len}\r\n\r\n"
+    let len = len.to_string();
+    let headers = build_request_head(
+        method,
+        path,
+        &[("Content-Type", content_type), ("Content-Length", &len)],
     );
     pipe.write_all(headers.as_bytes()).await?;
     tokio::io::copy(&mut file, &mut pipe).await?;
@@ -94,8 +96,13 @@ pub(super) async fn request_chunked_stream(
     mut stream: ReaderStream<DuplexStream>,
 ) -> Result<DockerResponse> {
     let mut pipe = open_named_pipe(pipe_path).await?;
-    let headers = format!(
-        "{method} {path} HTTP/1.1\r\nHost: docker\r\nUser-Agent: {USER_AGENT}\r\nConnection: close\r\nContent-Type: {content_type}\r\nTransfer-Encoding: chunked\r\n\r\n"
+    let headers = build_request_head(
+        method,
+        path,
+        &[
+            ("Content-Type", content_type),
+            ("Transfer-Encoding", "chunked"),
+        ],
     );
     pipe.write_all(headers.as_bytes()).await?;
     while let Some(chunk) = stream.next().await {
@@ -119,9 +126,7 @@ pub(super) async fn request_to_file(
     action: &str,
 ) -> Result<()> {
     let mut pipe = open_named_pipe(pipe_path).await?;
-    let headers = format!(
-        "{method} {path} HTTP/1.1\r\nHost: docker\r\nUser-Agent: {USER_AGENT}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
-    );
+    let headers = build_request_head(method, path, &[("Content-Length", "0")]);
     pipe.write_all(headers.as_bytes()).await?;
     pipe.flush().await?;
 
@@ -135,6 +140,21 @@ pub(super) async fn request_to_file(
     write_body_to_file(&mut pipe, &headers, body_start, &mut file).await?;
     file.flush().await?;
     Ok(())
+}
+
+#[cfg(windows)]
+fn build_request_head(method: &str, path: &str, headers: &[(&str, &str)]) -> String {
+    let mut head = format!(
+        "{method} {path} HTTP/1.1\r\nHost: docker\r\nUser-Agent: {USER_AGENT}\r\nConnection: close\r\n"
+    );
+    for (name, value) in headers {
+        head.push_str(name);
+        head.push_str(": ");
+        head.push_str(value);
+        head.push_str("\r\n");
+    }
+    head.push_str("\r\n");
+    head
 }
 
 #[cfg(windows)]
@@ -318,13 +338,7 @@ where
             let size_line = std::str::from_utf8(&line[..line_end]).map_err(|error| {
                 DockerPullError::BadResponse(format!("invalid chunk size: {error}"))
             })?;
-            let size_hex = size_line
-                .split_once(';')
-                .map(|(size, _)| size)
-                .unwrap_or(size_line);
-            return usize::from_str_radix(size_hex.trim(), 16).map_err(|error| {
-                DockerPullError::BadResponse(format!("invalid chunk size: {error}"))
-            });
+            return parse_chunk_size(size_line);
         }
         read_more(reader, buffer).await?;
     }
@@ -447,13 +461,7 @@ pub(crate) fn decode_chunked_body(bytes: &[u8]) -> Result<Vec<u8>> {
         let size_line = std::str::from_utf8(&bytes[index..index + line_end]).map_err(|error| {
             DockerPullError::BadResponse(format!("invalid chunk size: {error}"))
         })?;
-        let size_hex = size_line
-            .split_once(';')
-            .map(|(size, _)| size)
-            .unwrap_or(size_line);
-        let size = usize::from_str_radix(size_hex.trim(), 16).map_err(|error| {
-            DockerPullError::BadResponse(format!("invalid chunk size: {error}"))
-        })?;
+        let size = parse_chunk_size(size_line)?;
         index += line_end + 2;
         if size == 0 {
             return Ok(decoded);
@@ -467,6 +475,13 @@ pub(crate) fn decode_chunked_body(bytes: &[u8]) -> Result<Vec<u8>> {
         decoded.extend_from_slice(&bytes[index..chunk_end]);
         index = chunk_end + 2;
     }
+}
+
+#[cfg(any(test, windows))]
+fn parse_chunk_size(line: &str) -> Result<usize> {
+    let size_hex = line.split_once(';').map(|(size, _)| size).unwrap_or(line);
+    usize::from_str_radix(size_hex.trim(), 16)
+        .map_err(|error| DockerPullError::BadResponse(format!("invalid chunk size: {error}")))
 }
 
 #[cfg(test)]
