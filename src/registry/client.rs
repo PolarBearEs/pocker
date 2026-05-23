@@ -162,6 +162,7 @@ impl RegistryClient {
         if response.status() == StatusCode::NOT_FOUND {
             return Err(DockerPullError::ManifestNotFound);
         }
+        ensure_success_status(response.status(), "manifest")?;
         let digest = header_string(&response, &DOCKER_CONTENT_DIGEST)?;
         let media_type = response_content_media_type(&response);
         let body = response.bytes().await?.to_vec();
@@ -611,12 +612,7 @@ async fn raw_manifest_from_response(response: Response) -> Result<RawManifest> {
     if response.status() == StatusCode::NOT_FOUND {
         return Err(DockerPullError::ManifestNotFound);
     }
-    if !response.status().is_success() {
-        return Err(DockerPullError::BadResponse(format!(
-            "registry returned {} for manifest",
-            response.status()
-        )));
-    }
+    ensure_success_status(response.status(), "manifest")?;
     let digest = header_string(&response, &DOCKER_CONTENT_DIGEST)?;
     let media_type = response_content_media_type(&response);
     let bytes = response.bytes().await?.to_vec();
@@ -635,6 +631,15 @@ async fn raw_manifest_from_response(response: Response) -> Result<RawManifest> {
         },
         bytes,
     })
+}
+
+fn ensure_success_status(status: StatusCode, resource: &str) -> Result<()> {
+    if status.is_success() {
+        return Ok(());
+    }
+    Err(DockerPullError::BadResponse(format!(
+        "registry returned {status} for {resource}"
+    )))
 }
 
 fn token_cache_key(reference: &ImageReference) -> String {
@@ -989,6 +994,35 @@ mod tests {
         assert!(matches!(error, DockerPullError::ManifestNotFound));
 
         server.await.expect("server task should finish");
+    }
+
+    #[tokio::test]
+    async fn resolve_image_rejects_non_success_manifest_status() {
+        let registry = spawn_single_response(
+            b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
+        )
+        .await;
+        let client = RegistryClient::new(
+            reqwest::Client::builder()
+                .https_only(false)
+                .build()
+                .expect("client should build"),
+            Arc::new(AuthResolver::new(None).expect("auth resolver should build")),
+            true,
+            Some(DEFAULT_REQUEST_RETRIES),
+        );
+        let reference = ImageReference::parse(&format!("{registry}/sample:latest"))
+            .expect("reference should parse");
+
+        let error = client
+            .resolve_image(
+                &reference,
+                &Platform::parse("linux/amd64").expect("platform should parse"),
+            )
+            .await
+            .expect_err("non-success manifest response should fail before JSON parsing");
+
+        assert!(matches!(error, DockerPullError::BadResponse(message) if message.contains("403")));
     }
 
     #[tokio::test]
