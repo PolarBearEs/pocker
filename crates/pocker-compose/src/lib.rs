@@ -388,6 +388,27 @@ services:
     }
 
     #[test]
+    fn interpolation_rejects_excessive_nesting() {
+        let mut text = String::new();
+        for _ in 0..40 {
+            text.push_str("${UNSET:-");
+        }
+        text.push_str("fallback");
+        for _ in 0..40 {
+            text.push('}');
+        }
+
+        let error = interpolate(&text, &HashMap::new())
+            .expect_err("excessive nested interpolation should fail");
+
+        assert!(matches!(
+            error,
+            ComposeError::InvalidInput(message)
+                if message == "compose variable interpolation is nested too deeply"
+        ));
+    }
+
+    #[test]
     fn required_variable_operator_wins_over_dash_in_message() {
         let error = interpolate("${REQUIRED?-must be set}", &HashMap::new())
             .expect_err("required operator should fail when variable is unset");
