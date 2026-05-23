@@ -104,17 +104,13 @@ fn resolve_docker_config(config: &DockerConfig, registry: &str) -> Result<Option
         {
             return Ok(Some(credentials));
         }
-    }
 
-    if let Some(helper) = &config.creds_store {
-        for key in registry_keys(registry) {
-            if let Some(credentials) = invoke_helper(helper, key)? {
-                return Ok(Some(credentials));
-            }
+        if let Some(helper) = &config.creds_store
+            && let Some(credentials) = invoke_helper(helper, key)?
+        {
+            return Ok(Some(credentials));
         }
-    }
 
-    for key in registry_keys(registry) {
         if let Some(entry) = config.auths.get(key)
             && let Some(auth) = &entry.auth
         {
