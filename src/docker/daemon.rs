@@ -5,6 +5,7 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use tokio::io::DuplexStream;
+use tokio::sync::OnceCell;
 use tokio_util::io::ReaderStream;
 
 use crate::error::Result;
@@ -19,11 +20,19 @@ pub(super) struct DockerDaemon {
     transport: DockerTransport,
 }
 
+static SHARED_DAEMON: OnceCell<DockerDaemon> = OnceCell::const_new();
+
 impl DockerDaemon {
     pub(super) fn connect() -> Result<Self> {
         Ok(Self {
             transport: DockerTransport::connect()?,
         })
+    }
+
+    pub(super) async fn shared() -> Result<&'static Self> {
+        SHARED_DAEMON
+            .get_or_try_init(|| async { Self::connect() })
+            .await
     }
 
     pub(super) async fn load_archive(&self, path: &Path) -> Result<()> {

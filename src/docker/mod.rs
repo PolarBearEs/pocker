@@ -56,7 +56,7 @@ pub async fn load_reference_archive_stream(
     store: &Store,
     reference: &StoredReference,
 ) -> Result<()> {
-    let daemon = DockerDaemon::connect()?;
+    let daemon = DockerDaemon::shared().await?;
     let prepared = prepare_oci_archive(store, reference).await?;
     let (reader, writer) = tokio::io::duplex(LOAD_ARCHIVE_STREAM_BUFFER_BYTES);
     let writer = SyncIoBridge::new(writer);
@@ -98,7 +98,7 @@ fn write_archive_to_stream(
 
 pub async fn daemon_has_reference(reference: &ImageReference, config_digest: &str) -> Result<bool> {
     let inspect_target = daemon_inspect_target(reference, config_digest);
-    let daemon = DockerDaemon::connect()?;
+    let daemon = DockerDaemon::shared().await?;
     let Some(image) = daemon.inspect_daemon_image(&inspect_target).await? else {
         return Ok(false);
     };
@@ -118,27 +118,36 @@ fn normalize_image_id(image_id: &str) -> &str {
 }
 
 pub async fn load_archive(path: &Path) -> Result<()> {
-    DockerDaemon::connect()?.load_archive(path).await
+    DockerDaemon::shared().await?.load_archive(path).await
 }
 
 pub async fn pull_image(reference: &str) -> Result<()> {
-    DockerDaemon::connect()?.pull_image(reference).await
+    DockerDaemon::shared().await?.pull_image(reference).await
 }
 
 pub async fn tag_image(source: &str, target: &str) -> Result<()> {
-    DockerDaemon::connect()?.tag_image(source, target).await
+    DockerDaemon::shared()
+        .await?
+        .tag_image(source, target)
+        .await
 }
 
 pub async fn remove_image_tag(reference: &str) -> Result<()> {
-    DockerDaemon::connect()?.remove_image_tag(reference).await
+    DockerDaemon::shared()
+        .await?
+        .remove_image_tag(reference)
+        .await
 }
 
 pub async fn inspect_image(reference: &str) -> Result<Option<Value>> {
-    DockerDaemon::connect()?.inspect_image_json(reference).await
+    DockerDaemon::shared()
+        .await?
+        .inspect_image_json(reference)
+        .await
 }
 
 pub async fn list_images() -> Result<Vec<ImageSummary>> {
-    let daemon = DockerDaemon::connect()?;
+    let daemon = DockerDaemon::shared().await?;
     let images = daemon.list_image_summaries().await?;
     Ok(images
         .into_iter()
@@ -152,7 +161,10 @@ pub async fn list_images() -> Result<Vec<ImageSummary>> {
 }
 
 pub async fn save_image(reference: &str, path: &Path) -> Result<()> {
-    DockerDaemon::connect()?.save_image(reference, path).await
+    DockerDaemon::shared()
+        .await?
+        .save_image(reference, path)
+        .await
 }
 
 fn encode_path_segment(value: &str) -> String {

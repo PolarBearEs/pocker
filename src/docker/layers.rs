@@ -37,8 +37,8 @@ impl DaemonLayerCache {
         let images = self
             .images
             .get_or_try_init(|| async {
-                let daemon = DockerDaemon::connect()?;
-                list_daemon_images(&daemon).await
+                let daemon = DockerDaemon::shared().await?;
+                list_daemon_images(daemon).await
             })
             .await?;
         let chosen = choose_from_daemon_images(images.iter().cloned(), &wanted);
@@ -167,8 +167,8 @@ pub async fn materialize_daemon_layers(
         });
     }
 
-    let daemon = DockerDaemon::connect()?;
-    let chosen = choose_daemon_images(&daemon, &wanted).await?;
+    let daemon = DockerDaemon::shared().await?;
+    let chosen = choose_daemon_images(daemon, &wanted).await?;
     let tempdir = tempfile::tempdir_in(store.root())?;
     let mut paths = HashMap::new();
     for chosen in &chosen {
