@@ -1,5 +1,13 @@
 # AGENTS.md
 
+## Design Guidelines
+
+- Assume pocker is used on unreliable, slow, or constrained devices and networks. Avoid total-duration timeouts for blob transfers or other operations that can legitimately take a long time while still making progress.
+- Prefer idle/progress timeouts over absolute timeouts for network and file streaming paths.
+- Be careful with cache coordination: multiple images, tasks, or processes may request the same layer at the same time. Preserve deduplication, resumability, and cache integrity.
+- Do not optimize for the happy path at the expense of flaky-network behavior. Retries, cancellation, and partial progress should remain first-class.
+- When adding limits, concurrency controls, or timeouts, document what the limit protects against and why the default is appropriate for slow environments.
+
 ## Before Commit
 
 Before committing changes in this repo:
