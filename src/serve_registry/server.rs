@@ -403,7 +403,7 @@ fn is_supported_digest_reference(reference: &str) -> bool {
 }
 
 fn split_route<'a>(path: &'a str, separator: &str) -> Option<(&'a str, &'a str)> {
-    path.split_once(separator)
+    path.rsplit_once(separator)
 }
 
 fn looks_like_http_request(bytes: &[u8]) -> bool {
@@ -465,7 +465,7 @@ mod tests {
     use tokio::net::TcpListener;
     use tokio::sync::Semaphore;
 
-    use super::{ServeState, is_supported_digest_reference, run_server};
+    use super::{ServeState, is_supported_digest_reference, run_server, split_route};
     use crate::auth::AuthResolver;
     use crate::platform::Platform;
     use crate::pull::{BlobDownloadLocks, PullContext, PullOptions, Puller};
@@ -639,6 +639,18 @@ mod tests {
             "a".repeat(56)
         )));
         assert!(!is_supported_digest_reference("sha512:"));
+    }
+
+    #[test]
+    fn split_route_uses_last_route_separator() {
+        let (repository, reference) = split_route(
+            "registry.test/team/manifests/app/manifests/latest",
+            "/manifests/",
+        )
+        .expect("route should split");
+
+        assert_eq!(repository, "registry.test/team/manifests/app");
+        assert_eq!(reference, "latest");
     }
 
     #[tokio::test]
