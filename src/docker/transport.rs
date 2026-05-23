@@ -209,7 +209,7 @@ pub(super) fn build_failure_error(
     body: &[u8],
     action: &str,
 ) -> DockerPullError {
-    let body = String::from_utf8_lossy(&body);
+    let body = String::from_utf8_lossy(body);
     let body = body.trim();
     let detail = if body.is_empty() {
         format!("status {status}")

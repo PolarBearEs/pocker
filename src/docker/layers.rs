@@ -172,7 +172,7 @@ pub async fn materialize_daemon_layers(
     let tempdir = tempfile::tempdir_in(store.root())?;
     let mut paths = HashMap::new();
     for chosen in &chosen {
-        materialize_layers_from_saved_image(store, &daemon, chosen, tempdir.path(), &mut paths)
+        materialize_layers_from_saved_image(store, daemon, chosen, tempdir.path(), &mut paths)
             .await?;
     }
 
