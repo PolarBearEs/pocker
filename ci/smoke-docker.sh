@@ -3,6 +3,7 @@ set -euo pipefail
 
 BIN="${1:-target/debug/pocker}"
 PUBLIC_REF="registry.k8s.io/pause:3.9"
+SECOND_PUBLIC_REF="registry.k8s.io/pause:3.8"
 RESUME_REGISTRY_PORT="${RESUME_REGISTRY_PORT:-5002}"
 AUTH_REGISTRY_PORT="${AUTH_REGISTRY_PORT:-5003}"
 RESUME_REF="localhost:${RESUME_REGISTRY_PORT}/pocker/resume:latest"
@@ -66,6 +67,25 @@ if docker images --format '{{.Repository}}:{{.Tag}}' | grep -q 'pocker-cache'; t
   echo "temporary local registry image tag was not cleaned up" >&2
   exit 1
 fi
+
+echo "smoke: parallel cached load into Docker"
+docker image rm -f "${PUBLIC_REF}" "${SECOND_PUBLIC_REF}" >/dev/null 2>&1 || true
+run_pocker \
+  --cache-dir "${WORKDIR}/cache-parallel-load" \
+  pull \
+  --no-load \
+  --max-parallel-images 2 \
+  "${PUBLIC_REF}" \
+  "${SECOND_PUBLIC_REF}"
+docker image rm -f "${PUBLIC_REF}" "${SECOND_PUBLIC_REF}" >/dev/null 2>&1 || true
+run_pocker \
+  --cache-dir "${WORKDIR}/cache-parallel-load" \
+  pull \
+  --max-parallel-images 2 \
+  "${PUBLIC_REF}" \
+  "${SECOND_PUBLIC_REF}"
+docker image inspect "${PUBLIC_REF}" >/dev/null
+docker image inspect "${SECOND_PUBLIC_REF}" >/dev/null
 
 echo "smoke: compose config and service-filtered pull"
 mkdir -p "${WORKDIR}/compose"
