@@ -8,6 +8,8 @@ use std::time::Duration;
 use anstyle::{AnsiColor, Style};
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 
+use crate::units::format_units;
+
 pub(crate) const GREEN: Style = AnsiColor::Green.on_default();
 pub(crate) const YELLOW: Style = AnsiColor::Yellow.on_default();
 pub(crate) const CYAN: Style = AnsiColor::Cyan.on_default();
@@ -540,20 +542,7 @@ fn plain_layer_download_message(digest: &str, total_bytes: u64, starting_offset:
 
 fn format_bytes(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
-    let mut value = bytes as f64;
-    let mut unit = 0usize;
-    while value >= 1024.0 && unit + 1 < UNITS.len() {
-        value /= 1024.0;
-        unit += 1;
-    }
-
-    if unit == 0 {
-        format!("{bytes} {}", UNITS[unit])
-    } else if value >= 10.0 {
-        format!("{value:.0} {}", UNITS[unit])
-    } else {
-        format!("{value:.1} {}", UNITS[unit])
-    }
+    format_units(bytes, 1024.0, &UNITS)
 }
 
 fn image_status_style(animated: bool) -> ProgressStyle {

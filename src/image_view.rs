@@ -2,6 +2,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::docker;
 use crate::error::{DockerPullError, Result};
+use crate::units::format_units;
 
 pub(crate) async fn print_image_list() -> Result<()> {
     let images = docker::list_images().await?;
@@ -100,20 +101,7 @@ pub(crate) fn format_size(size: Option<u64>) -> String {
         return "<unknown>".into();
     };
     const UNITS: [&str; 5] = ["B", "kB", "MB", "GB", "TB"];
-    let mut value = size as f64;
-    let mut unit = 0usize;
-    while value >= 1000.0 && unit + 1 < UNITS.len() {
-        value /= 1000.0;
-        unit += 1;
-    }
-
-    if unit == 0 {
-        format!("{size} {}", UNITS[unit])
-    } else if value >= 10.0 {
-        format!("{value:.0} {}", UNITS[unit])
-    } else {
-        format!("{value:.1} {}", UNITS[unit])
-    }
+    format_units(size, 1000.0, &UNITS)
 }
 
 fn format_created(created: Option<i64>) -> String {
