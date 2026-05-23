@@ -20,7 +20,7 @@ const DOCKER_HUB_AUTH_KEYS: &[&str] = &[
     "index.docker.io",
     "docker.io",
 ];
-const CREDENTIAL_HELPER_TIMEOUT: Duration = Duration::from_secs(15);
+const CREDENTIAL_HELPER_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone)]
 pub enum Credentials {
