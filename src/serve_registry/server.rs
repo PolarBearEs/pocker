@@ -315,7 +315,9 @@ async fn fetch_manifest(
         .save_reference(&StoredReference {
             reference: reference.normalized(),
             manifest: raw.descriptor.clone(),
-            config_digest: manifest_config_digest(&raw.bytes).unwrap_or_default(),
+            config_digest: manifest_summary(&raw.bytes)
+                .config_digest
+                .unwrap_or_default(),
         })
         .await?;
     Ok(raw.descriptor)
@@ -428,8 +430,9 @@ async fn blob_path_and_size(store: &Store, digest: &str) -> Result<(PathBuf, u64
 async fn manifest_descriptor_from_blob(store: &Store, digest: &str) -> Result<Descriptor> {
     let path = store.blob_path(digest)?;
     let bytes = tokio::fs::read(&path).await?;
+    let summary = manifest_summary(&bytes);
     Ok(Descriptor {
-        media_type: manifest_media_type(&bytes).unwrap_or_default(),
+        media_type: summary.media_type.unwrap_or_default(),
         digest: digest.to_string(),
         size: bytes.len() as i64,
         platform: Some(Platform::host()),
@@ -437,21 +440,27 @@ async fn manifest_descriptor_from_blob(store: &Store, digest: &str) -> Result<De
     })
 }
 
-fn manifest_media_type(bytes: &[u8]) -> Option<String> {
-    serde_json::from_slice::<serde_json::Value>(bytes)
-        .ok()?
-        .get("mediaType")?
-        .as_str()
-        .map(ToString::to_string)
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ManifestSummary {
+    media_type: Option<String>,
+    config_digest: Option<String>,
 }
 
-fn manifest_config_digest(bytes: &[u8]) -> Option<String> {
-    serde_json::from_slice::<serde_json::Value>(bytes)
-        .ok()?
-        .get("config")?
-        .get("digest")?
-        .as_str()
-        .map(ToString::to_string)
+fn manifest_summary(bytes: &[u8]) -> ManifestSummary {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+        return ManifestSummary::default();
+    };
+    ManifestSummary {
+        media_type: value
+            .get("mediaType")
+            .and_then(|value| value.as_str())
+            .map(ToString::to_string),
+        config_digest: value
+            .get("config")
+            .and_then(|value| value.get("digest"))
+            .and_then(|value| value.as_str())
+            .map(ToString::to_string),
+    }
 }
 
 #[cfg(test)]
@@ -465,7 +474,10 @@ mod tests {
     use tokio::net::TcpListener;
     use tokio::sync::Semaphore;
 
-    use super::{ServeState, is_supported_digest_reference, run_server, split_route};
+    use super::{
+        ManifestSummary, ServeState, is_supported_digest_reference, manifest_summary, run_server,
+        split_route,
+    };
     use crate::auth::AuthResolver;
     use crate::platform::Platform;
     use crate::pull::{BlobDownloadLocks, PullContext, PullOptions, Puller};
@@ -651,6 +663,24 @@ mod tests {
 
         assert_eq!(repository, "registry.test/team/manifests/app");
         assert_eq!(reference, "latest");
+    }
+
+    #[test]
+    fn manifest_summary_reads_media_type_and_config_digest() {
+        let summary = manifest_summary(
+            br#"{"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}"#,
+        );
+
+        assert_eq!(
+            summary,
+            ManifestSummary {
+                media_type: Some("application/vnd.oci.image.manifest.v1+json".into()),
+                config_digest: Some(
+                    "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                        .into()
+                ),
+            }
+        );
     }
 
     #[tokio::test]
