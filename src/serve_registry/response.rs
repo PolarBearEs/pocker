@@ -4,6 +4,7 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use crate::error::Result;
+use crate::registry::OCTET_STREAM_MEDIA_TYPE;
 
 pub(super) enum RegistryBody {
     Empty,
@@ -118,8 +119,7 @@ pub(super) async fn write_response(
     stream: &mut TcpStream,
     response: RegistryResponse,
 ) -> Result<()> {
-    let content_type =
-        safe_header_value(&response.content_type).unwrap_or("application/octet-stream");
+    let content_type = safe_header_value(&response.content_type).unwrap_or(OCTET_STREAM_MEDIA_TYPE);
     let mut headers = format!(
         "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n",
         response.status, response.reason, content_type, response.content_length
