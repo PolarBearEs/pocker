@@ -1,10 +1,14 @@
 use std::path::PathBuf;
+use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::time::timeout;
 
 use crate::error::Result;
 use crate::registry::OCTET_STREAM_MEDIA_TYPE;
+
+const RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_secs(300);
 
 pub(super) enum RegistryBody {
     Empty,
@@ -119,6 +123,17 @@ pub(super) async fn write_response(
     stream: &mut TcpStream,
     response: RegistryResponse,
 ) -> Result<()> {
+    timeout(
+        RESPONSE_WRITE_TIMEOUT,
+        write_response_inner(stream, response),
+    )
+    .await
+    .map_err(|_| {
+        crate::error::DockerPullError::BadResponse("cache registry response timed out".into())
+    })?
+}
+
+async fn write_response_inner(stream: &mut TcpStream, response: RegistryResponse) -> Result<()> {
     let content_type = safe_header_value(&response.content_type).unwrap_or(OCTET_STREAM_MEDIA_TYPE);
     let mut headers = format!(
         "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n",
