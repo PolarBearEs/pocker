@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -223,32 +224,13 @@ async fn manifest_response(
         Err(error) => return RegistryResponse::text(400, "Bad Request", error.to_string()),
     };
 
-    let normalized = decoded.normalized();
-    if let Ok(Some(record)) = state.store.load_reference(&normalized).await {
-        return serve_manifest_blob(&state, &record.manifest, request.method == "HEAD").await;
-    }
-
-    if let Ok(path) = state.store.blob_path(reference)
-        && path.exists()
-    {
-        let descriptor = match manifest_descriptor_from_blob(&state.store, reference).await {
-            Ok(descriptor) => descriptor,
-            Err(error) => {
-                return RegistryResponse::text(500, "Internal Server Error", error.to_string());
-            }
-        };
-        return serve_manifest_blob(&state, &descriptor, request.method == "HEAD").await;
-    }
-
-    if !state.pull_missing {
-        return RegistryResponse::empty(404, "Not Found");
-    }
-
-    match fetch_manifest(&state, &decoded, reference).await {
-        Ok(descriptor) => serve_manifest_blob(&state, &descriptor, request.method == "HEAD").await,
-        Err(DockerPullError::ManifestNotFound) => RegistryResponse::empty(404, "Not Found"),
-        Err(error) => RegistryResponse::text(502, "Bad Gateway", error.to_string()),
-    }
+    cached_or_fetched(
+        cached_manifest_response(&state, &decoded, reference, request.method == "HEAD").await,
+        state.pull_missing,
+        || fetch_manifest_response(&state, &decoded, reference, request.method == "HEAD"),
+        |error| matches!(error, DockerPullError::ManifestNotFound),
+    )
+    .await
 }
 
 async fn blob_response(
@@ -262,40 +244,119 @@ async fn blob_response(
         Err(error) => return RegistryResponse::text(400, "Bad Request", error.to_string()),
     };
 
-    if let Ok((path, size)) = blob_path_and_size(&state.store, digest).await {
-        return RegistryResponse::file(
-            200,
-            "OK",
-            OCTET_STREAM_MEDIA_TYPE.to_string(),
-            path,
-            size,
-            request.method == "HEAD",
-        )
-        .with_digest(digest)
-        .with_range(request.range.as_deref());
+    cached_or_fetched(
+        cached_blob_response(&state, digest, request).await,
+        state.pull_missing,
+        || fetch_blob_response(&state, &decoded, digest, request),
+        |error| matches!(error, DockerPullError::BlobNotFound(_)),
+    )
+    .await
+}
+
+async fn cached_or_fetched<F, Fut, IsNotFound>(
+    cached: Result<Option<RegistryResponse>>,
+    pull_missing: bool,
+    fetch: F,
+    is_not_found: IsNotFound,
+) -> RegistryResponse
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<RegistryResponse>>,
+    IsNotFound: Fn(&DockerPullError) -> bool,
+{
+    match cached {
+        Ok(Some(response)) => return response,
+        Ok(None) => {}
+        Err(error) => {
+            return RegistryResponse::text(500, "Internal Server Error", error.to_string());
+        }
     }
 
-    if !state.pull_missing {
+    if !pull_missing {
         return RegistryResponse::empty(404, "Not Found");
     }
 
-    match fetch_blob(&state, &decoded, digest).await {
-        Ok(()) => match blob_path_and_size(&state.store, digest).await {
-            Ok((path, size)) => RegistryResponse::file(
-                200,
-                "OK",
-                OCTET_STREAM_MEDIA_TYPE.to_string(),
-                path,
-                size,
-                request.method == "HEAD",
-            )
-            .with_digest(digest)
-            .with_range(request.range.as_deref()),
-            Err(error) => RegistryResponse::text(500, "Internal Server Error", error.to_string()),
-        },
-        Err(DockerPullError::BlobNotFound(_)) => RegistryResponse::empty(404, "Not Found"),
+    match fetch().await {
+        Ok(response) => response,
+        Err(error) if is_not_found(&error) => RegistryResponse::empty(404, "Not Found"),
         Err(error) => RegistryResponse::text(502, "Bad Gateway", error.to_string()),
     }
+}
+
+async fn cached_manifest_response(
+    state: &ServeState,
+    reference: &ImageReference,
+    requested_reference: &str,
+    headers_only: bool,
+) -> Result<Option<RegistryResponse>> {
+    let normalized = reference.normalized();
+    if let Some(record) = state.store.load_reference(&normalized).await? {
+        return Ok(Some(
+            serve_manifest_blob(state, &record.manifest, headers_only).await,
+        ));
+    }
+
+    let Ok(path) = state.store.blob_path(requested_reference) else {
+        return Ok(None);
+    };
+    if path.exists() {
+        let descriptor = manifest_descriptor_from_blob(&state.store, requested_reference).await?;
+        return Ok(Some(
+            serve_manifest_blob(state, &descriptor, headers_only).await,
+        ));
+    }
+
+    Ok(None)
+}
+
+async fn fetch_manifest_response(
+    state: &ServeState,
+    reference: &ImageReference,
+    requested_reference: &str,
+    headers_only: bool,
+) -> Result<RegistryResponse> {
+    let descriptor = fetch_manifest(state, reference, requested_reference).await?;
+    Ok(serve_manifest_blob(state, &descriptor, headers_only).await)
+}
+
+async fn cached_blob_response(
+    state: &ServeState,
+    digest: &str,
+    request: &Request,
+) -> Result<Option<RegistryResponse>> {
+    let Ok((path, size)) = blob_path_and_size(&state.store, digest).await else {
+        return Ok(None);
+    };
+    Ok(Some(blob_file_response(path, size, digest, request)))
+}
+
+async fn fetch_blob_response(
+    state: &ServeState,
+    reference: &ImageReference,
+    digest: &str,
+    request: &Request,
+) -> Result<RegistryResponse> {
+    fetch_blob(state, reference, digest).await?;
+    let (path, size) = blob_path_and_size(&state.store, digest).await?;
+    Ok(blob_file_response(path, size, digest, request))
+}
+
+fn blob_file_response(
+    path: PathBuf,
+    size: u64,
+    digest: &str,
+    request: &Request,
+) -> RegistryResponse {
+    RegistryResponse::file(
+        200,
+        "OK",
+        OCTET_STREAM_MEDIA_TYPE.to_string(),
+        path,
+        size,
+        request.method == "HEAD",
+    )
+    .with_digest(digest)
+    .with_range(request.range.as_deref())
 }
 
 async fn fetch_manifest(
