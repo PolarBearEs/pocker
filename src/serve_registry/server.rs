@@ -2,7 +2,7 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use reqwest::header::RANGE;
 use tokio::io::AsyncReadExt;
@@ -68,13 +68,19 @@ pub(crate) async fn serve_listener(
     shutdown: Option<oneshot::Receiver<()>>,
 ) -> Result<()> {
     let state = Arc::new(ServeState {
-        store: config.store,
-        registry: config.registry,
+        store: Arc::clone(&config.store),
+        registry: Arc::clone(&config.registry),
         pull_missing: config.pull_missing,
-        blob_retry_limit: config.blob_retry_limit,
-        quiet: config.quiet,
         downloads: Arc::new(Semaphore::new(config.concurrency)),
-        blob_locks: Arc::new(BlobDownloadLocks::default()),
+        pull_context: Arc::new(PullContext {
+            store: config.store,
+            registry: config.registry,
+            stop: Arc::new(AtomicBool::new(false)),
+            ui: Arc::new(Ui::new(config.quiet, false)),
+            blob_retry_limit: config.blob_retry_limit,
+            blob_locks: Arc::new(BlobDownloadLocks::default()),
+            daemon_layer_cache: None,
+        }),
     });
     run_server(listener, state, shutdown).await
 }
@@ -99,7 +105,10 @@ async fn run_server(
                 } else {
                     std::future::pending::<()>().await;
                 }
-            } => break,
+            } => {
+                state.pull_context.stop.store(true, Ordering::SeqCst);
+                break;
+            },
         }
     }
     Ok(())
@@ -109,10 +118,8 @@ struct ServeState {
     store: Arc<Store>,
     registry: Arc<RegistryClient>,
     pull_missing: bool,
-    blob_retry_limit: Option<u32>,
-    quiet: bool,
     downloads: Arc<Semaphore>,
-    blob_locks: Arc<BlobDownloadLocks>,
+    pull_context: Arc<PullContext>,
 }
 
 #[derive(Debug)]
@@ -415,16 +422,7 @@ async fn fetch_blob(state: &ServeState, reference: &ImageReference, digest: &str
         platform: None,
         annotations: None,
     };
-    let context = PullContext {
-        store: Arc::clone(&state.store),
-        registry: Arc::clone(&state.registry),
-        stop: Arc::new(AtomicBool::new(false)),
-        ui: Arc::new(Ui::new(state.quiet, false)),
-        blob_retry_limit: state.blob_retry_limit,
-        blob_locks: Arc::clone(&state.blob_locks),
-        daemon_layer_cache: None,
-    };
-    download::download_blob(&context, reference, descriptor).await
+    download::download_blob(&state.pull_context, reference, descriptor).await
 }
 
 async fn serve_manifest_blob(
@@ -979,13 +977,19 @@ mod tests {
             Some(0),
         ));
         let state = Arc::new(ServeState {
-            store,
-            registry,
+            store: Arc::clone(&store),
+            registry: Arc::clone(&registry),
             pull_missing,
-            blob_retry_limit: Some(1),
-            quiet: true,
             downloads: Arc::new(Semaphore::new(1)),
-            blob_locks: Arc::new(BlobDownloadLocks::default()),
+            pull_context: Arc::new(PullContext {
+                store,
+                registry,
+                stop: Arc::new(AtomicBool::new(false)),
+                ui: Arc::new(Ui::new(true, false)),
+                blob_retry_limit: Some(1),
+                blob_locks: Arc::new(BlobDownloadLocks::default()),
+                daemon_layer_cache: None,
+            }),
         });
         tokio::spawn(async move {
             let _ = run_server(listener, state, None).await;
