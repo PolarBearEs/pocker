@@ -38,8 +38,6 @@ pub(crate) struct ManifestEnvelope {
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct ImageManifest {
-    #[serde(rename = "schemaVersion")]
-    pub(crate) _schema_version: u32,
     #[serde(rename = "mediaType", default)]
     pub(crate) media_type: String,
     pub(crate) config: Descriptor,
@@ -48,10 +46,6 @@ pub(crate) struct ImageManifest {
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct ImageIndex {
-    #[serde(rename = "schemaVersion")]
-    pub(crate) _schema_version: u32,
-    #[serde(rename = "mediaType", default)]
-    pub(crate) _media_type: String,
     pub(crate) manifests: Vec<Descriptor>,
 }
 
