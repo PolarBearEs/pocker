@@ -333,12 +333,7 @@ impl Fixture {
 
     fn build_with_layer_algorithm(algorithm: &str) -> Self {
         let layer_bytes = b"fake layer payload".to_vec();
-        let layer_digest = match algorithm {
-            "sha256" => sha256_hex(&layer_bytes),
-            "sha384" => sha384_hex(&layer_bytes),
-            "sha512" => sha512_hex(&layer_bytes),
-            other => panic!("unsupported test digest algorithm {other}"),
-        };
+        let layer_digest = digest_hex(algorithm, &layer_bytes);
         Self::build_with_layer_digest(format!("{algorithm}:{layer_digest}"))
     }
 
@@ -375,19 +370,20 @@ impl Fixture {
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    hex::encode(hasher.finalize())
+    digest_hex("sha256", bytes)
 }
 
-fn sha384_hex(bytes: &[u8]) -> String {
-    let mut hasher = Sha384::new();
-    hasher.update(bytes);
-    hex::encode(hasher.finalize())
+fn digest_hex(algorithm: &str, bytes: &[u8]) -> String {
+    match algorithm {
+        "sha256" => hash_hex::<Sha256>(bytes),
+        "sha384" => hash_hex::<Sha384>(bytes),
+        "sha512" => hash_hex::<Sha512>(bytes),
+        other => panic!("unsupported test digest algorithm {other}"),
+    }
 }
 
-fn sha512_hex(bytes: &[u8]) -> String {
-    let mut hasher = Sha512::new();
+fn hash_hex<D: Digest>(bytes: &[u8]) -> String {
+    let mut hasher = D::new();
     hasher.update(bytes);
     hex::encode(hasher.finalize())
 }
