@@ -93,8 +93,8 @@ impl DockerDaemon {
                 "POST",
                 &format!(
                     "/images/create?fromImage={}&tag={}",
-                    encode_query_value(repository),
-                    encode_query_value(tag)
+                    encode_query_value(&repository),
+                    encode_query_value(&tag)
                 ),
                 None,
             )
@@ -115,8 +115,8 @@ impl DockerDaemon {
                 &format!(
                     "/images/{}/tag?repo={}&tag={}",
                     encode_path_segment(source),
-                    encode_query_value(repository),
-                    encode_query_value(tag)
+                    encode_query_value(&repository),
+                    encode_query_value(&tag)
                 ),
                 None,
             )

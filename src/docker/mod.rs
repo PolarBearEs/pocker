@@ -163,22 +163,18 @@ fn encode_query_value(value: &str) -> String {
     utf8_percent_encode(value, QUERY_VALUE_ENCODE_SET).to_string()
 }
 
-fn split_tagged_reference(reference: &str) -> Result<(&str, &str)> {
-    if reference.contains('@') {
+fn split_tagged_reference(reference: &str) -> Result<(String, String)> {
+    let reference = ImageReference::parse(reference)?;
+    let ReferenceTarget::Tag(tag) = &reference.target else {
         return Err(DockerPullError::InvalidInput(format!(
-            "image reference `{reference}` is not a tagged reference"
+            "image reference `{}` is not a tagged reference",
+            reference.display_name()
         )));
-    }
-    let slash = reference.rfind('/');
-    let colon = reference.rfind(':').ok_or_else(|| {
-        DockerPullError::InvalidInput(format!("image reference `{reference}` is missing a tag"))
-    })?;
-    if slash.is_some_and(|slash| colon < slash) {
-        return Err(DockerPullError::InvalidInput(format!(
-            "image reference `{reference}` is missing a tag"
-        )));
-    }
-    Ok((&reference[..colon], &reference[colon + 1..]))
+    };
+
+    let mut repository = reference.display_name();
+    repository.truncate(repository.len() - tag.len() - 1);
+    Ok((repository, tag.clone()))
 }
 
 fn ensure_json_stream_success(body: String, action: &str) -> Result<()> {
@@ -213,10 +209,12 @@ mod tests {
     #[cfg(unix)]
     use std::path::Path;
 
+    use super::layers::ordered_unique_image_ids;
     use super::transport::windows::{decode_chunked_body, header_value, parse_response_head};
     use super::transport::{DEFAULT_DOCKER_HOST, DockerEndpoint, docker_endpoint_from_host};
-    use super::{daemon_inspect_target, encode_path_segment, encode_query_value};
-    use super::{layers::ordered_unique_image_ids, split_tagged_reference};
+    use super::{
+        daemon_inspect_target, encode_path_segment, encode_query_value, split_tagged_reference,
+    };
     use crate::reference::ImageReference;
 
     #[test]
@@ -271,7 +269,10 @@ mod tests {
         assert_eq!(
             split_tagged_reference("127.0.0.1:5000/pocker/image:latest")
                 .expect("reference should split"),
-            ("127.0.0.1:5000/pocker/image", "latest")
+            (
+                "127.0.0.1:5000/pocker/image".to_string(),
+                "latest".to_string()
+            )
         );
     }
 
@@ -362,5 +363,22 @@ mod tests {
             encode_query_value("example.com/acme/app&name=value+tag:latest"),
             "example.com%2Facme%2Fapp%26name%3Dvalue%2Btag%3Alatest"
         );
+    }
+
+    #[test]
+    fn tagged_reference_parts_use_parsed_reference() {
+        let (repository, tag) = super::split_tagged_reference("docker.io/library/alpine:3.20")
+            .expect("tagged reference should parse");
+
+        assert_eq!(repository, "alpine");
+        assert_eq!(tag, "3.20");
+    }
+
+    #[test]
+    fn tagged_reference_parts_reject_digest_references() {
+        super::split_tagged_reference(
+            "ghcr.io/acme/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+        .expect_err("digest reference is not a tagged target");
     }
 }
