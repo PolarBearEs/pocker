@@ -387,18 +387,29 @@ services:
         ));
     }
 
-    #[test]
-    fn interpolation_rejects_excessive_nesting() {
+    fn nested_interpolation(depth: usize) -> String {
         let mut text = String::new();
-        for _ in 0..40 {
+        for _ in 0..depth {
             text.push_str("${UNSET:-");
         }
         text.push_str("fallback");
-        for _ in 0..40 {
+        for _ in 0..depth {
             text.push('}');
         }
+        text
+    }
 
-        let error = interpolate(&text, &HashMap::new())
+    #[test]
+    fn interpolation_allows_depth_below_limit() {
+        let interpolated = interpolate(&nested_interpolation(31), &HashMap::new())
+            .expect("nesting below the interpolation limit should succeed");
+
+        assert_eq!(interpolated, "fallback");
+    }
+
+    #[test]
+    fn interpolation_rejects_excessive_nesting() {
+        let error = interpolate(&nested_interpolation(32), &HashMap::new())
             .expect_err("excessive nested interpolation should fail");
 
         assert!(matches!(

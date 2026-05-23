@@ -13,7 +13,7 @@ fn interpolate_with_depth(
     values: &HashMap<String, String>,
     depth: usize,
 ) -> Result<String> {
-    if depth > MAX_INTERPOLATION_DEPTH {
+    if depth >= MAX_INTERPOLATION_DEPTH {
         return Err(ComposeError::InvalidInput(
             "compose variable interpolation is nested too deeply".into(),
         ));
