@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -6,10 +5,7 @@ use std::sync::atomic::AtomicBool;
 use tokio::task::JoinSet;
 
 use crate::auth::{AuthResolver, read_credentials};
-use crate::cli::{
-    AuthArgs, CacheSourceArgs, ComposePullArgs, ImageParallelArgs, ImportArgs, PullArgs,
-    PullDownloadArgs, PullOutputArgs, RegistryArgs, RetryArgs,
-};
+use crate::cli::{ComposePullArgs, PullArgs, PullCommonArgs};
 use crate::error::{DockerPullError, Result};
 use crate::http::build_http_client;
 use crate::platform::Platform;
@@ -46,35 +42,15 @@ impl PullRequestOptions {
     pub(crate) fn from_pull_args(args: PullArgs) -> (Vec<String>, Self) {
         (
             args.references,
-            Self::from_args(PullOptionArgs {
-                download: args.download,
-                image_parallel: args.image_parallel,
-                retry: args.retry,
-                import: args.import,
-                registry: args.registry,
-                auth: args.auth,
-                output: args.output,
-                cache: args.cache,
-                no_animations: args.no_animations,
-            }),
+            Self::from_args(args.common, args.no_animations),
         )
     }
 
     pub(crate) fn from_compose_pull_args(args: ComposePullArgs) -> Self {
-        Self::from_args(PullOptionArgs {
-            download: args.download,
-            image_parallel: args.image_parallel,
-            retry: args.retry,
-            import: args.import,
-            registry: args.registry,
-            auth: args.auth,
-            output: args.output,
-            cache: args.cache,
-            no_animations: true,
-        })
+        Self::from_args(args.common, true)
     }
 
-    fn from_args(args: PullOptionArgs) -> Self {
+    fn from_args(args: PullCommonArgs, no_animations: bool) -> Self {
         Self {
             platform: args.download.platform,
             concurrency: args.download.concurrency,
@@ -98,23 +74,11 @@ impl PullRequestOptions {
             username: args.auth.username,
             password_stdin: args.auth.password_stdin,
             quiet: args.output.quiet,
-            no_animations: args.no_animations,
+            no_animations,
             cache_from: args.cache.cache_from,
             cache_only: args.cache.cache_only,
         }
     }
-}
-
-struct PullOptionArgs {
-    download: PullDownloadArgs,
-    image_parallel: ImageParallelArgs,
-    retry: RetryArgs,
-    import: ImportArgs,
-    registry: RegistryArgs,
-    auth: AuthArgs,
-    output: PullOutputArgs,
-    cache: CacheSourceArgs,
-    no_animations: bool,
 }
 
 pub(crate) fn retry_limit(
@@ -147,7 +111,7 @@ pub(crate) async fn pull_references(
     references: Vec<String>,
     request: PullRequestOptions,
 ) -> Result<()> {
-    let references = unique_references(references);
+    let references = pocker_compose::unique_images(&references);
     let store = Arc::new(Store::open_active(cache_dir.to_path_buf()).await?);
     let quiet = global_quiet || request.quiet;
     let platform = request
@@ -261,36 +225,4 @@ async fn pull_reference_with_group(state: SharedPullState, reference: String) ->
         daemon_layer_cache: state.daemon_layer_cache,
     };
     Puller::new(context).pull(reference, state.options).await
-}
-
-fn unique_references(references: Vec<String>) -> Vec<String> {
-    let mut seen = HashSet::new();
-    let mut unique = Vec::new();
-    for reference in references {
-        if seen.insert(reference.clone()) {
-            unique.push(reference);
-        }
-    }
-    unique
-}
-
-#[cfg(test)]
-mod tests {
-    use super::unique_references;
-
-    #[test]
-    fn unique_references_preserves_first_seen_order() {
-        let references = unique_references(vec![
-            "alpine:latest".to_string(),
-            "busybox:latest".to_string(),
-            "alpine:latest".to_string(),
-            "ghcr.io/acme/app:latest".to_string(),
-            "busybox:latest".to_string(),
-        ]);
-
-        assert_eq!(
-            references,
-            vec!["alpine:latest", "busybox:latest", "ghcr.io/acme/app:latest"]
-        );
-    }
 }

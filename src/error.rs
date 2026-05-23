@@ -22,12 +22,8 @@ pub enum DockerPullError {
     Unauthorized(String),
     #[error("bad registry response: {0}")]
     BadResponse(String),
-    #[error("digest mismatch for {digest}: expected {expected}, got {actual}")]
-    DigestMismatch {
-        digest: String,
-        expected: String,
-        actual: String,
-    },
+    #[error("digest mismatch: expected {expected}, got {actual}")]
+    DigestMismatch { expected: String, actual: String },
     #[error("download interrupted")]
     Interrupted,
     #[error("missing blob file `{0}` at `{1}`")]

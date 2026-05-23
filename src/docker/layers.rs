@@ -345,7 +345,6 @@ fn copy_archive_entry_with_digest<R: Read>(
     file.sync_data()?;
     if actual_digest != expected_digest {
         return Err(DockerPullError::DigestMismatch {
-            digest: expected_digest.to_string(),
             expected: expected_digest.to_string(),
             actual: actual_digest,
         });

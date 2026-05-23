@@ -43,14 +43,17 @@ pub async fn run() -> Result<()> {
                 let resolved = compose::select_services(&resolved, &pull_args.services)?;
                 if !(resolved.skipped_build_only.is_empty()
                     || cli.global.quiet
-                    || pull_args.output.quiet)
+                    || pull_args.common.output.quiet)
                 {
                     eprintln!(
                         "warning: skipping build-only compose services without image: {}",
                         resolved.skipped_build_only.join(", ")
                     );
                 }
-                print_compose_pull_plan(&resolved, cli.global.quiet || pull_args.output.quiet);
+                print_compose_pull_plan(
+                    &resolved,
+                    cli.global.quiet || pull_args.common.output.quiet,
+                );
                 let images = compose::unique_images(&resolved.images);
                 let request = PullRequestOptions::from_compose_pull_args(*pull_args);
                 pull_references(&cli.global.cache_dir, cli.global.quiet, images, request).await?;

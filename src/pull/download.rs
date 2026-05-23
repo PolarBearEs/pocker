@@ -39,28 +39,26 @@ pub async fn download_blob(
         .store
         .prepare_download(&descriptor, expected_size)
         .await?;
-    let mut offset = plan.durable_offset;
+    let mut progress = DownloadProgress::new(plan.durable_offset);
     context
         .ui
-        .start_layer_download(&descriptor.digest, expected_size, offset);
-    let mut bytes_since_checkpoint = 0_u64;
-    let mut last_checkpoint = Instant::now();
+        .start_layer_download(&descriptor.digest, expected_size, progress.offset);
     let mut retries = 0_u32;
 
     loop {
         if context.stop.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(DockerPullError::Interrupted);
         }
-        if offset >= expected_size {
+        if progress.offset >= expected_size {
             break;
         }
 
         let response = context
             .registry
-            .get_blob(reference, &descriptor.digest, offset)
+            .get_blob(reference, &descriptor.digest, progress.offset)
             .await?;
         let status = response.status();
-        if status == StatusCode::OK && offset > 0 {
+        if status == StatusCode::OK && progress.offset > 0 {
             let delay = jittered_backoff_delay(retries);
             retries = register_retry(
                 context,
@@ -73,9 +71,14 @@ pub async fn download_blob(
                 "registry ignored range request for {}, restarting blob",
                 descriptor.digest
             );
-            reset_download_state(context, &descriptor, expected_size, &mut plan, &mut offset)
-                .await?;
-            reset_checkpoint_tracking(&mut bytes_since_checkpoint, &mut last_checkpoint);
+            reset_download_state(
+                context,
+                &descriptor,
+                expected_size,
+                &mut plan,
+                &mut progress,
+            )
+            .await?;
             tokio::time::sleep(delay).await;
             continue;
         }
@@ -92,18 +95,22 @@ pub async fn download_blob(
                 .store
                 .reset_partial(&descriptor.digest, expected_size)
                 .await?;
-            reset_download_progress(context, &descriptor.digest, expected_size, &mut offset);
-            reset_checkpoint_tracking(&mut bytes_since_checkpoint, &mut last_checkpoint);
+            progress.reset(context, &descriptor.digest, expected_size);
             tokio::time::sleep(delay).await;
             continue;
         }
-        validate_blob_response_status(status, response.headers(), offset, &descriptor.digest)?;
+        validate_blob_response_status(
+            status,
+            response.headers(),
+            progress.offset,
+            &descriptor.digest,
+        )?;
 
         let mut file = OpenOptions::new()
             .create(true)
-            .append(offset > 0)
+            .append(progress.offset > 0)
             .write(true)
-            .truncate(offset == 0)
+            .truncate(progress.offset == 0)
             .open(&plan.partial_path)
             .await?;
         let mut stream = response.bytes_stream();
@@ -113,22 +120,16 @@ pub async fn download_blob(
             match chunk {
                 Ok(chunk) => {
                     file.write_all(&chunk).await?;
-                    offset += chunk.len() as u64;
-                    bytes_since_checkpoint += chunk.len() as u64;
+                    progress.advance(chunk.len() as u64);
                     context
                         .ui
                         .advance_layer_download(&descriptor.digest, chunk.len() as u64);
-                    if bytes_since_checkpoint >= CHECKPOINT_BYTES
-                        || last_checkpoint.elapsed() >= CHECKPOINT_INTERVAL
-                    {
+                    if progress.should_checkpoint() {
                         file.flush().await?;
                         file.sync_data().await?;
-                        context
-                            .store
-                            .checkpoint_download(&descriptor.digest, offset, expected_size)
+                        progress
+                            .checkpoint(context, &descriptor.digest, expected_size)
                             .await?;
-                        bytes_since_checkpoint = 0;
-                        last_checkpoint = Instant::now();
                     }
                 }
                 Err(error) => {
@@ -145,7 +146,7 @@ pub async fn download_blob(
                     file.sync_data().await?;
                     context
                         .store
-                        .checkpoint_download(&descriptor.digest, offset, expected_size)
+                        .checkpoint_download(&descriptor.digest, progress.offset, expected_size)
                         .await?;
                     tokio::time::sleep(delay).await;
                     stream_failed = true;
@@ -160,10 +161,18 @@ pub async fn download_blob(
 
         file.flush().await?;
         file.sync_data().await?;
-        context
-            .store
-            .checkpoint_download(&descriptor.digest, offset, expected_size)
+        progress
+            .checkpoint(context, &descriptor.digest, expected_size)
             .await?;
+        if let Some(detail) = premature_eof_detail(progress.offset, expected_size) {
+            let delay = jittered_backoff_delay(retries);
+            retries = register_retry(context, &descriptor.digest, retries, detail, delay)?;
+            warn!(
+                "stream ended early for {} at byte {} of {}",
+                descriptor.digest, progress.offset, expected_size
+            );
+            tokio::time::sleep(delay).await;
+        }
     }
 
     context
@@ -179,6 +188,61 @@ pub async fn download_blob(
     }
     context.ui.finish_layer_download(&descriptor.digest);
     Ok(())
+}
+
+struct DownloadProgress {
+    offset: u64,
+    bytes_since_checkpoint: u64,
+    last_checkpoint: Instant,
+}
+
+impl DownloadProgress {
+    fn new(offset: u64) -> Self {
+        Self {
+            offset,
+            bytes_since_checkpoint: 0,
+            last_checkpoint: Instant::now(),
+        }
+    }
+
+    fn advance(&mut self, bytes: u64) {
+        self.offset += bytes;
+        self.bytes_since_checkpoint += bytes;
+    }
+
+    fn should_checkpoint(&self) -> bool {
+        self.bytes_since_checkpoint >= CHECKPOINT_BYTES
+            || self.last_checkpoint.elapsed() >= CHECKPOINT_INTERVAL
+    }
+
+    async fn checkpoint(
+        &mut self,
+        context: &PullContext,
+        digest: &str,
+        expected_size: u64,
+    ) -> Result<()> {
+        context
+            .store
+            .checkpoint_download(digest, self.offset, expected_size)
+            .await?;
+        self.bytes_since_checkpoint = 0;
+        self.last_checkpoint = Instant::now();
+        Ok(())
+    }
+
+    fn reset(&mut self, context: &PullContext, digest: &str, expected_size: u64) {
+        self.offset = 0;
+        self.bytes_since_checkpoint = 0;
+        self.last_checkpoint = Instant::now();
+        context
+            .ui
+            .start_layer_download(digest, expected_size, self.offset);
+    }
+}
+
+fn premature_eof_detail(offset: u64, expected_size: u64) -> Option<String> {
+    (offset < expected_size)
+        .then(|| format!("download ended at byte {offset} before expected size {expected_size}"))
 }
 
 fn validate_blob_response_status(
@@ -232,7 +296,7 @@ async fn reset_download_state(
     descriptor: &Descriptor,
     expected_size: u64,
     plan: &mut DownloadPlan,
-    offset: &mut u64,
+    progress: &mut DownloadProgress,
 ) -> Result<()> {
     context
         .store
@@ -242,25 +306,8 @@ async fn reset_download_state(
         .store
         .prepare_download(descriptor, expected_size)
         .await?;
-    reset_download_progress(context, &descriptor.digest, expected_size, offset);
+    progress.reset(context, &descriptor.digest, expected_size);
     Ok(())
-}
-
-fn reset_download_progress(
-    context: &PullContext,
-    digest: &str,
-    expected_size: u64,
-    offset: &mut u64,
-) {
-    *offset = 0;
-    context
-        .ui
-        .start_layer_download(digest, expected_size, *offset);
-}
-
-fn reset_checkpoint_tracking(bytes_since_checkpoint: &mut u64, last_checkpoint: &mut Instant) {
-    *bytes_since_checkpoint = 0;
-    *last_checkpoint = Instant::now();
 }
 
 fn register_retry(
@@ -290,7 +337,7 @@ mod tests {
     use reqwest::StatusCode;
     use reqwest::header::{CONTENT_RANGE, HeaderMap, HeaderValue};
 
-    use super::validate_blob_response_status;
+    use super::{DownloadProgress, premature_eof_detail, validate_blob_response_status};
     use crate::error::DockerPullError;
 
     #[test]
@@ -356,5 +403,25 @@ mod tests {
         headers.insert(CONTENT_RANGE, HeaderValue::from_static("bytes 42-99/100"));
         validate_blob_response_status(StatusCode::PARTIAL_CONTENT, &headers, 42, "sha256:deadbeef")
             .expect("resumed downloads should accept matching 206 responses");
+    }
+
+    #[test]
+    fn premature_eof_registers_retry_detail_when_short() {
+        assert_eq!(
+            premature_eof_detail(42, 100).as_deref(),
+            Some("download ended at byte 42 before expected size 100")
+        );
+        assert!(premature_eof_detail(100, 100).is_none());
+    }
+
+    #[test]
+    fn download_progress_tracks_offsets_and_checkpoints() {
+        let mut progress = DownloadProgress::new(10);
+
+        progress.advance(5);
+
+        assert_eq!(progress.offset, 15);
+        assert_eq!(progress.bytes_since_checkpoint, 5);
+        assert!(!progress.should_checkpoint());
     }
 }

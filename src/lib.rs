@@ -19,6 +19,7 @@ mod serve_registry;
 mod signal;
 mod store;
 mod ui;
+mod units;
 
 pub use error::{DockerPullError as Error, Result};
 pub use runtime::run;

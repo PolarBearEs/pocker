@@ -30,6 +30,7 @@ struct ComposeProject {
     env: HashMap<String, String>,
     documents: HashMap<PathBuf, ComposeDocument>,
     entry_files: Vec<PathBuf>,
+    merged_services: Vec<Service>,
     project_dir: PathBuf,
 }
 
@@ -41,7 +42,7 @@ struct ComposeDocument {
 
 #[derive(Debug, Clone, Eq, Hash, PartialEq)]
 struct ServiceKey {
-    file: PathBuf,
+    file: Option<PathBuf>,
     source_file: PathBuf,
     name: String,
 }
@@ -65,13 +66,13 @@ pub fn resolve_images(files: &[PathBuf], working_dir: &Path) -> Result<ComposeIm
         env,
         documents: HashMap::new(),
         entry_files: entry_files.clone(),
+        merged_services: Vec::new(),
         project_dir: project_dir.to_path_buf(),
     };
     for file in &entry_files {
         project.load_document(file)?;
     }
 
-    let synthetic_file = PathBuf::from("<merged-compose>");
     let mut merged_services = Vec::new();
     for file in project.entry_files.clone() {
         for service in project.document(&file)?.services.clone() {
@@ -106,21 +107,15 @@ pub fn resolve_images(files: &[PathBuf], working_dir: &Path) -> Result<ComposeIm
         }
     }
 
-    project.documents.insert(
-        synthetic_file.clone(),
-        ComposeDocument {
-            services: merged_services,
-            includes: Vec::new(),
-        },
-    );
+    project.merged_services = merged_services;
 
     let mut images = Vec::new();
     let mut skipped_build_only = Vec::new();
     let mut service_images = Vec::new();
-    let services = project.document(&synthetic_file)?.services.clone();
+    let services = project.merged_services.clone();
     for service in services {
         let key = ServiceKey {
-            file: synthetic_file.clone(),
+            file: None,
             source_file: service.source_file.clone(),
             name: service.name.clone(),
         };
@@ -219,17 +214,24 @@ impl ComposeProject {
     }
 
     fn service(&self, key: &ServiceKey) -> Result<Service> {
-        let document = self.document(&key.file)?;
-        document
-            .services
+        let services = if let Some(file) = &key.file {
+            &self.document(file)?.services
+        } else {
+            &self.merged_services
+        };
+        services
             .iter()
             .find(|service| service.name == key.name)
             .cloned()
             .ok_or_else(|| {
+                let location = key
+                    .file
+                    .as_ref()
+                    .map(|file| file.display().to_string())
+                    .unwrap_or_else(|| "merged compose services".to_string());
                 ComposeError::InvalidInput(format!(
                     "compose service `{}` not found in `{}`",
-                    key.name,
-                    key.file.display()
+                    key.name, location
                 ))
             })
     }
@@ -242,18 +244,24 @@ impl ComposeProject {
             )));
         }
         stack.push(key.clone());
+        let resolved = self.resolve_service_inner(key, stack);
+        stack.pop();
+        resolved
+    }
 
+    fn resolve_service_inner(
+        &self,
+        key: &ServiceKey,
+        stack: &mut Vec<ServiceKey>,
+    ) -> Result<Value> {
         let service = self.service(key)?;
         let Some(extends) = mapping_get(value_mapping(&service.value), "extends") else {
-            stack.pop();
             return Ok(service.value);
         };
         let Some(parent_key) = self.extends_key(key, extends)? else {
-            stack.pop();
             return Ok(service.value);
         };
         let parent = self.resolve_service(&parent_key, stack)?;
-        stack.pop();
 
         Ok(merge_values(parent, service.value))
     }
@@ -282,10 +290,17 @@ impl ComposeProject {
                 absolutize(base, Path::new(&file))
             })
             .transpose_normalize()?
-            .unwrap_or_else(|| key.file.clone());
+            .or_else(|| key.file.clone());
+        let Some(file) = file else {
+            return Ok(Some(ServiceKey {
+                source_file: key.source_file.clone(),
+                file: None,
+                name: service,
+            }));
+        };
         Ok(Some(ServiceKey {
             source_file: file.clone(),
-            file,
+            file: Some(file),
             name: service,
         }))
     }

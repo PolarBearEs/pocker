@@ -111,6 +111,12 @@ pub struct ComposePullArgs {
     #[arg(value_name = "SERVICE", help = "Compose service to pull")]
     pub services: Vec<String>,
     #[command(flatten)]
+    pub common: PullCommonArgs,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct PullCommonArgs {
+    #[command(flatten)]
     pub download: PullDownloadArgs,
     #[command(flatten)]
     pub image_parallel: ImageParallelArgs,
@@ -376,27 +382,13 @@ pub struct PullArgs {
     )]
     pub references: Vec<String>,
     #[command(flatten)]
-    pub download: PullDownloadArgs,
-    #[command(flatten)]
-    pub image_parallel: ImageParallelArgs,
-    #[command(flatten)]
-    pub retry: RetryArgs,
-    #[command(flatten)]
-    pub import: ImportArgs,
-    #[command(flatten)]
-    pub registry: RegistryArgs,
-    #[command(flatten)]
-    pub auth: AuthArgs,
-    #[command(flatten)]
-    pub output: PullOutputArgs,
+    pub common: PullCommonArgs,
     #[arg(
         long,
         help_heading = "Output options",
         help = "Disable animated progress output during pull"
     )]
     pub no_animations: bool,
-    #[command(flatten)]
-    pub cache: CacheSourceArgs,
 }
 
 impl ValueEnum for LoadMode {
@@ -479,7 +471,7 @@ mod tests {
             panic!("expected pull command");
         };
 
-        assert_eq!(args.image_parallel.image_concurrency, 4);
+        assert_eq!(args.common.image_parallel.image_concurrency, 4);
         assert_eq!(args.references, vec!["alpine:latest", "busybox:latest"]);
     }
 
@@ -490,7 +482,7 @@ mod tests {
             panic!("expected pull command");
         };
 
-        assert!(args.output.quiet);
+        assert!(args.common.output.quiet);
     }
 
     #[test]
@@ -500,7 +492,7 @@ mod tests {
             panic!("expected pull command");
         };
 
-        assert_eq!(args.import.load_mode, LoadMode::Registry);
+        assert_eq!(args.common.import.load_mode, LoadMode::Registry);
     }
 
     #[test]
@@ -510,7 +502,7 @@ mod tests {
             panic!("expected pull command");
         };
 
-        assert_eq!(args.retry.blob_retries, Some(32));
+        assert_eq!(args.common.retry.blob_retries, Some(32));
     }
 
     #[test]
@@ -520,7 +512,7 @@ mod tests {
             panic!("expected pull command");
         };
 
-        assert_eq!(args.retry.blob_retries, Some(0));
+        assert_eq!(args.common.retry.blob_retries, Some(0));
     }
 
     #[test]
@@ -530,7 +522,7 @@ mod tests {
             panic!("expected pull command");
         };
 
-        assert!(args.retry.retry_forever);
+        assert!(args.common.retry.retry_forever);
     }
 
     #[test]
@@ -547,8 +539,8 @@ mod tests {
             panic!("expected pull command");
         };
 
-        assert_eq!(args.retry.blob_retries, Some(1));
-        assert!(args.retry.retry_forever);
+        assert_eq!(args.common.retry.blob_retries, Some(1));
+        assert!(args.common.retry.retry_forever);
     }
 
     #[test]
@@ -558,7 +550,7 @@ mod tests {
             panic!("expected pull command");
         };
 
-        assert_eq!(args.retry.request_retries, Some(12));
+        assert_eq!(args.common.retry.request_retries, Some(12));
     }
 
     #[test]
@@ -575,7 +567,11 @@ mod tests {
         };
 
         assert_eq!(
-            args.cache.cache_from.as_ref().map(|url| url.as_str()),
+            args.common
+                .cache
+                .cache_from
+                .as_ref()
+                .map(|url| url.as_str()),
             Some("http://127.0.0.1:5000/")
         );
     }
@@ -594,7 +590,7 @@ mod tests {
             panic!("expected pull command");
         };
 
-        assert!(args.cache.cache_only);
+        assert!(args.common.cache.cache_only);
     }
 
     #[test]
@@ -684,7 +680,7 @@ mod tests {
             panic!("expected pull command");
         };
 
-        assert_eq!(args.retry.request_retries, Some(0));
+        assert_eq!(args.common.retry.request_retries, Some(0));
     }
 
     #[test]
@@ -730,7 +726,7 @@ mod tests {
             panic!("expected compose pull command");
         };
 
-        assert!(pull.output.quiet);
+        assert!(pull.common.output.quiet);
     }
 
     #[test]
@@ -750,8 +746,8 @@ mod tests {
             panic!("expected compose pull command");
         };
 
-        assert_eq!(pull.retry.blob_retries, Some(1));
-        assert!(pull.retry.retry_forever);
+        assert_eq!(pull.common.retry.blob_retries, Some(1));
+        assert!(pull.common.retry.retry_forever);
     }
 
     #[test]
@@ -771,7 +767,7 @@ mod tests {
             panic!("expected compose pull command");
         };
 
-        assert!(pull.cache.cache_only);
+        assert!(pull.common.cache.cache_only);
     }
 
     #[test]

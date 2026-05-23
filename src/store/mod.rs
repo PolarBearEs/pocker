@@ -132,7 +132,6 @@ impl Store {
         let actual_digest = digest_bytes_for_digest(&descriptor.digest, bytes)?;
         if actual_digest != descriptor.digest {
             return Err(DockerPullError::DigestMismatch {
-                digest: descriptor.digest.clone(),
                 expected: descriptor.digest.clone(),
                 actual: actual_digest,
             });
@@ -210,7 +209,6 @@ impl Store {
             };
         if computed != descriptor.digest {
             return Err(DockerPullError::DigestMismatch {
-                digest: descriptor.digest.clone(),
                 expected: descriptor.digest.clone(),
                 actual: computed,
             });
