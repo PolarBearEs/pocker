@@ -5,10 +5,7 @@ use std::sync::atomic::AtomicBool;
 use tokio::task::JoinSet;
 
 use crate::auth::{AuthResolver, read_credentials};
-use crate::cli::{
-    AuthArgs, CacheSourceArgs, ComposePullArgs, ImageParallelArgs, ImportArgs, PullArgs,
-    PullDownloadArgs, PullOutputArgs, RegistryArgs, RetryArgs,
-};
+use crate::cli::{ComposePullArgs, PullArgs, PullCommonArgs};
 use crate::error::{DockerPullError, Result};
 use crate::http::build_http_client;
 use crate::platform::Platform;
@@ -45,35 +42,15 @@ impl PullRequestOptions {
     pub(crate) fn from_pull_args(args: PullArgs) -> (Vec<String>, Self) {
         (
             args.references,
-            Self::from_args(PullOptionArgs {
-                download: args.download,
-                image_parallel: args.image_parallel,
-                retry: args.retry,
-                import: args.import,
-                registry: args.registry,
-                auth: args.auth,
-                output: args.output,
-                cache: args.cache,
-                no_animations: args.no_animations,
-            }),
+            Self::from_args(args.common, args.no_animations),
         )
     }
 
     pub(crate) fn from_compose_pull_args(args: ComposePullArgs) -> Self {
-        Self::from_args(PullOptionArgs {
-            download: args.download,
-            image_parallel: args.image_parallel,
-            retry: args.retry,
-            import: args.import,
-            registry: args.registry,
-            auth: args.auth,
-            output: args.output,
-            cache: args.cache,
-            no_animations: true,
-        })
+        Self::from_args(args.common, true)
     }
 
-    fn from_args(args: PullOptionArgs) -> Self {
+    fn from_args(args: PullCommonArgs, no_animations: bool) -> Self {
         Self {
             platform: args.download.platform,
             concurrency: args.download.concurrency,
@@ -97,23 +74,11 @@ impl PullRequestOptions {
             username: args.auth.username,
             password_stdin: args.auth.password_stdin,
             quiet: args.output.quiet,
-            no_animations: args.no_animations,
+            no_animations,
             cache_from: args.cache.cache_from,
             cache_only: args.cache.cache_only,
         }
     }
-}
-
-struct PullOptionArgs {
-    download: PullDownloadArgs,
-    image_parallel: ImageParallelArgs,
-    retry: RetryArgs,
-    import: ImportArgs,
-    registry: RegistryArgs,
-    auth: AuthArgs,
-    output: PullOutputArgs,
-    cache: CacheSourceArgs,
-    no_animations: bool,
 }
 
 pub(crate) fn retry_limit(
