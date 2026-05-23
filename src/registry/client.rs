@@ -50,6 +50,11 @@ struct RegistryRequest<'a> {
     allow_retry: bool,
 }
 
+struct RegistryAuthContext {
+    token: Option<String>,
+    credentials: Option<Credentials>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RequestMode {
     Direct,
@@ -450,28 +455,8 @@ impl RegistryClient {
         let mut retries = 0_u32;
         let mut auth_retries = 0_u32;
         loop {
-            let token = if mode.uses_registry_auth() {
-                self.token_cache.lock().await.get(&cache_key).cloned()
-            } else {
-                None
-            };
-            let credentials = if mode.uses_registry_auth() {
-                self.auth.resolve(&reference.registry).await?
-            } else {
-                None
-            };
-            let mut builder = self.client.request(request.method.clone(), url.clone());
-            if let Some(accept) = request.accept {
-                builder = builder.header(ACCEPT, accept);
-            }
-            if let Some(range) = request.range {
-                builder = builder.header(RANGE, range);
-            }
-            if let Some(token) = &token {
-                builder = builder.bearer_auth(token);
-            } else if let Some(Credentials::Basic { username, password }) = &credentials {
-                builder = builder.basic_auth(username, Some(password));
-            }
+            let auth = self.auth_context(reference, &cache_key, mode).await?;
+            let builder = self.request_builder(request, &url, &auth);
 
             let response = match builder.send().await {
                 Ok(response) => response,
@@ -494,26 +479,10 @@ impl RegistryClient {
             }
 
             if response.status() == StatusCode::UNAUTHORIZED {
-                if auth_retries >= MAX_AUTH_RETRIES {
-                    return Err(DockerPullError::Unauthorized(format!(
-                        "authentication retry limit exceeded for {}",
-                        reference.normalized()
-                    )));
-                }
-                let challenge = response
-                    .headers()
-                    .get(WWW_AUTHENTICATE)
-                    .cloned()
-                    .ok_or_else(|| DockerPullError::Unauthorized("missing challenge".into()))?;
-                if let Some(token) = self
-                    .refresh_token(challenge, reference, credentials.clone())
+                if self
+                    .refresh_auth_token(response, reference, &cache_key, auth, &mut auth_retries)
                     .await?
                 {
-                    self.token_cache
-                        .lock()
-                        .await
-                        .insert(cache_key.clone(), token);
-                    auth_retries += 1;
                     continue;
                 }
                 return Err(DockerPullError::Unauthorized(reference.normalized()));
@@ -543,6 +512,79 @@ impl RegistryClient {
             debug!("registry {} {}", request.method, url);
             return Ok(response);
         }
+    }
+
+    async fn auth_context(
+        &self,
+        reference: &ImageReference,
+        cache_key: &str,
+        mode: RequestMode,
+    ) -> Result<RegistryAuthContext> {
+        if !mode.uses_registry_auth() {
+            return Ok(RegistryAuthContext {
+                token: None,
+                credentials: None,
+            });
+        }
+
+        Ok(RegistryAuthContext {
+            token: self.token_cache.lock().await.get(cache_key).cloned(),
+            credentials: self.auth.resolve(&reference.registry).await?,
+        })
+    }
+
+    fn request_builder(
+        &self,
+        request: &RegistryRequest<'_>,
+        url: &Url,
+        auth: &RegistryAuthContext,
+    ) -> reqwest::RequestBuilder {
+        let mut builder = self.client.request(request.method.clone(), url.clone());
+        if let Some(accept) = request.accept {
+            builder = builder.header(ACCEPT, accept);
+        }
+        if let Some(range) = request.range {
+            builder = builder.header(RANGE, range);
+        }
+        if let Some(token) = &auth.token {
+            builder = builder.bearer_auth(token);
+        } else if let Some(Credentials::Basic { username, password }) = &auth.credentials {
+            builder = builder.basic_auth(username, Some(password));
+        }
+        builder
+    }
+
+    async fn refresh_auth_token(
+        &self,
+        response: Response,
+        reference: &ImageReference,
+        cache_key: &str,
+        auth: RegistryAuthContext,
+        auth_retries: &mut u32,
+    ) -> Result<bool> {
+        if *auth_retries >= MAX_AUTH_RETRIES {
+            return Err(DockerPullError::Unauthorized(format!(
+                "authentication retry limit exceeded for {}",
+                reference.normalized()
+            )));
+        }
+        let challenge = response
+            .headers()
+            .get(WWW_AUTHENTICATE)
+            .cloned()
+            .ok_or_else(|| DockerPullError::Unauthorized("missing challenge".into()))?;
+        if let Some(token) = self
+            .refresh_token(challenge, reference, auth.credentials)
+            .await?
+        {
+            self.token_cache
+                .lock()
+                .await
+                .insert(cache_key.to_string(), token);
+            *auth_retries += 1;
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     async fn retry_request(
