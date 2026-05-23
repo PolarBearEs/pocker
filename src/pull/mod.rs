@@ -5,10 +5,10 @@ pub(crate) mod orchestrator;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use futures_util::stream::{self, FuturesUnordered, StreamExt};
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
+use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 use crate::docker;
@@ -26,7 +26,7 @@ pub const DEFAULT_BLOB_RETRIES: u32 = 8;
 pub struct PullContext {
     pub store: Arc<Store>,
     pub registry: Arc<RegistryClient>,
-    pub stop: Arc<AtomicBool>,
+    pub stop: CancellationToken,
     pub ui: Arc<Ui>,
     pub blob_retry_limit: Option<u32>,
     pub blob_locks: Arc<BlobDownloadLocks>,
@@ -109,7 +109,7 @@ impl Puller {
     }
 
     pub async fn pull(&self, reference: ImageReference, options: PullOptions) -> Result<()> {
-        if self.context.stop.load(Ordering::SeqCst) {
+        if self.context.stop.is_cancelled() {
             return Err(DockerPullError::Interrupted);
         }
 

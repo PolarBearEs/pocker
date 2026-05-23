@@ -1,8 +1,8 @@
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 
 use tokio::task::JoinSet;
+use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 use crate::auth::{AuthResolver, read_credentials};
@@ -98,7 +98,7 @@ pub(crate) fn retry_limit(
 struct SharedPullState {
     store: Arc<Store>,
     registry: Arc<RegistryClient>,
-    stop: Arc<AtomicBool>,
+    stop: CancellationToken,
     blob_retry_limit: Option<u32>,
     blob_locks: Arc<BlobDownloadLocks>,
     daemon_layer_cache: Option<Arc<crate::docker::DaemonLayerCache>>,

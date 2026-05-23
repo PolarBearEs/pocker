@@ -2,11 +2,11 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Semaphore, oneshot};
 use tokio::task::JoinSet;
+use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 use crate::digest::parse_digest;
@@ -76,7 +76,7 @@ pub(crate) async fn serve_listener(
         pull_context: Arc::new(PullContext {
             store: config.store,
             registry: config.registry,
-            stop: Arc::new(AtomicBool::new(false)),
+            stop: CancellationToken::new(),
             ui: Arc::new(Ui::new(config.quiet, false)),
             blob_retry_limit: config.blob_retry_limit,
             blob_locks: Arc::new(BlobDownloadLocks::default()),
@@ -115,7 +115,7 @@ async fn run_server(
                     std::future::pending::<()>().await;
                 }
             } => {
-                state.pull_context.stop.store(true, Ordering::SeqCst);
+                state.pull_context.stop.cancel();
                 connections.abort_all();
                 while connections.join_next().await.is_some() {}
                 break;
@@ -469,13 +469,13 @@ fn manifest_summary(bytes: &[u8]) -> ManifestSummary {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::sync::atomic::AtomicBool;
 
     use reqwest::StatusCode;
     use tempfile::tempdir;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
     use tokio::sync::Semaphore;
+    use tokio_util::sync::CancellationToken;
 
     use super::{
         ManifestSummary, ServeState, is_supported_digest_reference, manifest_summary, run_server,
@@ -836,7 +836,7 @@ mod tests {
         let puller = Puller::new(PullContext {
             store: Arc::clone(&client_store),
             registry,
-            stop: Arc::new(AtomicBool::new(false)),
+            stop: CancellationToken::new(),
             ui: Arc::new(Ui::new(true, false)),
             blob_retry_limit: Some(1),
             blob_locks: Arc::new(BlobDownloadLocks::default()),
@@ -895,7 +895,7 @@ mod tests {
             pull_context: Arc::new(PullContext {
                 store,
                 registry,
-                stop: Arc::new(AtomicBool::new(false)),
+                stop: CancellationToken::new(),
                 ui: Arc::new(Ui::new(true, false)),
                 blob_retry_limit: Some(1),
                 blob_locks: Arc::new(BlobDownloadLocks::default()),

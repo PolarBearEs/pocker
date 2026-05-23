@@ -1,12 +1,11 @@
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use tokio_util::sync::CancellationToken;
 
-pub(crate) fn install_handler() -> Arc<AtomicBool> {
-    let stop = Arc::new(AtomicBool::new(false));
-    let signal = Arc::clone(&stop);
+pub(crate) fn install_handler() -> CancellationToken {
+    let stop = CancellationToken::new();
+    let signal = stop.clone();
     tokio::spawn(async move {
         wait_for_shutdown_signal().await;
-        signal.store(true, Ordering::SeqCst);
+        signal.cancel();
     });
     stop
 }
