@@ -7,7 +7,7 @@ use serde::Deserialize;
 use tar::Archive;
 use tempfile::{NamedTempFile, TempDir};
 use tokio::sync::OnceCell;
-use tokio::task::JoinSet;
+use tokio::task::{self, JoinSet};
 
 use crate::digest::{copy_reader_with_digest, parse_digest};
 use crate::error::{DockerPullError, Result};
@@ -250,12 +250,32 @@ async fn materialize_layers_from_saved_image(
         return Ok(());
     }
 
-    let entries = save_manifest_entries(temp.path())?;
+    let archive_path = temp.path().to_path_buf();
+    let output_root = output_root.to_path_buf();
+    let chosen = chosen.clone();
+    let extracted = task::spawn_blocking(move || {
+        materialize_layers_from_saved_archive(&archive_path, &chosen, &output_root)
+    })
+    .await
+    .map_err(|error| {
+        DockerPullError::CommandFailed(format!("docker layer materialization task failed: {error}"))
+    })??;
+
+    paths.extend(extracted);
+    Ok(())
+}
+
+fn materialize_layers_from_saved_archive(
+    archive_path: &Path,
+    chosen: &ChosenImageLayers,
+    output_root: &Path,
+) -> Result<HashMap<String, PathBuf>> {
+    let entries = save_manifest_entries(archive_path)?;
     let Some(entry) = entries.into_iter().next() else {
-        return Ok(());
+        return Ok(HashMap::new());
     };
     if entry.layers.len() != chosen.image.rootfs_layers().len() {
-        return Ok(());
+        return Ok(HashMap::new());
     }
 
     let targets = chosen
@@ -268,10 +288,11 @@ async fn materialize_layers_from_saved_image(
         .map(|(diff_id, path)| (path, diff_id))
         .collect::<HashMap<_, _>>();
     if targets.is_empty() {
-        return Ok(());
+        return Ok(HashMap::new());
     }
 
-    let file = File::open(temp.path())?;
+    let mut paths = HashMap::new();
+    let file = File::open(archive_path)?;
     let mut archive = Archive::new(file);
 
     for entry in archive.entries()? {
@@ -280,7 +301,7 @@ async fn materialize_layers_from_saved_image(
         let Some(diff_id) = targets.get(&path) else {
             continue;
         };
-        if paths.contains_key(diff_id.as_str()) {
+        if paths.contains_key(diff_id) {
             continue;
         }
         let destination = extracted_layer_path(output_root, diff_id)?;
@@ -288,7 +309,7 @@ async fn materialize_layers_from_saved_image(
         paths.insert(diff_id.clone(), destination);
     }
 
-    Ok(())
+    Ok(paths)
 }
 
 fn save_manifest_entries(path: &Path) -> Result<Vec<SaveManifestEntry>> {
