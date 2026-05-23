@@ -1,5 +1,5 @@
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{ErrorKind, Write};
 use std::path::Path;
 
 use serde::Serialize;
@@ -31,18 +31,20 @@ pub fn atomic_write_json(path: &Path, value: &impl Serialize) -> Result<()> {
 }
 
 pub fn read_json_if_exists<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
-    if !path.exists() {
-        return Ok(None);
-    }
-    let bytes = fs::read(path)?;
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
     serde_json::from_slice(&bytes).map(Some).map_err(Into::into)
 }
 
 pub fn reconcile_partial_file(path: &Path, durable_offset: u64) -> Result<u64> {
-    if !path.exists() {
-        return Ok(0);
-    }
-    let file_len = fs::metadata(path)?.len();
+    let file_len = match fs::metadata(path) {
+        Ok(metadata) => metadata.len(),
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error.into()),
+    };
     if file_len > durable_offset {
         let file = OpenOptions::new().write(true).open(path)?;
         file.set_len(durable_offset)?;

@@ -3,6 +3,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use tokio::fs as tokio_fs;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Semaphore, oneshot};
 use tokio::task::JoinSet;
@@ -249,7 +250,7 @@ async fn cached_manifest_response(
     let Ok(path) = state.store.blob_path(requested_reference) else {
         return Ok(None);
     };
-    if path.exists() {
+    if tokio_fs::try_exists(&path).await? {
         let descriptor = manifest_descriptor_from_blob(&state.store, requested_reference).await?;
         return Ok(Some(
             serve_manifest_blob(state, &descriptor, headers_only).await,

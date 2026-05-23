@@ -122,7 +122,7 @@ pub(crate) async fn pull_references(
         .transpose()?
         .unwrap_or_else(Platform::host);
     let credentials = read_credentials(request.username, request.password_stdin)?;
-    let auth = Arc::new(AuthResolver::new(credentials)?);
+    let auth = Arc::new(AuthResolver::new_async(credentials).await?);
     let client = Arc::new(RegistryClient::new_with_cache_from(
         build_http_client(
             request.plain_http

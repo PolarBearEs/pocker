@@ -66,7 +66,7 @@ impl Store {
     }
 
     async fn open_with_lock(root: PathBuf, shared_lock: bool) -> Result<Self> {
-        ensure_directory(&root)?;
+        ensure_directory_blocking(root.clone()).await?;
         let lock = if shared_lock {
             Some(std::sync::Arc::new(
                 acquire_shared_cache_lock(root.clone()).await?,
@@ -74,12 +74,7 @@ impl Store {
         } else {
             None
         };
-        for algorithm in DigestAlgorithm::SUPPORTED {
-            let algorithm = algorithm.to_string();
-            ensure_directory(&root.join("blobs").join(&algorithm))?;
-            ensure_directory(&root.join("partials").join(&algorithm))?;
-        }
-        ensure_directory(&root.join("references"))?;
+        ensure_store_layout_blocking(root.clone()).await?;
         Ok(Self {
             root,
             shared_lock: lock,
@@ -114,7 +109,7 @@ impl Store {
     pub async fn save_blob_bytes(&self, descriptor: &Descriptor, bytes: &[u8]) -> Result<()> {
         let expected_size = descriptor.expected_size()?;
         let path = self.blob_path(&descriptor.digest)?;
-        if path.exists()
+        if tokio_fs::try_exists(&path).await?
             && self
                 .ensure_blob_complete(&descriptor.digest, expected_size)
                 .await?
@@ -136,7 +131,7 @@ impl Store {
                 actual: actual_digest,
             });
         }
-        if let Err(error) = atomic_write_bytes(&path, bytes) {
+        if let Err(error) = atomic_write_bytes_blocking(path.clone(), bytes.to_vec()).await {
             if is_concurrent_blob_save_race(&error)
                 && self
                     .ensure_blob_complete(&descriptor.digest, expected_size)
@@ -185,9 +180,7 @@ impl Store {
 
     pub async fn reset_partial(&self, digest: &str, expected_size: u64) -> Result<()> {
         let partial = self.partial_path(digest)?;
-        if partial.exists() {
-            tokio_fs::remove_file(&partial).await?;
-        }
+        remove_file_if_exists(&partial).await?;
         self.checkpoint_download(digest, 0, expected_size).await?;
         Ok(())
     }
@@ -214,7 +207,7 @@ impl Store {
             });
         }
         if let Some(parent) = final_path.parent() {
-            ensure_directory(parent)?;
+            tokio_fs::create_dir_all(parent).await?;
         }
         tokio_fs::rename(&partial, &final_path).await?;
 
@@ -239,9 +232,10 @@ impl Store {
                 .and_then(|value| value.as_str())
                 .ok_or_else(|| DockerPullError::BadResponse("layer digest missing".into()))?;
             let path = self.blob_path(digest)?;
-            if path.exists() {
-                tokio_fs::remove_file(path).await?;
-                removed += 1;
+            match tokio_fs::remove_file(path).await {
+                Ok(()) => removed += 1,
+                Err(error) if error.kind() == ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
             }
         }
 
@@ -250,11 +244,21 @@ impl Store {
 
     pub async fn save_reference(&self, record: &StoredReference) -> Result<()> {
         let path = self.reference_path(&record.reference);
-        atomic_write_json(&path, record)
+        let record = record.clone();
+        tokio::task::spawn_blocking(move || atomic_write_json(&path, &record))
+            .await
+            .map_err(|e| {
+                DockerPullError::InvalidInput(format!("reference save task panicked: {e}"))
+            })?
     }
 
     pub async fn load_reference(&self, reference: &str) -> Result<Option<StoredReference>> {
-        read_json_if_exists(&self.reference_path(reference))
+        let path = self.reference_path(reference);
+        tokio::task::spawn_blocking(move || read_json_if_exists(&path))
+            .await
+            .map_err(|e| {
+                DockerPullError::InvalidInput(format!("reference load task panicked: {e}"))
+            })?
     }
 
     pub async fn clear(&self) -> Result<ClearedCache> {
@@ -316,6 +320,26 @@ async fn acquire_shared_cache_lock(root: PathBuf) -> Result<File> {
     .map_err(|e| DockerPullError::InvalidInput(format!("cache lock task panicked: {e}")))?
 }
 
+async fn ensure_directory_blocking(path: PathBuf) -> Result<()> {
+    tokio::task::spawn_blocking(move || ensure_directory(&path))
+        .await
+        .map_err(|e| DockerPullError::InvalidInput(format!("directory setup task panicked: {e}")))?
+}
+
+async fn ensure_store_layout_blocking(root: PathBuf) -> Result<()> {
+    tokio::task::spawn_blocking(move || {
+        for algorithm in DigestAlgorithm::SUPPORTED {
+            let algorithm = algorithm.to_string();
+            ensure_directory(&root.join("blobs").join(&algorithm))?;
+            ensure_directory(&root.join("partials").join(&algorithm))?;
+        }
+        ensure_directory(&root.join("references"))?;
+        Result::Ok(())
+    })
+    .await
+    .map_err(|e| DockerPullError::InvalidInput(format!("store layout task panicked: {e}")))?
+}
+
 fn open_lock_file(root: &Path) -> Result<File> {
     let path = cache_lock_path(root);
     if let Some(parent) = path.parent() {
@@ -335,7 +359,7 @@ fn cache_lock_path(root: &Path) -> PathBuf {
 }
 
 async fn remove_cache_contents(root: &Path) -> Result<()> {
-    if !root.exists() {
+    if !tokio_fs::try_exists(root).await? {
         return Ok(());
     }
 
@@ -445,6 +469,12 @@ async fn write_download_checkpoint_blocking(
     .map_err(|e| DockerPullError::InvalidInput(format!("checkpoint task panicked: {e}")))?
 }
 
+async fn atomic_write_bytes_blocking(path: PathBuf, bytes: Vec<u8>) -> Result<()> {
+    tokio::task::spawn_blocking(move || atomic_write_bytes(&path, &bytes))
+        .await
+        .map_err(|e| DockerPullError::InvalidInput(format!("blob write task panicked: {e}")))?
+}
+
 async fn digest_file_for_digest_blocking(digest: String, path: PathBuf) -> Result<String> {
     tokio::task::spawn_blocking(move || digest_file_for_digest(&digest, &path))
         .await
@@ -496,11 +526,12 @@ fn collect_cache_files_recursive(
     current: &Path,
     files: &mut Vec<ClearedCacheFile>,
 ) -> Result<()> {
-    if !current.exists() {
-        return Ok(());
-    }
-
-    for entry in std::fs::read_dir(current)? {
+    let entries = match std::fs::read_dir(current) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    for entry in entries {
         let entry = entry?;
         let path = entry.path();
         if path == cache_lock_path(root) {
