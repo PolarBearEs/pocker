@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::IsTerminal;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anstyle::{AnsiColor, Style};
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
@@ -14,6 +14,8 @@ pub(crate) const GREEN: Style = AnsiColor::Green.on_default();
 pub(crate) const YELLOW: Style = AnsiColor::Yellow.on_default();
 pub(crate) const CYAN: Style = AnsiColor::Cyan.on_default();
 pub(crate) const DIM: Style = Style::new().dimmed();
+
+const AGGREGATE_RENDER_INTERVAL: Duration = Duration::from_millis(50);
 
 pub(crate) fn paint(value: &str, style: Style) -> String {
     if should_color_stderr() {
@@ -64,6 +66,8 @@ struct ProgressUiInner {
 struct AggregateProgress {
     order: Vec<String>,
     layers: HashMap<String, AggregateLayer>,
+    last_rendered: Option<AggregateRender>,
+    last_rendered_at: Option<Instant>,
 }
 
 #[derive(Default)]
@@ -73,10 +77,21 @@ struct AggregateLayer {
     complete: bool,
 }
 
+#[derive(Clone, PartialEq, Eq)]
+struct AggregateRender {
+    strip: String,
+    total_bytes: u64,
+    position: u64,
+    hide_bytes: bool,
+    status: String,
+}
+
 impl AggregateProgress {
     fn clear(&mut self) {
         self.order.clear();
         self.layers.clear();
+        self.last_rendered = None;
+        self.last_rendered_at = None;
     }
 
     fn touch_layer(&mut self, digest: &str) -> &mut AggregateLayer {
@@ -425,7 +440,7 @@ impl ProgressUiInner {
         layer.position = layer.position.saturating_add(amount).min(layer.total);
         layer.complete = layer.total > 0 && layer.position >= layer.total;
         drop(aggregate);
-        self.render_aggregate_progress("Pulling");
+        self.render_aggregate_progress_throttled("Pulling");
     }
 
     fn finish_aggregate_layer(&self, digest: &str) {
@@ -440,39 +455,74 @@ impl ProgressUiInner {
     }
 
     fn render_aggregate_progress(&self, status: &str) {
-        let aggregate = self.aggregate.lock().expect("ui state poisoned");
-        let mut strip = String::new();
-        let mut total_bytes = 0;
-        let mut position = 0;
-        let mut hide_bytes = false;
-        for digest in &aggregate.order {
-            let Some(layer) = aggregate.layers.get(digest) else {
-                continue;
-            };
-            total_bytes += layer.total;
-            position += layer.position;
-            if !layer.complete && layer.total == 0 {
-                hide_bytes = true;
+        self.render_aggregate_progress_with_throttle(status, true);
+    }
+
+    fn render_aggregate_progress_throttled(&self, status: &str) {
+        self.render_aggregate_progress_with_throttle(status, false);
+    }
+
+    fn render_aggregate_progress_with_throttle(&self, status: &str, force: bool) {
+        let mut aggregate = self.aggregate.lock().expect("ui state poisoned");
+        let render = aggregate_render(&aggregate, status);
+
+        if !force {
+            if aggregate.last_rendered.as_ref() == Some(&render) {
+                return;
             }
-            strip.push(layer_progress_char(layer));
+            if aggregate
+                .last_rendered_at
+                .is_some_and(|last| last.elapsed() < AGGREGATE_RENDER_INTERVAL)
+            {
+                return;
+            }
         }
+        aggregate.last_rendered = Some(render.clone());
+        aggregate.last_rendered_at = Some(Instant::now());
         drop(aggregate);
 
         self.image.set_style(compose_image_style());
         let image = self.image_name.lock().expect("ui state poisoned").clone();
-        let bytes = if total_bytes > 0 && !hide_bytes {
+        let bytes = if render.total_bytes > 0 && !render.hide_bytes {
             format!(
                 " {} / {}",
-                format_bytes(position.min(total_bytes)),
-                format_bytes(total_bytes)
+                format_bytes(render.position.min(render.total_bytes)),
+                format_bytes(render.total_bytes)
             )
         } else {
             String::new()
         };
         self.image.set_message(format!(
-            "{image} [{}]{bytes} {status}",
-            paint(&strip, GREEN)
+            "{image} [{}]{bytes} {}",
+            paint(&render.strip, GREEN),
+            render.status
         ));
+    }
+}
+
+fn aggregate_render(aggregate: &AggregateProgress, status: &str) -> AggregateRender {
+    let mut strip = String::new();
+    let mut total_bytes = 0;
+    let mut position = 0;
+    let mut hide_bytes = false;
+    for digest in &aggregate.order {
+        let Some(layer) = aggregate.layers.get(digest) else {
+            continue;
+        };
+        total_bytes += layer.total;
+        position += layer.position;
+        if !layer.complete && layer.total == 0 {
+            hide_bytes = true;
+        }
+        strip.push(layer_progress_char(layer));
+    }
+
+    AggregateRender {
+        strip,
+        total_bytes,
+        position,
+        hide_bytes,
+        status: status.to_string(),
     }
 }
 
