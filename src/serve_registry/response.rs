@@ -118,9 +118,11 @@ pub(super) async fn write_response(
     stream: &mut TcpStream,
     response: RegistryResponse,
 ) -> Result<()> {
+    let content_type =
+        safe_header_value(&response.content_type).unwrap_or("application/octet-stream");
     let mut headers = format!(
         "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n",
-        response.status, response.reason, response.content_type, response.content_length
+        response.status, response.reason, content_type, response.content_length
     );
     headers.push_str("Docker-Distribution-API-Version: registry/2.0\r\n");
     if let Some(digest) = &response.digest {
@@ -151,4 +153,27 @@ pub(super) async fn write_response(
     stream.flush().await?;
     stream.shutdown().await?;
     Ok(())
+}
+
+fn safe_header_value(value: &str) -> Option<&str> {
+    if value.bytes().any(|byte| matches!(byte, b'\r' | b'\n')) {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::safe_header_value;
+
+    #[test]
+    fn header_value_rejects_crlf() {
+        assert_eq!(
+            safe_header_value("application/octet-stream"),
+            Some("application/octet-stream")
+        );
+        assert_eq!(safe_header_value("text/plain\r\nInjected: yes"), None);
+        assert_eq!(safe_header_value("text/plain\nInjected: yes"), None);
+    }
 }
