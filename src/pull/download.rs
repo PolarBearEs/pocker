@@ -339,7 +339,7 @@ fn register_retry(
         format!("blob download {digest}"),
         detail.clone(),
     )?;
-    context.ui.warn(format!(
+    context.ui.warn(&format!(
         "{detail} for {digest}; retrying in {:?} ({retry_budget})",
         delay
     ));
