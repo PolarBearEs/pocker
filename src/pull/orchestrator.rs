@@ -1,6 +1,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use futures_util::{StreamExt, stream};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
@@ -11,10 +12,11 @@ use crate::error::{DockerPullError, Result};
 use crate::http::build_http_client;
 use crate::platform::Platform;
 use crate::pull::{
-    BlobDownloadLocks, DEFAULT_BLOB_RETRIES, LoadMode, PullContext, PullOptions, Puller,
+    BlobDownloadLocks, CurrentPullLayers, DEFAULT_BLOB_RETRIES, LoadMode, PullContext, PullOptions,
+    Puller,
 };
-use crate::reference;
-use crate::registry::{DEFAULT_REQUEST_RETRIES, RegistryClient};
+use crate::reference::ImageReference;
+use crate::registry::{DEFAULT_REQUEST_RETRIES, RegistryClient, ResolvedImage};
 use crate::signal;
 use crate::store::{ActiveStore, Store};
 use crate::ui::UiGroup;
@@ -130,6 +132,52 @@ pub(crate) fn retry_limit(
     }
 }
 
+struct PlannedPull {
+    reference: ImageReference,
+    resolved: ResolvedImage,
+    layer_digests: Vec<String>,
+}
+
+async fn plan_pull_references(
+    references: &[String],
+    registry: Arc<RegistryClient>,
+    platform: &Platform,
+    concurrency: usize,
+) -> Result<Vec<PlannedPull>> {
+    let mut planned = stream::iter(references.iter().cloned().enumerate())
+        .map(|(index, raw_reference)| {
+            let registry = Arc::clone(&registry);
+            let platform = platform.clone();
+            async move {
+                let reference = ImageReference::parse(&raw_reference)?;
+                let resolved = registry.resolve_image(&reference, &platform).await?;
+                let layer_digests = resolved
+                    .layers
+                    .iter()
+                    .map(|layer| layer.digest.clone())
+                    .collect();
+                Result::Ok((
+                    index,
+                    PlannedPull {
+                        reference,
+                        resolved,
+                        layer_digests,
+                    },
+                ))
+            }
+        })
+        .buffer_unordered(concurrency.max(1));
+
+    let mut ordered = Vec::with_capacity(references.len());
+    ordered.resize_with(references.len(), || None);
+    while let Some(result) = planned.next().await {
+        let (index, planned_pull) = result?;
+        ordered[index] = Some(planned_pull);
+    }
+
+    Ok(ordered.into_iter().flatten().collect())
+}
+
 #[derive(Clone)]
 struct SharedPullState {
     store: Arc<Store>,
@@ -137,6 +185,7 @@ struct SharedPullState {
     stop: CancellationToken,
     blob_retry_limit: Option<u32>,
     blob_locks: Arc<BlobDownloadLocks>,
+    layer_usage: Arc<CurrentPullLayers>,
     daemon_layer_cache: Option<Arc<crate::docker::DaemonLayerCache>>,
     options: PullOptions,
     ui_group: UiGroup,
@@ -181,9 +230,21 @@ pub(crate) async fn pull_references(
         request.cache.cache_from,
         request.cache.cache_only,
     ));
+    let image_concurrency = request.image_concurrency.max(1);
+    let planned_pulls = plan_pull_references(
+        &references,
+        Arc::clone(&client),
+        &platform,
+        image_concurrency,
+    )
+    .await?;
+    let image_layers = planned_pulls
+        .iter()
+        .map(|planned| planned.layer_digests.clone())
+        .collect::<Vec<_>>();
+    let layer_usage = Arc::new(CurrentPullLayers::from_image_layers(&image_layers));
     let stop = signal::install_handler();
     let options = PullOptions {
-        platform,
         concurrency: request.download.concurrency.max(1),
         no_load: request.import.no_load,
         keep_layer_blobs: request.import.keep_layer_blobs,
@@ -198,34 +259,35 @@ pub(crate) async fn pull_references(
         stop,
         blob_retry_limit: request.retry.blob_retry_limit,
         blob_locks: Arc::new(BlobDownloadLocks::default()),
+        layer_usage,
         daemon_layer_cache,
         options,
         ui_group: UiGroup::new(quiet, !request.no_animations),
     };
 
-    if request.image_concurrency <= 1 {
-        for reference in references {
-            pull_reference_with_group(state.clone(), reference).await?;
+    if image_concurrency <= 1 {
+        for planned_pull in planned_pulls {
+            pull_reference_with_group(state.clone(), planned_pull).await?;
         }
         return Ok(());
     }
 
-    pull_references_parallel(state, references, request.image_concurrency.max(1)).await
+    pull_references_parallel(state, planned_pulls, image_concurrency).await
 }
 
 async fn pull_references_parallel(
     state: SharedPullState,
-    references: Vec<String>,
+    planned_pulls: Vec<PlannedPull>,
     image_concurrency: usize,
 ) -> Result<()> {
-    let mut pending = references.into_iter();
+    let mut pending = planned_pulls.into_iter();
     let mut queue = JoinSet::new();
 
     while queue.len() < image_concurrency {
-        let Some(reference) = pending.next() else {
+        let Some(planned_pull) = pending.next() else {
             break;
         };
-        spawn_pull_task(&mut queue, state.clone(), reference);
+        spawn_pull_task(&mut queue, state.clone(), planned_pull);
     }
 
     while let Some(result) = queue.join_next().await {
@@ -243,16 +305,20 @@ async fn pull_references_parallel(
             }
         }
 
-        if let Some(reference) = pending.next() {
-            spawn_pull_task(&mut queue, state.clone(), reference);
+        if let Some(planned_pull) = pending.next() {
+            spawn_pull_task(&mut queue, state.clone(), planned_pull);
         }
     }
 
     Ok(())
 }
 
-fn spawn_pull_task(queue: &mut JoinSet<Result<()>>, state: SharedPullState, reference: String) {
-    queue.spawn(async move { pull_reference_with_group(state, reference).await });
+fn spawn_pull_task(
+    queue: &mut JoinSet<Result<()>>,
+    state: SharedPullState,
+    planned_pull: PlannedPull,
+) {
+    queue.spawn(async move { pull_reference_with_group(state, planned_pull).await });
 }
 
 async fn abort_pull_tasks(queue: &mut JoinSet<Result<()>>) {
@@ -266,8 +332,15 @@ async fn abort_pull_tasks(queue: &mut JoinSet<Result<()>>) {
     }
 }
 
-async fn pull_reference_with_group(state: SharedPullState, reference: String) -> Result<()> {
-    let reference = reference::ImageReference::parse(&reference)?;
+async fn pull_reference_with_group(
+    state: SharedPullState,
+    planned_pull: PlannedPull,
+) -> Result<()> {
+    let PlannedPull {
+        reference,
+        resolved,
+        layer_digests: _,
+    } = planned_pull;
     let label = reference.display_name();
     let context = PullContext {
         store: state.store,
@@ -276,7 +349,10 @@ async fn pull_reference_with_group(state: SharedPullState, reference: String) ->
         ui: Arc::new(state.ui_group.image_ui(label)),
         blob_retry_limit: state.blob_retry_limit,
         blob_locks: state.blob_locks,
+        layer_usage: state.layer_usage,
         daemon_layer_cache: state.daemon_layer_cache,
     };
-    Puller::new(context).pull(reference, state.options).await
+    Puller::new(context)
+        .pull_resolved(reference, resolved, state.options)
+        .await
 }

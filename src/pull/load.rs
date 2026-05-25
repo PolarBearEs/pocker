@@ -1,5 +1,4 @@
 use std::sync::Arc;
-
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -11,13 +10,14 @@ use crate::registry::{RegistryClient, cache_repository};
 use crate::serve_registry::{self, ServeListenerConfig};
 use crate::store::{Store, StoredReference};
 
-use super::{LoadMode, PullContext, PullOptions};
+use super::{LayerClaimGuard, LoadMode, PullContext, PullOptions};
 
 pub(super) async fn finalize_existing_reference(
     context: &PullContext,
     reference: &ImageReference,
     stored_reference: &StoredReference,
     options: &PullOptions,
+    layer_claim: &LayerClaimGuard<'_>,
 ) -> Result<bool> {
     let normalized = &stored_reference.reference;
     let already_loaded = docker::daemon_has_reference(reference, &stored_reference.config_digest)
@@ -32,9 +32,10 @@ pub(super) async fn finalize_existing_reference(
     context.store.save_reference(stored_reference).await?;
     if !options.keep_layer_blobs {
         context.ui.set_image_status(normalized, "Pruning cache");
+        let protected_layer_digests = layer_claim.protected_digests();
         context
             .store
-            .prune_reference_layer_blobs(stored_reference)
+            .prune_reference_layer_blobs_except(stored_reference, &protected_layer_digests)
             .await?;
     }
     context.ui.finish_image(normalized, "Already exists");
@@ -46,6 +47,7 @@ pub(super) async fn load_reference(
     reference: &ImageReference,
     stored_reference: &StoredReference,
     options: &PullOptions,
+    layer_claim: &LayerClaimGuard<'_>,
 ) -> Result<()> {
     let normalized = &stored_reference.reference;
     context.ui.begin_load(normalized);
@@ -59,9 +61,10 @@ pub(super) async fn load_reference(
     }
     if !options.keep_layer_blobs {
         context.ui.set_image_status(normalized, "Pruning cache");
+        let protected_layer_digests = layer_claim.protected_digests();
         context
             .store
-            .prune_reference_layer_blobs(stored_reference)
+            .prune_reference_layer_blobs_except(stored_reference, &protected_layer_digests)
             .await?;
     }
     context.ui.finish_image(normalized, "Ready");

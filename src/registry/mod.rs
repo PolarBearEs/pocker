@@ -20,4 +20,4 @@ pub(crate) const MANIFEST_ACCEPT: &str = concat!(
 
 pub(crate) use cache::{cache_repository, decode_cache_repository};
 pub(crate) use client::{DEFAULT_REQUEST_RETRIES, RegistryClient};
-pub(crate) use types::Descriptor;
+pub(crate) use types::{Descriptor, ResolvedImage};

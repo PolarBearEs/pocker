@@ -1,5 +1,6 @@
 mod fs;
 
+use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io::ErrorKind;
 use std::ops::Deref;
@@ -223,22 +224,21 @@ impl Store {
         Ok(())
     }
 
-    pub async fn prune_reference_layer_blobs(&self, reference: &StoredReference) -> Result<usize> {
+    pub async fn prune_reference_layer_blobs_except(
+        &self,
+        reference: &StoredReference,
+        protected: &HashSet<String>,
+    ) -> Result<usize> {
         let manifest_path = self.blob_path(&reference.manifest.digest)?;
         let manifest_bytes = tokio_fs::read(&manifest_path).await?;
-        let manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes)?;
-        let layers = manifest
-            .get("layers")
-            .and_then(|layers| layers.as_array())
-            .ok_or_else(|| DockerPullError::BadResponse("manifest layers missing".into()))?;
+        let layer_digests = layer_digests_from_manifest(&manifest_bytes)?;
 
         let mut removed = 0_usize;
-        for layer in layers {
-            let digest = layer
-                .get("digest")
-                .and_then(|value| value.as_str())
-                .ok_or_else(|| DockerPullError::BadResponse("layer digest missing".into()))?;
-            let path = self.blob_path(digest)?;
+        for digest in layer_digests {
+            if protected.contains(&digest) {
+                continue;
+            }
+            let path = self.blob_path(&digest)?;
             match tokio_fs::remove_file(path).await {
                 Ok(()) => removed += 1,
                 Err(error) if error.kind() == ErrorKind::NotFound => {}
@@ -544,6 +544,24 @@ fn is_concurrent_blob_save_race(error: &DockerPullError) -> bool {
     )
 }
 
+fn layer_digests_from_manifest(bytes: &[u8]) -> Result<Vec<String>> {
+    let manifest: serde_json::Value = serde_json::from_slice(bytes)?;
+    let layers = manifest
+        .get("layers")
+        .and_then(|layers| layers.as_array())
+        .ok_or_else(|| DockerPullError::BadResponse("manifest layers missing".into()))?;
+    layers
+        .iter()
+        .map(|layer| {
+            layer
+                .get("digest")
+                .and_then(|value| value.as_str())
+                .map(ToString::to_string)
+                .ok_or_else(|| DockerPullError::BadResponse("layer digest missing".into()))
+        })
+        .collect()
+}
+
 fn digest_path(root: PathBuf, digest: &str) -> Result<PathBuf> {
     let parsed = parse_digest(digest)?;
     Ok(root.join(parsed.algorithm.to_string()).join(parsed.value))
@@ -608,6 +626,7 @@ fn collect_cache_files_recursive(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::path::Path;
 
     use tempfile::tempdir;
@@ -712,11 +731,14 @@ mod tests {
         std::fs::write(&layer_path, b"layer").expect("layer should be written");
 
         let removed = store
-            .prune_reference_layer_blobs(&StoredReference {
-                reference: "registry-1.docker.io/library/alpine:latest".into(),
-                manifest: manifest.clone(),
-                config_digest: config.digest.clone(),
-            })
+            .prune_reference_layer_blobs_except(
+                &StoredReference {
+                    reference: "registry-1.docker.io/library/alpine:latest".into(),
+                    manifest: manifest.clone(),
+                    config_digest: config.digest.clone(),
+                },
+                &HashSet::new(),
+            )
             .await
             .expect("layer prune should succeed");
 
@@ -738,6 +760,76 @@ mod tests {
                 .expect("config path")
                 .exists(),
             "config blob should be retained"
+        );
+    }
+
+    #[tokio::test]
+    async fn prune_reference_layer_blobs_except_keeps_protected_layers() {
+        let dir = tempdir().expect("tempdir should create");
+        let store = Store::open(dir.path().to_path_buf())
+            .await
+            .expect("store should open");
+        let shared_layer =
+            "sha256:3333333333333333333333333333333333333333333333333333333333333333";
+        let unique_layer =
+            "sha256:4444444444444444444444444444444444444444444444444444444444444444";
+        let manifest = Descriptor {
+            media_type: "application/vnd.oci.image.manifest.v1+json".into(),
+            digest: "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+                .into(),
+            size: 0,
+            platform: None,
+            annotations: None,
+        };
+        let layer_json = [shared_layer, unique_layer]
+            .iter()
+            .map(|digest| {
+                format!(
+                    r#"{{"mediaType":"application/vnd.oci.image.layer.v1.tar+gzip","digest":"{digest}","size":5}}"#
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let bytes = format!(
+            r#"{{"schemaVersion":2,"config":{{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","size":2}},"layers":[{layer_json}]}}"#
+        );
+        let path = store.blob_path(&manifest.digest).expect("manifest path");
+        std::fs::create_dir_all(path.parent().expect("manifest parent"))
+            .expect("manifest parent should exist");
+        std::fs::write(path, bytes).expect("manifest should be written");
+        for digest in [shared_layer, unique_layer] {
+            let path = store.blob_path(digest).expect("layer path");
+            std::fs::create_dir_all(path.parent().expect("layer parent"))
+                .expect("layer parent should exist");
+            std::fs::write(path, b"layer").expect("layer should be written");
+        }
+        let reference = StoredReference {
+            reference: "registry-1.docker.io/library/alpine:latest".into(),
+            manifest,
+            config_digest:
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+        };
+        let protected = HashSet::from([shared_layer.to_string()]);
+
+        let removed = store
+            .prune_reference_layer_blobs_except(&reference, &protected)
+            .await
+            .expect("layer prune should succeed");
+
+        assert_eq!(removed, 1);
+        assert!(
+            store
+                .blob_path(shared_layer)
+                .expect("shared layer")
+                .exists(),
+            "shared layer should be kept"
+        );
+        assert!(
+            !store
+                .blob_path(unique_layer)
+                .expect("unique layer")
+                .exists(),
+            "unprotected layer should be removed"
         );
     }
 

@@ -2,7 +2,7 @@ pub mod download;
 mod load;
 pub(crate) mod orchestrator;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::Mutex;
 
@@ -14,9 +14,8 @@ use tracing::warn;
 use crate::docker;
 use crate::error::{DockerPullError, Result};
 use crate::image::pair_layers;
-use crate::platform::Platform;
 use crate::reference::ImageReference;
-use crate::registry::{Descriptor, RegistryClient};
+use crate::registry::{Descriptor, RegistryClient, ResolvedImage};
 use crate::store::{Store, StoredReference};
 use crate::ui::ProgressSink;
 
@@ -30,12 +29,12 @@ pub struct PullContext {
     pub ui: Arc<dyn ProgressSink>,
     pub blob_retry_limit: Option<u32>,
     pub blob_locks: Arc<BlobDownloadLocks>,
+    pub layer_usage: Arc<CurrentPullLayers>,
     pub daemon_layer_cache: Option<Arc<docker::DaemonLayerCache>>,
 }
 
 #[derive(Debug, Clone)]
 pub struct PullOptions {
-    pub platform: Platform,
     pub concurrency: usize,
     pub no_load: bool,
     pub keep_layer_blobs: bool,
@@ -58,11 +57,29 @@ pub struct BlobDownloadLocks {
     locks: Mutex<HashMap<String, Arc<AsyncMutex<()>>>>,
 }
 
+#[derive(Default)]
+pub struct CurrentPullLayers {
+    state: Mutex<CurrentPullLayerState>,
+}
+
+#[derive(Default)]
+struct CurrentPullLayerState {
+    planned_remaining: HashMap<String, usize>,
+    active_unplanned: HashMap<String, usize>,
+    planned: bool,
+}
+
 pub struct BlobDownloadGuard<'a> {
     locks: &'a BlobDownloadLocks,
     digest: String,
     lock: Arc<AsyncMutex<()>>,
     guard: Option<OwnedMutexGuard<()>>,
+}
+
+pub struct LayerClaimGuard<'a> {
+    usage: &'a CurrentPullLayers,
+    planned_digests: Vec<String>,
+    unplanned_digests: Vec<String>,
 }
 
 impl BlobDownloadLocks {
@@ -89,6 +106,107 @@ impl BlobDownloadLocks {
     }
 }
 
+impl CurrentPullLayers {
+    pub fn from_image_layers(images: &[Vec<String>]) -> Self {
+        let mut planned_remaining = HashMap::new();
+        for digests in images {
+            for digest in unique_digests(digests) {
+                *planned_remaining.entry(digest).or_default() += 1;
+            }
+        }
+        Self {
+            state: Mutex::new(CurrentPullLayerState {
+                planned_remaining,
+                active_unplanned: HashMap::new(),
+                planned: true,
+            }),
+        }
+    }
+
+    pub fn claim(&self, digests: &[String]) -> LayerClaimGuard<'_> {
+        let digests = unique_digests(digests);
+        let mut state = self.state.lock().expect("layer usage state poisoned");
+        let mut planned_digests = Vec::new();
+        let mut unplanned_digests = Vec::new();
+        for digest in digests {
+            if state.planned && state.planned_remaining.contains_key(&digest) {
+                planned_digests.push(digest);
+            } else {
+                *state.active_unplanned.entry(digest.clone()).or_default() += 1;
+                unplanned_digests.push(digest);
+            }
+        }
+        LayerClaimGuard {
+            usage: self,
+            planned_digests,
+            unplanned_digests,
+        }
+    }
+
+    fn protected_digests(&self, digests: &[String]) -> HashSet<String> {
+        let state = self.state.lock().expect("layer usage state poisoned");
+        digests
+            .iter()
+            .filter(|digest| {
+                let planned = state
+                    .planned_remaining
+                    .get(*digest)
+                    .copied()
+                    .unwrap_or_default();
+                let unplanned = state
+                    .active_unplanned
+                    .get(*digest)
+                    .copied()
+                    .unwrap_or_default();
+                planned + unplanned > 1
+            })
+            .cloned()
+            .collect()
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.state.lock().expect("layer usage state poisoned").len()
+    }
+}
+
+impl LayerClaimGuard<'_> {
+    pub fn protected_digests(&self) -> HashSet<String> {
+        let mut digests = self.planned_digests.clone();
+        digests.extend(self.unplanned_digests.clone());
+        self.usage.protected_digests(&digests)
+    }
+}
+
+impl Drop for LayerClaimGuard<'_> {
+    fn drop(&mut self) {
+        let mut state = self.usage.state.lock().expect("layer usage state poisoned");
+        for digest in &self.planned_digests {
+            decrement_count(&mut state.planned_remaining, digest);
+        }
+        for digest in &self.unplanned_digests {
+            decrement_count(&mut state.active_unplanned, digest);
+        }
+    }
+}
+
+impl CurrentPullLayerState {
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.planned_remaining.len() + self.active_unplanned.len()
+    }
+}
+
+fn decrement_count(counts: &mut HashMap<String, usize>, digest: &str) {
+    let Some(count) = counts.get_mut(digest) else {
+        return;
+    };
+    *count -= 1;
+    if *count == 0 {
+        counts.remove(digest);
+    }
+}
+
 impl Drop for BlobDownloadGuard<'_> {
     fn drop(&mut self) {
         drop(self.guard.take());
@@ -103,12 +221,28 @@ impl Drop for BlobDownloadGuard<'_> {
     }
 }
 
+fn unique_digests(digests: &[String]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut unique = Vec::new();
+    for digest in digests {
+        if seen.insert(digest.as_str()) {
+            unique.push(digest.clone());
+        }
+    }
+    unique
+}
+
 impl Puller {
     pub fn new(context: PullContext) -> Self {
         Self { context }
     }
 
-    pub async fn pull(&self, reference: ImageReference, options: PullOptions) -> Result<()> {
+    pub async fn pull_resolved(
+        &self,
+        reference: ImageReference,
+        resolved: ResolvedImage,
+        options: PullOptions,
+    ) -> Result<()> {
         if self.context.stop.is_cancelled() {
             return Err(DockerPullError::Interrupted);
         }
@@ -116,11 +250,6 @@ impl Puller {
         let normalized = reference.normalized();
         self.context.ui.begin_image(&normalized);
 
-        let resolved = self
-            .context
-            .registry
-            .resolve_image(&reference, &options.platform)
-            .await?;
         self.context
             .store
             .save_blob_bytes(&resolved.manifest, &resolved.manifest_bytes)
@@ -133,23 +262,26 @@ impl Puller {
             config_digest: resolved.config.digest.clone(),
         };
 
+        let layers = pair_layers(resolved.layers.clone(), &config_bytes)?;
+        let layer_digests = layers
+            .iter()
+            .map(|layer| layer.descriptor.digest.clone())
+            .collect::<Vec<_>>();
+
+        let layer_claim = self.context.layer_usage.claim(&layer_digests);
         if !options.no_load
             && load::finalize_existing_reference(
                 &self.context,
                 &reference,
                 &stored_reference,
                 &options,
+                &layer_claim,
             )
             .await?
         {
             return Ok(());
         }
 
-        let layers = pair_layers(resolved.layers.clone(), &config_bytes)?;
-        let layer_digests = layers
-            .iter()
-            .map(|layer| layer.descriptor.digest.clone())
-            .collect::<Vec<_>>();
         self.context.ui.prepare_layers(&layer_digests);
         let daemon_layers = if options.load_mode == LoadMode::Stream {
             let coverage = match &self.context.daemon_layer_cache {
@@ -222,7 +354,14 @@ impl Puller {
         if options.no_load {
             self.context.ui.finish_image(&normalized, "Pulled");
         } else {
-            load::load_reference(&self.context, &reference, &stored_reference, &options).await?;
+            load::load_reference(
+                &self.context,
+                &reference,
+                &stored_reference,
+                &options,
+                &layer_claim,
+            )
+            .await?;
         }
 
         Ok(())
@@ -284,7 +423,7 @@ async fn load_blob_bytes(
 
 #[cfg(test)]
 mod tests {
-    use super::BlobDownloadLocks;
+    use super::{BlobDownloadLocks, CurrentPullLayers};
 
     #[tokio::test]
     async fn blob_download_locks_remove_idle_entries() {
@@ -313,5 +452,86 @@ mod tests {
 
         waiter.await.expect("waiter task should finish");
         assert_eq!(locks.len(), 0);
+    }
+
+    #[test]
+    fn current_pull_layers_protects_shared_active_claims_until_last_release() {
+        let usage = CurrentPullLayers::default();
+        let first = vec!["sha256:shared".to_string(), "sha256:first".to_string()];
+        let second = vec!["sha256:shared".to_string(), "sha256:second".to_string()];
+
+        let first_claim = usage.claim(&first);
+        let second_claim = usage.claim(&second);
+
+        assert!(first_claim.protected_digests().contains("sha256:shared"));
+        assert!(!first_claim.protected_digests().contains("sha256:first"));
+
+        drop(first_claim);
+
+        assert!(!second_claim.protected_digests().contains("sha256:shared"));
+
+        drop(second_claim);
+        assert_eq!(usage.len(), 0);
+    }
+
+    #[test]
+    fn current_pull_layers_counts_duplicate_digests_once_per_image() {
+        let usage = CurrentPullLayers::default();
+        let digests = vec!["sha256:shared".to_string(), "sha256:shared".to_string()];
+
+        let claim = usage.claim(&digests);
+
+        assert!(!claim.protected_digests().contains("sha256:shared"));
+
+        drop(claim);
+        assert_eq!(usage.len(), 0);
+    }
+
+    #[test]
+    fn current_pull_layers_can_preplan_images_before_they_start() {
+        let first = vec!["sha256:shared".to_string(), "sha256:first".to_string()];
+        let second = vec!["sha256:shared".to_string(), "sha256:second".to_string()];
+        let usage = CurrentPullLayers::from_image_layers(&[first.clone(), second.clone()]);
+
+        let first_claim = usage.claim(&first);
+
+        assert!(first_claim.protected_digests().contains("sha256:shared"));
+
+        drop(first_claim);
+
+        let second_claim = usage.claim(&second);
+        assert!(!second_claim.protected_digests().contains("sha256:shared"));
+
+        drop(second_claim);
+        assert_eq!(usage.len(), 0);
+    }
+
+    #[test]
+    fn current_pull_layers_tracks_unplanned_layers_in_planned_pulls() {
+        let planned = vec!["sha256:planned".to_string()];
+        let unexpected = vec!["sha256:unexpected".to_string()];
+        let usage = CurrentPullLayers::from_image_layers(std::slice::from_ref(&planned));
+
+        let planned_claim = usage.claim(&planned);
+        let first_unexpected_claim = usage.claim(&unexpected);
+        let second_unexpected_claim = usage.claim(&unexpected);
+
+        assert!(
+            first_unexpected_claim
+                .protected_digests()
+                .contains("sha256:unexpected")
+        );
+
+        drop(first_unexpected_claim);
+
+        assert!(
+            !second_unexpected_claim
+                .protected_digests()
+                .contains("sha256:unexpected")
+        );
+
+        drop(second_unexpected_claim);
+        drop(planned_claim);
+        assert_eq!(usage.len(), 0);
     }
 }
