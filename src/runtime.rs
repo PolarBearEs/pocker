@@ -13,7 +13,7 @@ use crate::http::build_http_client;
 use crate::image_view::{format_size, print_image_inspect, print_image_list};
 use crate::pull::orchestrator::{PullRequestOptions, pull_references, retry_limit};
 use crate::registry::{DEFAULT_REQUEST_RETRIES, RegistryClient};
-use crate::store::Store;
+use crate::store::{ActiveStore, MaintenanceStore};
 use crate::{docker, pull, serve_registry, signal, ui};
 
 pub async fn run() -> Result<()> {
@@ -60,7 +60,11 @@ pub async fn run() -> Result<()> {
             }
         },
         Commands::Serve(args) => {
-            let store = Arc::new(Store::open_active(cli.global.cache_dir.clone()).await?);
+            let store = Arc::new(
+                ActiveStore::open(cli.global.cache_dir.clone())
+                    .await?
+                    .into_store(),
+            );
             let credentials = read_credentials(args.auth.username, args.auth.password_stdin)?;
             let auth = Arc::new(AuthResolver::new_async(credentials).await?);
             let client = Arc::new(RegistryClient::new(
@@ -111,7 +115,7 @@ pub async fn run() -> Result<()> {
             .await?;
         }
         Commands::Cache(args) => {
-            let store = Store::open(cli.global.cache_dir.clone()).await?;
+            let store = MaintenanceStore::open(cli.global.cache_dir.clone()).await?;
             match args.command {
                 CacheCommands::Clean(_) => clean_cache(&store, cli.global.quiet).await?,
             }
@@ -228,7 +232,7 @@ async fn resolve_compose_images(files: Vec<std::path::PathBuf>) -> Result<compos
         .map_err(Into::into)
 }
 
-async fn clean_cache(store: &Store, quiet: bool) -> Result<()> {
+async fn clean_cache(store: &MaintenanceStore, quiet: bool) -> Result<()> {
     if quiet {
         store.clear_quiet().await?;
         return Ok(());

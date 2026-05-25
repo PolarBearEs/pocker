@@ -16,7 +16,7 @@ use crate::pull::{
 use crate::reference;
 use crate::registry::{DEFAULT_REQUEST_RETRIES, RegistryClient};
 use crate::signal;
-use crate::store::Store;
+use crate::store::{ActiveStore, Store};
 use crate::ui::UiGroup;
 
 pub(crate) struct PullRequestOptions {
@@ -113,7 +113,11 @@ pub(crate) async fn pull_references(
     request: PullRequestOptions,
 ) -> Result<()> {
     let references = pocker_compose::unique_images(&references);
-    let store = Arc::new(Store::open_active(cache_dir.to_path_buf()).await?);
+    let store = Arc::new(
+        ActiveStore::open(cache_dir.to_path_buf())
+            .await?
+            .into_store(),
+    );
     let quiet = global_quiet || request.quiet;
     let platform = request
         .platform
