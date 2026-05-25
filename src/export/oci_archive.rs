@@ -204,7 +204,8 @@ async fn load_archive_inputs(store: &Store, reference: &StoredReference) -> Resu
     let mut missing = Vec::new();
     let mut resolved_diff_ids = Vec::with_capacity(diff_ids.len());
     for (layer, diff_id) in manifest.layers.iter().zip(diff_ids) {
-        if !store.blob_path(&layer.digest)?.exists() {
+        let blob_path = store.blob_path(&layer.digest)?;
+        if !tokio_fs::try_exists(&blob_path).await? {
             missing.push(diff_id.clone());
         }
         resolved_diff_ids.push(diff_id);

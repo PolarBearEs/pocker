@@ -62,7 +62,7 @@ pub async fn run() -> Result<()> {
         Commands::Serve(args) => {
             let store = Arc::new(Store::open_active(cli.global.cache_dir.clone()).await?);
             let credentials = read_credentials(args.auth.username, args.auth.password_stdin)?;
-            let auth = Arc::new(AuthResolver::new(credentials)?);
+            let auth = Arc::new(AuthResolver::new_async(credentials).await?);
             let client = Arc::new(RegistryClient::new(
                 build_http_client(
                     args.registry.plain_http,

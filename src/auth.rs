@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::io::ErrorKind;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -60,10 +61,24 @@ struct HelperResponse {
 }
 
 impl AuthResolver {
+    #[cfg(test)]
     pub fn new(cli_credentials: Option<Credentials>) -> Result<Self> {
         Ok(Self {
             cli_credentials,
             docker_config: load_docker_config()?.map(Arc::new),
+            resolved: Mutex::new(HashMap::new()),
+        })
+    }
+
+    pub async fn new_async(cli_credentials: Option<Credentials>) -> Result<Self> {
+        let docker_config = tokio::task::spawn_blocking(load_docker_config)
+            .await
+            .map_err(|error| {
+                DockerPullError::InvalidInput(format!("docker config task panicked: {error}"))
+            })??;
+        Ok(Self {
+            cli_credentials,
+            docker_config: docker_config.map(Arc::new),
             resolved: Mutex::new(HashMap::new()),
         })
     }
@@ -142,12 +157,9 @@ fn decode_auth_entry(auth: &str) -> Result<Credentials> {
 
 fn load_docker_config() -> Result<Option<DockerConfig>> {
     let path = docker_config_path();
-    if !path.exists() {
-        return Ok(None);
-    }
-
     let content = match std::fs::read_to_string(&path) {
         Ok(content) => content,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
         Err(error) => {
             warn!(
                 "failed to read docker config at `{}`: {}; continuing without docker auth",
