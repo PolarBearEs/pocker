@@ -35,6 +35,21 @@ pub struct UiGroup {
     mode: UiGroupMode,
 }
 
+pub trait ProgressSink: Send + Sync {
+    fn begin_image(&self, image: &str);
+    fn begin_load(&self, image: &str);
+    fn set_image_status(&self, image: &str, status: &str);
+    fn finish_image(&self, image: &str, status: &str);
+    fn prepare_layers(&self, digests: &[String]);
+    fn mark_layer_cached(&self, digest: &str);
+    fn mark_layer_daemon(&self, digest: &str);
+    fn start_layer_download(&self, digest: &str, total_bytes: u64, starting_offset: u64);
+    fn advance_layer_download(&self, digest: &str, amount: u64);
+    fn finish_layer_download(&self, digest: &str);
+    fn set_layer_status(&self, digest: &str, status: &str);
+    fn warn(&self, message: &str);
+}
+
 #[derive(Clone)]
 enum UiMode {
     Quiet,
@@ -285,15 +300,6 @@ impl Ui {
         );
     }
 
-    pub fn warn(&self, message: impl Into<String>) {
-        let message = format!("warning: {}", message.into());
-        match &self.mode {
-            UiMode::Progress(inner) => inner.image.println(message),
-            UiMode::Plain { .. } => self.plain_line(message),
-            UiMode::Quiet => {}
-        }
-    }
-
     fn finish_layer_status(&self, digest: &str, progress_status: &str, plain_status: &str) {
         self.dispatch_mode(
             |inner| {
@@ -335,6 +341,61 @@ impl Ui {
             } => eprintln!("[{prefix}] {}", message.as_ref()),
             UiMode::Plain { prefix: None } => eprintln!("{}", message.as_ref()),
             UiMode::Quiet | UiMode::Progress(_) => {}
+        }
+    }
+}
+
+impl ProgressSink for Ui {
+    fn begin_image(&self, image: &str) {
+        Self::begin_image(self, image);
+    }
+
+    fn begin_load(&self, image: &str) {
+        Self::begin_load(self, image);
+    }
+
+    fn set_image_status(&self, image: &str, status: &str) {
+        Self::set_image_status(self, image, status);
+    }
+
+    fn finish_image(&self, image: &str, status: &str) {
+        Self::finish_image(self, image, status);
+    }
+
+    fn prepare_layers(&self, digests: &[String]) {
+        Self::prepare_layers(self, digests);
+    }
+
+    fn mark_layer_cached(&self, digest: &str) {
+        Self::mark_layer_cached(self, digest);
+    }
+
+    fn mark_layer_daemon(&self, digest: &str) {
+        Self::mark_layer_daemon(self, digest);
+    }
+
+    fn start_layer_download(&self, digest: &str, total_bytes: u64, starting_offset: u64) {
+        Self::start_layer_download(self, digest, total_bytes, starting_offset);
+    }
+
+    fn advance_layer_download(&self, digest: &str, amount: u64) {
+        Self::advance_layer_download(self, digest, amount);
+    }
+
+    fn finish_layer_download(&self, digest: &str) {
+        Self::finish_layer_download(self, digest);
+    }
+
+    fn set_layer_status(&self, digest: &str, status: &str) {
+        Self::set_layer_status(self, digest, status);
+    }
+
+    fn warn(&self, message: &str) {
+        let message = format!("warning: {message}");
+        match &self.mode {
+            UiMode::Progress(inner) => inner.image.println(message),
+            UiMode::Plain { .. } => self.plain_line(message),
+            UiMode::Quiet => {}
         }
     }
 }

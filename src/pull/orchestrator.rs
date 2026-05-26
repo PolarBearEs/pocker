@@ -16,25 +16,49 @@ use crate::pull::{
 use crate::reference;
 use crate::registry::{DEFAULT_REQUEST_RETRIES, RegistryClient};
 use crate::signal;
-use crate::store::Store;
+use crate::store::{ActiveStore, Store};
 use crate::ui::UiGroup;
 
 pub(crate) struct PullRequestOptions {
+    download: PullDownloadConfig,
+    image_concurrency: usize,
+    retry: RetryConfig,
+    import: ImportConfig,
+    registry: RegistryConfig,
+    auth: AuthConfig,
+    quiet: bool,
+    cache: CacheSourceConfig,
+    no_animations: bool,
+}
+
+struct PullDownloadConfig {
     platform: Option<String>,
     concurrency: usize,
-    image_concurrency: usize,
+}
+
+struct RetryConfig {
     blob_retry_limit: Option<u32>,
     request_retry_limit: Option<u32>,
+}
+
+struct ImportConfig {
     no_load: bool,
     keep_layer_blobs: bool,
     load_mode: LoadMode,
+}
+
+struct RegistryConfig {
     plain_http: bool,
     insecure_skip_tls_verify: bool,
     ca_file: Option<std::path::PathBuf>,
+}
+
+struct AuthConfig {
     username: Option<String>,
     password_stdin: bool,
-    quiet: bool,
-    no_animations: bool,
+}
+
+struct CacheSourceConfig {
     cache_from: Option<url::Url>,
     cache_only: bool,
 }
@@ -53,31 +77,43 @@ impl PullRequestOptions {
 
     fn from_args(args: PullCommonArgs, no_animations: bool) -> Self {
         Self {
-            platform: args.download.platform,
-            concurrency: args.download.concurrency,
+            download: PullDownloadConfig {
+                platform: args.download.platform,
+                concurrency: args.download.concurrency,
+            },
             image_concurrency: args.image_parallel.image_concurrency,
-            blob_retry_limit: retry_limit(
-                args.retry.blob_retries,
-                args.retry.retry_forever,
-                DEFAULT_BLOB_RETRIES,
-            ),
-            request_retry_limit: retry_limit(
-                args.retry.request_retries,
-                args.retry.retry_forever,
-                DEFAULT_REQUEST_RETRIES,
-            ),
-            no_load: args.import.no_load,
-            keep_layer_blobs: args.import.keep_layer_blobs,
-            load_mode: args.import.load_mode,
-            plain_http: args.registry.plain_http,
-            insecure_skip_tls_verify: args.registry.insecure_skip_tls_verify,
-            ca_file: args.registry.ca_file,
-            username: args.auth.username,
-            password_stdin: args.auth.password_stdin,
+            retry: RetryConfig {
+                blob_retry_limit: retry_limit(
+                    args.retry.blob_retries,
+                    args.retry.retry_forever,
+                    DEFAULT_BLOB_RETRIES,
+                ),
+                request_retry_limit: retry_limit(
+                    args.retry.request_retries,
+                    args.retry.retry_forever,
+                    DEFAULT_REQUEST_RETRIES,
+                ),
+            },
+            import: ImportConfig {
+                no_load: args.import.no_load,
+                keep_layer_blobs: args.import.keep_layer_blobs,
+                load_mode: args.import.load_mode,
+            },
+            registry: RegistryConfig {
+                plain_http: args.registry.plain_http,
+                insecure_skip_tls_verify: args.registry.insecure_skip_tls_verify,
+                ca_file: args.registry.ca_file,
+            },
+            auth: AuthConfig {
+                username: args.auth.username,
+                password_stdin: args.auth.password_stdin,
+            },
             quiet: args.output.quiet,
             no_animations,
-            cache_from: args.cache.cache_from,
-            cache_only: args.cache.cache_only,
+            cache: CacheSourceConfig {
+                cache_from: args.cache.cache_from,
+                cache_only: args.cache.cache_only,
+            },
         }
     }
 }
@@ -113,39 +149,45 @@ pub(crate) async fn pull_references(
     request: PullRequestOptions,
 ) -> Result<()> {
     let references = pocker_compose::unique_images(&references);
-    let store = Arc::new(Store::open_active(cache_dir.to_path_buf()).await?);
+    let store = Arc::new(
+        ActiveStore::open(cache_dir.to_path_buf())
+            .await?
+            .into_store(),
+    );
     let quiet = global_quiet || request.quiet;
     let platform = request
+        .download
         .platform
         .as_deref()
         .map(Platform::parse)
         .transpose()?
         .unwrap_or_else(Platform::host);
-    let credentials = read_credentials(request.username, request.password_stdin)?;
+    let credentials = read_credentials(request.auth.username, request.auth.password_stdin)?;
     let auth = Arc::new(AuthResolver::new_async(credentials).await?);
     let client = Arc::new(RegistryClient::new_with_cache_from(
         build_http_client(
-            request.plain_http
+            request.registry.plain_http
                 || request
+                    .cache
                     .cache_from
                     .as_ref()
                     .is_some_and(|url| url.scheme() == "http"),
-            request.insecure_skip_tls_verify,
-            request.ca_file.as_deref(),
+            request.registry.insecure_skip_tls_verify,
+            request.registry.ca_file.as_deref(),
         )?,
         auth,
-        request.plain_http,
-        request.request_retry_limit,
-        request.cache_from,
-        request.cache_only,
+        request.registry.plain_http,
+        request.retry.request_retry_limit,
+        request.cache.cache_from,
+        request.cache.cache_only,
     ));
     let stop = signal::install_handler();
     let options = PullOptions {
         platform,
-        concurrency: request.concurrency.max(1),
-        no_load: request.no_load,
-        keep_layer_blobs: request.keep_layer_blobs,
-        load_mode: request.load_mode,
+        concurrency: request.download.concurrency.max(1),
+        no_load: request.import.no_load,
+        keep_layer_blobs: request.import.keep_layer_blobs,
+        load_mode: request.import.load_mode,
     };
     let daemon_layer_cache = (options.load_mode == LoadMode::Stream)
         .then(|| Arc::new(crate::docker::DaemonLayerCache::new()));
@@ -154,7 +196,7 @@ pub(crate) async fn pull_references(
         store,
         registry: client,
         stop,
-        blob_retry_limit: request.blob_retry_limit,
+        blob_retry_limit: request.retry.blob_retry_limit,
         blob_locks: Arc::new(BlobDownloadLocks::default()),
         daemon_layer_cache,
         options,

@@ -2,6 +2,7 @@ mod fs;
 
 use std::fs::{File, OpenOptions};
 use std::io::ErrorKind;
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -23,6 +24,16 @@ pub struct Store {
     // Keeps the active cache lock held for the Store lifetime.
     #[allow(dead_code)]
     shared_lock: Option<std::sync::Arc<File>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ActiveStore {
+    store: Store,
+}
+
+#[derive(Debug, Clone)]
+pub struct MaintenanceStore {
+    store: Store,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,10 +70,6 @@ struct DownloadCheckpoint {
 impl Store {
     pub async fn open(root: PathBuf) -> Result<Self> {
         Self::open_with_lock(root, false).await
-    }
-
-    pub async fn open_active(root: PathBuf) -> Result<Self> {
-        Self::open_with_lock(root, true).await
     }
 
     async fn open_with_lock(root: PathBuf, shared_lock: bool) -> Result<Self> {
@@ -261,16 +268,6 @@ impl Store {
             })?
     }
 
-    pub async fn clear(&self) -> Result<ClearedCache> {
-        self.clear_with_report(true)
-            .await
-            .map(|report| report.expect("clear_with_report(true) must return Some"))
-    }
-
-    pub async fn clear_quiet(&self) -> Result<()> {
-        self.clear_with_report(false).await.map(|_| ())
-    }
-
     async fn clear_with_report(&self, collect_report: bool) -> Result<Option<ClearedCache>> {
         let root = self.root.clone();
         let _exclusive_lock = tokio::task::spawn_blocking(move || {
@@ -307,6 +304,53 @@ impl Store {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+}
+
+impl ActiveStore {
+    pub async fn open(root: PathBuf) -> Result<Self> {
+        Ok(Self {
+            store: Store::open_with_lock(root, true).await?,
+        })
+    }
+
+    pub fn into_store(self) -> Store {
+        self.store
+    }
+}
+
+impl Deref for ActiveStore {
+    type Target = Store;
+
+    fn deref(&self) -> &Self::Target {
+        &self.store
+    }
+}
+
+impl MaintenanceStore {
+    pub async fn open(root: PathBuf) -> Result<Self> {
+        Ok(Self {
+            store: Store::open_with_lock(root, false).await?,
+        })
+    }
+
+    pub async fn clear(&self) -> Result<ClearedCache> {
+        self.store
+            .clear_with_report(true)
+            .await
+            .map(|report| report.expect("clear_with_report(true) must return Some"))
+    }
+
+    pub async fn clear_quiet(&self) -> Result<()> {
+        self.store.clear_with_report(false).await.map(|_| ())
+    }
+}
+
+impl Deref for MaintenanceStore {
+    type Target = Store;
+
+    fn deref(&self) -> &Self::Target {
+        &self.store
     }
 }
 
@@ -568,7 +612,9 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::{ClearedCacheFile, Store, StoredReference, reference_key};
+    use super::{
+        ActiveStore, ClearedCacheFile, MaintenanceStore, Store, StoredReference, reference_key,
+    };
     use crate::error::DockerPullError;
     use crate::registry::Descriptor;
 
@@ -860,7 +906,7 @@ mod tests {
     #[tokio::test]
     async fn clear_removes_cached_files_and_recreates_layout() {
         let dir = tempdir().expect("tempdir should create");
-        let store = Store::open(dir.path().to_path_buf())
+        let store = MaintenanceStore::open(dir.path().to_path_buf())
             .await
             .expect("store should open");
         let lock = super::cache_lock_path(store.root());
@@ -928,7 +974,7 @@ mod tests {
     #[tokio::test]
     async fn clear_quiet_removes_cache_without_collecting_report() {
         let dir = tempdir().expect("tempdir should create");
-        let store = Store::open(dir.path().to_path_buf())
+        let store = MaintenanceStore::open(dir.path().to_path_buf())
             .await
             .expect("store should open");
         let blob = store
@@ -951,10 +997,10 @@ mod tests {
     #[tokio::test]
     async fn clear_waits_for_active_cache_lock() {
         let dir = tempdir().expect("tempdir should create");
-        let active_store = Store::open_active(dir.path().to_path_buf())
+        let active_store = ActiveStore::open(dir.path().to_path_buf())
             .await
             .expect("active store should open");
-        let cleaner = Store::open(dir.path().to_path_buf())
+        let cleaner = MaintenanceStore::open(dir.path().to_path_buf())
             .await
             .expect("cleaner store should open");
 

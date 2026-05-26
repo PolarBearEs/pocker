@@ -18,7 +18,7 @@ use crate::platform::Platform;
 use crate::reference::ImageReference;
 use crate::registry::{Descriptor, RegistryClient};
 use crate::store::{Store, StoredReference};
-use crate::ui::Ui;
+use crate::ui::ProgressSink;
 
 pub const DEFAULT_BLOB_RETRIES: u32 = 8;
 
@@ -27,7 +27,7 @@ pub struct PullContext {
     pub store: Arc<Store>,
     pub registry: Arc<RegistryClient>,
     pub stop: CancellationToken,
-    pub ui: Arc<Ui>,
+    pub ui: Arc<dyn ProgressSink>,
     pub blob_retry_limit: Option<u32>,
     pub blob_locks: Arc<BlobDownloadLocks>,
     pub daemon_layer_cache: Option<Arc<docker::DaemonLayerCache>>,
@@ -160,9 +160,10 @@ impl Puller {
                 Ok(coverage) => coverage,
                 Err(error) => {
                     warn!("failed to inspect Docker daemon layer coverage: {error}");
-                    self.context.ui.warn(format!(
+                    let warning = format!(
                         "could not inspect existing Docker layers; downloading all missing cache layers: {error}"
-                    ));
+                    );
+                    self.context.ui.warn(&warning);
                     Default::default()
                 }
             }
