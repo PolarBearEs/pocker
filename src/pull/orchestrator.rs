@@ -176,7 +176,13 @@ async fn plan_pull_references(
             let platform = platform.clone();
             async move {
                 let reference = ImageReference::parse(&raw_reference)?;
-                let resolved = registry.resolve_image(&reference, &platform).await?;
+                let resolved = registry
+                    .resolve_image(&reference, &platform)
+                    .await
+                    .map_err(|source| DockerPullError::ImageResolutionFailed {
+                        reference: reference.display_name(),
+                        source: Box::new(source),
+                    })?;
                 let layer_digests = resolved
                     .layers
                     .iter()
