@@ -593,6 +593,7 @@ mod tests {
             format!(
                 r#"#!/bin/sh
 count_file="{}"
+cat >/dev/null
 printf x >> "$count_file"
 sleep 0.2
 printf '{{"Username":"helper-user","Secret":"helper-pass"}}'
@@ -678,6 +679,7 @@ printf '{{"Username":"helper-user","Secret":"helper-pass"}}'
                 &helper_path,
                 format!(
                     r#"#!/bin/sh
+cat >/dev/null
 printf '{{"Username":"{username}","Secret":"{password}"}}'
 "#
                 ),
