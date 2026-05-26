@@ -300,15 +300,6 @@ impl Ui {
         );
     }
 
-    pub fn warn(&self, message: impl Into<String>) {
-        let message = format!("warning: {}", message.into());
-        match &self.mode {
-            UiMode::Progress(inner) => inner.image.println(message),
-            UiMode::Plain { .. } => self.plain_line(message),
-            UiMode::Quiet => {}
-        }
-    }
-
     fn finish_layer_status(&self, digest: &str, progress_status: &str, plain_status: &str) {
         self.dispatch_mode(
             |inner| {
@@ -400,7 +391,12 @@ impl ProgressSink for Ui {
     }
 
     fn warn(&self, message: &str) {
-        Self::warn(self, message);
+        let message = format!("warning: {message}");
+        match &self.mode {
+            UiMode::Progress(inner) => inner.image.println(message),
+            UiMode::Plain { .. } => self.plain_line(message),
+            UiMode::Quiet => {}
+        }
     }
 }
 

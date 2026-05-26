@@ -160,9 +160,10 @@ impl Puller {
                 Ok(coverage) => coverage,
                 Err(error) => {
                     warn!("failed to inspect Docker daemon layer coverage: {error}");
-                    self.context.ui.warn(&format!(
+                    let warning = format!(
                         "could not inspect existing Docker layers; downloading all missing cache layers: {error}"
-                    ));
+                    );
+                    self.context.ui.warn(&warning);
                     Default::default()
                 }
             }

@@ -21,12 +21,12 @@ use crate::ui::UiGroup;
 
 pub(crate) struct PullRequestOptions {
     download: PullDownloadConfig,
-    image_parallel: ImageParallelConfig,
+    image_concurrency: usize,
     retry: RetryConfig,
     import: ImportConfig,
     registry: RegistryConfig,
     auth: AuthConfig,
-    output: PullOutputConfig,
+    quiet: bool,
     cache: CacheSourceConfig,
     no_animations: bool,
 }
@@ -34,10 +34,6 @@ pub(crate) struct PullRequestOptions {
 struct PullDownloadConfig {
     platform: Option<String>,
     concurrency: usize,
-}
-
-struct ImageParallelConfig {
-    image_concurrency: usize,
 }
 
 struct RetryConfig {
@@ -60,10 +56,6 @@ struct RegistryConfig {
 struct AuthConfig {
     username: Option<String>,
     password_stdin: bool,
-}
-
-struct PullOutputConfig {
-    quiet: bool,
 }
 
 struct CacheSourceConfig {
@@ -89,9 +81,7 @@ impl PullRequestOptions {
                 platform: args.download.platform,
                 concurrency: args.download.concurrency,
             },
-            image_parallel: ImageParallelConfig {
-                image_concurrency: args.image_parallel.image_concurrency,
-            },
+            image_concurrency: args.image_parallel.image_concurrency,
             retry: RetryConfig {
                 blob_retry_limit: retry_limit(
                     args.retry.blob_retries,
@@ -118,9 +108,7 @@ impl PullRequestOptions {
                 username: args.auth.username,
                 password_stdin: args.auth.password_stdin,
             },
-            output: PullOutputConfig {
-                quiet: args.output.quiet,
-            },
+            quiet: args.output.quiet,
             no_animations,
             cache: CacheSourceConfig {
                 cache_from: args.cache.cache_from,
@@ -166,7 +154,7 @@ pub(crate) async fn pull_references(
             .await?
             .into_store(),
     );
-    let quiet = global_quiet || request.output.quiet;
+    let quiet = global_quiet || request.quiet;
     let platform = request
         .download
         .platform
@@ -215,19 +203,14 @@ pub(crate) async fn pull_references(
         ui_group: UiGroup::new(quiet, !request.no_animations),
     };
 
-    if request.image_parallel.image_concurrency <= 1 {
+    if request.image_concurrency <= 1 {
         for reference in references {
             pull_reference_with_group(state.clone(), reference).await?;
         }
         return Ok(());
     }
 
-    pull_references_parallel(
-        state,
-        references,
-        request.image_parallel.image_concurrency.max(1),
-    )
-    .await
+    pull_references_parallel(state, references, request.image_concurrency.max(1)).await
 }
 
 async fn pull_references_parallel(
