@@ -135,24 +135,18 @@ fn print_compose_config(
     pull_plan: bool,
     format: Option<ComposeConfigFormat>,
 ) -> Result<()> {
-    write_compose_config(
-        std::io::stdout(),
-        std::io::stderr(),
-        resolved,
-        images,
-        services_only,
-        pull_plan,
-        format,
-    )
+    if pull_plan {
+        return print_compose_pull_plan(resolved, false);
+    }
+
+    write_compose_config(std::io::stdout(), resolved, images, services_only, format)
 }
 
 fn write_compose_config(
     mut out: impl Write,
-    err: impl Write,
     resolved: &compose::ComposeImages,
     images: bool,
     services_only: bool,
-    pull_plan: bool,
     format: Option<ComposeConfigFormat>,
 ) -> Result<()> {
     if images {
@@ -166,11 +160,6 @@ fn write_compose_config(
         for service in &resolved.services {
             writeln!(out, "{}", service.service)?;
         }
-        return Ok(());
-    }
-
-    if pull_plan {
-        write_compose_pull_plan(err, resolved, false)?;
         return Ok(());
     }
 
@@ -295,21 +284,17 @@ mod tests {
     fn compose_config_images_writes_unique_images_to_output() {
         let resolved = compose_images();
         let mut out = Vec::new();
-        let mut err = Vec::new();
 
         write_compose_config(
             &mut out,
-            &mut err,
             &resolved,
             true,
-            false,
             false,
             Some(ComposeConfigFormat::Json),
         )
         .expect("config output should write");
 
         assert_eq!(String::from_utf8(out).expect("utf8"), "nginx:alpine\n");
-        assert!(err.is_empty());
     }
 
     #[test]
