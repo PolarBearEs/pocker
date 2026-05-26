@@ -13,7 +13,7 @@ use tracing::warn;
 use crate::digest::parse_digest;
 use crate::error::{DockerPullError, Result};
 use crate::platform::Platform;
-use crate::pull::{BlobDownloadLocks, PullContext, download};
+use crate::pull::{BlobDownloadLocks, CurrentPullLayers, PullContext, download};
 use crate::reference::ImageReference;
 use crate::registry::{
     Descriptor, MANIFEST_ACCEPT, OCI_IMAGE_MANIFEST_MEDIA_TYPE, OCTET_STREAM_MEDIA_TYPE,
@@ -81,6 +81,7 @@ pub(crate) async fn serve_listener(
             ui: Arc::new(Ui::new(config.quiet, false)),
             blob_retry_limit: config.blob_retry_limit,
             blob_locks: Arc::new(BlobDownloadLocks::default()),
+            layer_usage: Arc::new(CurrentPullLayers::default()),
             daemon_layer_cache: None,
         }),
     });
@@ -484,7 +485,7 @@ mod tests {
     };
     use crate::auth::AuthResolver;
     use crate::platform::Platform;
-    use crate::pull::{BlobDownloadLocks, PullContext, PullOptions, Puller};
+    use crate::pull::{BlobDownloadLocks, CurrentPullLayers, PullContext, PullOptions, Puller};
     use crate::reference::ImageReference;
     use crate::registry::{Descriptor, RegistryClient, cache_repository};
     use crate::serve_registry::response::parse_byte_range;
@@ -834,6 +835,11 @@ mod tests {
             ),
             true,
         ));
+        let reference = ImageReference::parse("alpine:latest").expect("reference should parse");
+        let resolved = registry
+            .resolve_image(&reference, &Platform::host())
+            .await
+            .expect("image should resolve through cache server");
         let puller = Puller::new(PullContext {
             store: Arc::clone(&client_store),
             registry,
@@ -841,14 +847,15 @@ mod tests {
             ui: Arc::new(Ui::new(true, false)),
             blob_retry_limit: Some(1),
             blob_locks: Arc::new(BlobDownloadLocks::default()),
+            layer_usage: Arc::new(CurrentPullLayers::default()),
             daemon_layer_cache: None,
         });
 
         puller
-            .pull(
-                ImageReference::parse("alpine:latest").expect("reference should parse"),
+            .pull_resolved(
+                reference,
+                resolved,
                 PullOptions {
-                    platform: Platform::host(),
                     concurrency: 1,
                     no_load: true,
                     keep_layer_blobs: true,
@@ -900,6 +907,7 @@ mod tests {
                 ui: Arc::new(Ui::new(true, false)),
                 blob_retry_limit: Some(1),
                 blob_locks: Arc::new(BlobDownloadLocks::default()),
+                layer_usage: Arc::new(CurrentPullLayers::default()),
                 daemon_layer_cache: None,
             }),
         });
