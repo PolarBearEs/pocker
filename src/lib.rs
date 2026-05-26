@@ -15,12 +15,15 @@ mod pull;
 mod reference;
 mod registry;
 mod retry;
-mod runtime;
 mod serve_registry;
 mod signal;
 mod store;
 mod ui;
 mod units;
 
+pub use cli::Cli;
 pub use error::{DockerPullError as Error, Result};
-pub use runtime::run;
+
+pub async fn run(cli: Cli) -> Result<()> {
+    commands::execute(cli).await
+}
