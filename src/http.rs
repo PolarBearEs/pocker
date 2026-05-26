@@ -5,7 +5,12 @@ use reqwest::{Certificate, Client, ClientBuilder};
 
 use crate::error::Result;
 
+// Bounds connection setup to unreachable hosts without limiting slow but
+// progressing blob transfers after the connection is established.
 pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+// Idle read timeout: each socket read must make progress within this window.
+// This deliberately is not a total request timeout so constrained networks can
+// finish large transfers as long as bytes keep arriving.
 pub(crate) const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(60);
 pub(crate) const USER_AGENT: &str = concat!("pocker/", env!("CARGO_PKG_VERSION"));
 

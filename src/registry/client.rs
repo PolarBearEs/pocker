@@ -26,7 +26,11 @@ use crate::platform::Platform;
 use crate::reference::ImageReference;
 use crate::retry::{jittered_backoff_delay, record_retry_attempt};
 
+// Metadata requests are small and should fail fast enough to surface bad
+// registries, while still tolerating transient DNS/TLS/5xx failures.
 pub const DEFAULT_REQUEST_RETRIES: u32 = 5;
+// Auth retries are intentionally tighter than network retries so bad or stale
+// credentials do not spin indefinitely.
 const MAX_AUTH_RETRIES: u32 = 2;
 const DOCKER_CONTENT_DIGEST: HeaderName = HeaderName::from_static("docker-content-digest");
 

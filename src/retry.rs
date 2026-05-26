@@ -1,6 +1,8 @@
 use crate::error::DockerPullError;
 use std::time::Duration;
 
+// Keep the first retry responsive for brief network blips, then cap backoff so
+// long-running pulls on poor links continue to make periodic progress.
 const MIN_RETRY_DELAY: Duration = Duration::from_millis(100);
 const INITIAL_RETRY_DELAY: Duration = Duration::from_millis(500);
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);

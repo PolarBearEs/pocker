@@ -19,6 +19,9 @@ use crate::registry::{Descriptor, RegistryClient, ResolvedImage};
 use crate::store::{Store, StoredReference};
 use crate::ui::ProgressSink;
 
+// Blob retries are higher than metadata request retries because large layer
+// transfers are the most likely operation to hit transient slow-network stalls.
+// Retries resume from durable partial files rather than restarting from zero.
 pub const DEFAULT_BLOB_RETRIES: u32 = 8;
 
 #[derive(Clone)]
@@ -84,6 +87,9 @@ pub struct LayerClaimGuard<'a> {
 
 impl BlobDownloadLocks {
     pub async fn lock(&self, digest: &str) -> BlobDownloadGuard<'_> {
+        // Keep one mutex per digest while a download is active or another task
+        // is waiting for it, so concurrent pulls deduplicate the same blob
+        // without leaking entries after the final guard is gone.
         let lock = {
             let mut locks = self.locks.lock().expect("blob lock state poisoned");
             locks
@@ -451,6 +457,25 @@ mod tests {
         assert_eq!(locks.len(), 1);
 
         waiter.await.expect("waiter task should finish");
+        assert_eq!(locks.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn blob_download_locks_remove_entries_after_waiter_cancellation() {
+        let locks = std::sync::Arc::new(BlobDownloadLocks::default());
+        let guard = locks.lock("sha256:abc").await;
+        let waiter_locks = std::sync::Arc::clone(&locks);
+
+        let waiter = tokio::spawn(async move {
+            let _guard = waiter_locks.lock("sha256:abc").await;
+        });
+        tokio::task::yield_now().await;
+
+        waiter.abort();
+        let result = waiter.await;
+        assert!(result.is_err_and(|error| error.is_cancelled()));
+
+        drop(guard);
         assert_eq!(locks.len(), 0);
     }
 

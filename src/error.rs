@@ -36,6 +36,12 @@ pub enum DockerPullError {
         retries: u32,
         detail: String,
     },
+    #[error("failed to resolve image `{reference}`: {source}")]
+    ImageResolutionFailed {
+        reference: String,
+        #[source]
+        source: Box<DockerPullError>,
+    },
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]
@@ -50,4 +56,22 @@ pub enum DockerPullError {
     Header(#[from] http::header::ToStrError),
     #[error(transparent)]
     Base64(#[from] base64::DecodeError),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DockerPullError;
+
+    #[test]
+    fn image_resolution_error_includes_reference_and_source() {
+        let error = DockerPullError::ImageResolutionFailed {
+            reference: "example.com/library/app:latest".to_string(),
+            source: Box::new(DockerPullError::PlatformNotFound("linux/s390x".to_string())),
+        };
+
+        assert_eq!(
+            error.to_string(),
+            "failed to resolve image `example.com/library/app:latest`: requested platform `linux/s390x` not found in image index"
+        );
+    }
 }

@@ -138,19 +138,51 @@ struct PlannedPull {
     layer_digests: Vec<String>,
 }
 
+struct PullPlan {
+    pulls: Vec<PlannedPull>,
+    image_layers: Vec<Vec<String>>,
+}
+
+impl PullPlan {
+    fn new(pulls: Vec<PlannedPull>) -> Self {
+        let image_layers = pulls
+            .iter()
+            .map(|planned| planned.layer_digests.clone())
+            .collect();
+        Self {
+            pulls,
+            image_layers,
+        }
+    }
+
+    fn layer_usage(&self) -> CurrentPullLayers {
+        CurrentPullLayers::from_image_layers(&self.image_layers)
+    }
+
+    fn into_pulls(self) -> Vec<PlannedPull> {
+        self.pulls
+    }
+}
+
 async fn plan_pull_references(
     references: &[String],
     registry: Arc<RegistryClient>,
     platform: &Platform,
     concurrency: usize,
-) -> Result<Vec<PlannedPull>> {
+) -> Result<PullPlan> {
     let mut planned = stream::iter(references.iter().cloned().enumerate())
         .map(|(index, raw_reference)| {
             let registry = Arc::clone(&registry);
             let platform = platform.clone();
             async move {
                 let reference = ImageReference::parse(&raw_reference)?;
-                let resolved = registry.resolve_image(&reference, &platform).await?;
+                let resolved = registry
+                    .resolve_image(&reference, &platform)
+                    .await
+                    .map_err(|source| DockerPullError::ImageResolutionFailed {
+                        reference: reference.display_name(),
+                        source: Box::new(source),
+                    })?;
                 let layer_digests = resolved
                     .layers
                     .iter()
@@ -175,7 +207,7 @@ async fn plan_pull_references(
         ordered[index] = Some(planned_pull);
     }
 
-    Ok(ordered.into_iter().flatten().collect())
+    Ok(PullPlan::new(ordered.into_iter().flatten().collect()))
 }
 
 #[derive(Clone)]
@@ -231,18 +263,15 @@ pub(crate) async fn pull_references(
         request.cache.cache_only,
     ));
     let image_concurrency = request.image_concurrency.max(1);
-    let planned_pulls = plan_pull_references(
+    let pull_plan = plan_pull_references(
         &references,
         Arc::clone(&client),
         &platform,
         image_concurrency,
     )
     .await?;
-    let image_layers = planned_pulls
-        .iter()
-        .map(|planned| planned.layer_digests.clone())
-        .collect::<Vec<_>>();
-    let layer_usage = Arc::new(CurrentPullLayers::from_image_layers(&image_layers));
+    let layer_usage = Arc::new(pull_plan.layer_usage());
+    let planned_pulls = pull_plan.into_pulls();
     let stop = signal::install_handler();
     let options = PullOptions {
         concurrency: request.download.concurrency.max(1),
@@ -355,4 +384,54 @@ async fn pull_reference_with_group(
     Puller::new(context)
         .pull_resolved(reference, resolved, state.options)
         .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PlannedPull, PullPlan};
+    use crate::reference::ImageReference;
+    use crate::registry::{Descriptor, ResolvedImage};
+
+    #[test]
+    fn pull_plan_builds_layer_usage_from_resolved_images() {
+        let first_layers = vec!["sha256:shared".to_string(), "sha256:first".to_string()];
+        let second_layers = vec!["sha256:shared".to_string(), "sha256:second".to_string()];
+        let plan = PullPlan::new(vec![
+            planned_pull("example.com/library/first:latest", first_layers.clone()),
+            planned_pull("example.com/library/second:latest", second_layers),
+        ]);
+        let usage = plan.layer_usage();
+
+        let first_claim = usage.claim(&first_layers);
+
+        assert!(first_claim.protected_digests().contains("sha256:shared"));
+        assert!(!first_claim.protected_digests().contains("sha256:first"));
+    }
+
+    fn planned_pull(raw_reference: &str, layer_digests: Vec<String>) -> PlannedPull {
+        let layers = layer_digests
+            .iter()
+            .map(|digest| descriptor(digest))
+            .collect::<Vec<_>>();
+        PlannedPull {
+            reference: ImageReference::parse(raw_reference).expect("reference should parse"),
+            resolved: ResolvedImage {
+                manifest: descriptor("sha256:manifest"),
+                manifest_bytes: Vec::new(),
+                config: descriptor("sha256:config"),
+                layers,
+            },
+            layer_digests,
+        }
+    }
+
+    fn descriptor(digest: &str) -> Descriptor {
+        Descriptor {
+            media_type: String::new(),
+            digest: digest.to_string(),
+            size: 0,
+            platform: None,
+            annotations: None,
+        }
+    }
 }

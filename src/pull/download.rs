@@ -14,7 +14,11 @@ use crate::registry::Descriptor;
 use crate::retry::{jittered_backoff_delay, record_retry_attempt};
 use crate::store::DownloadPlan;
 
+// Persist partial-download progress often enough that cancellation or flaky
+// links do not lose much work, without syncing every small network chunk.
 const CHECKPOINT_BYTES: u64 = 8 * 1024 * 1024;
+// Time-based checkpointing protects very slow links that may take a long time
+// to reach the byte threshold while still making legitimate progress.
 const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(2);
 
 pub async fn download_blob(
@@ -198,9 +202,16 @@ pub async fn download_blob(
 }
 
 async fn sleep_or_interrupt(context: &PullContext, delay: Duration) -> Result<()> {
+    sleep_or_interrupt_on_token(&context.stop, delay).await
+}
+
+async fn sleep_or_interrupt_on_token(
+    stop: &tokio_util::sync::CancellationToken,
+    delay: Duration,
+) -> Result<()> {
     tokio::select! {
         _ = tokio::time::sleep(delay) => Ok(()),
-        _ = context.stop.cancelled() => Err(DockerPullError::Interrupted),
+        _ = stop.cancelled() => Err(DockerPullError::Interrupted),
     }
 }
 
@@ -352,7 +363,12 @@ mod tests {
     use reqwest::StatusCode;
     use reqwest::header::{CONTENT_RANGE, HeaderMap, HeaderValue};
 
-    use super::{DownloadProgress, premature_eof_detail, validate_blob_response_status};
+    use std::time::{Duration, Instant};
+
+    use super::{
+        DownloadProgress, premature_eof_detail, sleep_or_interrupt_on_token,
+        validate_blob_response_status,
+    };
     use crate::error::DockerPullError;
 
     #[test]
@@ -438,5 +454,27 @@ mod tests {
         assert_eq!(progress.offset, 15);
         assert_eq!(progress.bytes_since_checkpoint, 5);
         assert!(!progress.should_checkpoint());
+    }
+
+    #[test]
+    fn download_progress_checkpoints_after_interval_for_slow_streams() {
+        let mut progress = DownloadProgress::new(10);
+        progress.last_checkpoint = Instant::now() - Duration::from_secs(3);
+
+        progress.advance(1);
+
+        assert!(progress.should_checkpoint());
+    }
+
+    #[tokio::test]
+    async fn retry_sleep_stops_when_cancelled() {
+        let stop = tokio_util::sync::CancellationToken::new();
+        stop.cancel();
+
+        let error = sleep_or_interrupt_on_token(&stop, Duration::from_secs(60))
+            .await
+            .expect_err("cancelled retry sleep should return immediately");
+
+        assert!(matches!(error, DockerPullError::Interrupted));
     }
 }
