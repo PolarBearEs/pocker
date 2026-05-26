@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::sync::Arc;
 
 use pocker_compose as compose;
@@ -47,7 +48,7 @@ pub(crate) async fn execute(cli: Cli) -> Result<()> {
                 print_compose_pull_plan(
                     &resolved,
                     cli.global.quiet || pull_args.common.output.quiet,
-                );
+                )?;
                 let images = compose::unique_images(&resolved.images);
                 let request = PullRequestOptions::from_compose_pull_args(*pull_args);
                 pull_references(&cli.global.cache_dir, cli.global.quiet, images, request).await?;
@@ -134,81 +135,114 @@ fn print_compose_config(
     pull_plan: bool,
     format: Option<ComposeConfigFormat>,
 ) -> Result<()> {
+    write_compose_config(
+        std::io::stdout(),
+        std::io::stderr(),
+        resolved,
+        images,
+        services_only,
+        pull_plan,
+        format,
+    )
+}
+
+fn write_compose_config(
+    mut out: impl Write,
+    err: impl Write,
+    resolved: &compose::ComposeImages,
+    images: bool,
+    services_only: bool,
+    pull_plan: bool,
+    format: Option<ComposeConfigFormat>,
+) -> Result<()> {
     if images {
         for image in &compose::unique_images(&resolved.images) {
-            println!("{image}");
+            writeln!(out, "{image}")?;
         }
         return Ok(());
     }
 
     if services_only {
         for service in &resolved.services {
-            println!("{}", service.service);
+            writeln!(out, "{}", service.service)?;
         }
         return Ok(());
     }
 
     if pull_plan {
-        print_compose_pull_plan(resolved, false);
+        write_compose_pull_plan(err, resolved, false)?;
         return Ok(());
     }
 
     match format.unwrap_or(ComposeConfigFormat::Json) {
-        ComposeConfigFormat::Json => print_compose_config_json(resolved)?,
+        ComposeConfigFormat::Json => write_compose_config_json(out, resolved)?,
     }
     Ok(())
 }
 
-fn print_compose_config_json(resolved: &compose::ComposeImages) -> Result<()> {
+fn write_compose_config_json(mut out: impl Write, resolved: &compose::ComposeImages) -> Result<()> {
     let mut resolved = resolved.clone();
     resolved.images = compose::unique_images(&resolved.images);
-    serde_json::to_writer_pretty(std::io::stdout(), &resolved)?;
-    println!();
+    serde_json::to_writer_pretty(&mut out, &resolved)?;
+    writeln!(out)?;
     Ok(())
 }
 
-fn print_compose_pull_plan(resolved: &compose::ComposeImages, quiet: bool) {
+fn print_compose_pull_plan(resolved: &compose::ComposeImages, quiet: bool) -> Result<()> {
+    write_compose_pull_plan(std::io::stderr(), resolved, quiet)
+}
+
+fn write_compose_pull_plan(
+    mut err: impl Write,
+    resolved: &compose::ComposeImages,
+    quiet: bool,
+) -> Result<()> {
     if quiet {
-        return;
+        return Ok(());
     }
 
     let images = compose::unique_images(&resolved.images);
-    eprintln!(
+    writeln!(
+        err,
         "{} {} service(s), {} unique image(s)",
         ui::paint("Compose pull plan:", ui::CYAN),
         resolved.services.len(),
         images.len()
-    );
+    )?;
 
     let mut first_service_by_image = std::collections::HashMap::new();
     for service in &resolved.services {
         if let Some(image) = &service.image {
             if let Some(first_service) = first_service_by_image.get(image) {
-                eprintln!(
+                writeln!(
+                    err,
                     "  {} {} {} {}",
                     ui::paint(&service.service, ui::GREEN),
                     ui::paint("->", ui::DIM),
                     image,
                     ui::paint(&format!("(shared with {first_service})"), ui::DIM)
-                );
+                )?;
             } else {
                 first_service_by_image.insert(image.clone(), service.service.clone());
-                eprintln!(
+                writeln!(
+                    err,
                     "  {} {} {}",
                     ui::paint(&service.service, ui::GREEN),
                     ui::paint("->", ui::DIM),
                     image
-                );
+                )?;
             }
         } else if service.build_only {
-            eprintln!(
+            writeln!(
+                err,
                 "  {} {} {}",
                 ui::paint(&service.service, ui::GREEN),
                 ui::paint("->", ui::DIM),
                 ui::paint("build-only (skipped)", ui::YELLOW)
-            );
+            )?;
         }
     }
+    Ok(())
 }
 
 async fn resolve_compose_images(files: Vec<std::path::PathBuf>) -> Result<compose::ComposeImages> {
@@ -250,4 +284,66 @@ async fn clean_cache(store: &MaintenanceStore, quiet: bool) -> Result<()> {
 
 fn print_version() {
     println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{write_compose_config, write_compose_pull_plan};
+    use crate::cli::ComposeConfigFormat;
+
+    #[test]
+    fn compose_config_images_writes_unique_images_to_output() {
+        let resolved = compose_images();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+
+        write_compose_config(
+            &mut out,
+            &mut err,
+            &resolved,
+            true,
+            false,
+            false,
+            Some(ComposeConfigFormat::Json),
+        )
+        .expect("config output should write");
+
+        assert_eq!(String::from_utf8(out).expect("utf8"), "nginx:alpine\n");
+        assert!(err.is_empty());
+    }
+
+    #[test]
+    fn compose_pull_plan_can_be_rendered_without_stderr_side_effects() {
+        let resolved = compose_images();
+        let mut err = Vec::new();
+
+        write_compose_pull_plan(&mut err, &resolved, false).expect("pull plan should write");
+        let output = String::from_utf8(err).expect("utf8");
+
+        assert!(output.contains("Compose pull plan:"));
+        assert!(output.contains("web"));
+        assert!(output.contains("api"));
+        assert!(output.contains("shared with web"));
+    }
+
+    fn compose_images() -> pocker_compose::ComposeImages {
+        pocker_compose::ComposeImages {
+            services: vec![
+                pocker_compose::ComposeServiceImage {
+                    service: "web".to_string(),
+                    image: Some("nginx:alpine".to_string()),
+                    build_only: false,
+                    labels: None,
+                },
+                pocker_compose::ComposeServiceImage {
+                    service: "api".to_string(),
+                    image: Some("nginx:alpine".to_string()),
+                    build_only: false,
+                    labels: None,
+                },
+            ],
+            images: vec!["nginx:alpine".to_string(), "nginx:alpine".to_string()],
+            skipped_build_only: Vec::new(),
+        }
+    }
 }
