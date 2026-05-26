@@ -23,6 +23,8 @@ const DOCKER_HUB_AUTH_KEYS: &[&str] = &[
     "index.docker.io",
     "docker.io",
 ];
+// Credential helpers are local subprocesses; this timeout prevents a hung
+// helper from blocking all registry auth while keeping slow devices usable.
 const CREDENTIAL_HELPER_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone)]

@@ -5,7 +5,10 @@ use tokio::time::{Duration, timeout};
 
 use crate::error::{DockerPullError, Result};
 
+// Cap request headers to avoid unbounded memory growth from malformed clients.
 const MAX_REQUEST_HEAD_BYTES: usize = 64 * 1024;
+// This protects the local registry from clients that connect and stop sending
+// headers. It applies only before a request is parsed, not to blob streaming.
 const REQUEST_HEAD_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Debug)]

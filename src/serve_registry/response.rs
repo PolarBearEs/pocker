@@ -8,6 +8,8 @@ use tokio::time::timeout;
 use crate::error::{DockerPullError, Result};
 use crate::registry::OCTET_STREAM_MEDIA_TYPE;
 
+// Idle timeout for cache-registry responses: slow clients may take a long time
+// to receive large blobs, but each write must eventually make progress.
 const RESPONSE_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const RESPONSE_COPY_BUFFER_BYTES: usize = 64 * 1024;
 

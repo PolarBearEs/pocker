@@ -14,7 +14,11 @@ use crate::registry::Descriptor;
 use crate::retry::{jittered_backoff_delay, record_retry_attempt};
 use crate::store::DownloadPlan;
 
+// Persist partial-download progress often enough that cancellation or flaky
+// links do not lose much work, without syncing every small network chunk.
 const CHECKPOINT_BYTES: u64 = 8 * 1024 * 1024;
+// Time-based checkpointing protects very slow links that may take a long time
+// to reach the byte threshold while still making legitimate progress.
 const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(2);
 
 pub async fn download_blob(

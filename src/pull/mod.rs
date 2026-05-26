@@ -19,6 +19,9 @@ use crate::registry::{Descriptor, RegistryClient, ResolvedImage};
 use crate::store::{Store, StoredReference};
 use crate::ui::ProgressSink;
 
+// Blob retries are higher than metadata request retries because large layer
+// transfers are the most likely operation to hit transient slow-network stalls.
+// Retries resume from durable partial files rather than restarting from zero.
 pub const DEFAULT_BLOB_RETRIES: u32 = 8;
 
 #[derive(Clone)]
