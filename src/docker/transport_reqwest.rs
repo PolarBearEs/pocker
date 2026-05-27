@@ -9,7 +9,7 @@ use tokio::io::DuplexStream;
 use tokio_util::io::ReaderStream;
 
 use crate::error::{DockerPullError, Result};
-use crate::http::{CONNECT_TIMEOUT, DEFAULT_READ_TIMEOUT, USER_AGENT};
+use crate::http::USER_AGENT;
 
 use super::{DockerResponse, build_failure_error};
 
@@ -108,11 +108,7 @@ impl ReqwestTransport {
 }
 
 fn builder() -> reqwest::ClientBuilder {
-    Client::builder()
-        .connect_timeout(CONNECT_TIMEOUT)
-        .read_timeout(DEFAULT_READ_TIMEOUT)
-        .user_agent(USER_AGENT)
-        .http1_only()
+    Client::builder().user_agent(USER_AGENT).http1_only()
 }
 
 async fn ensure_success(response: Response, action: &str) -> Result<Response> {
@@ -123,4 +119,82 @@ async fn ensure_success(response: Response, action: &str) -> Result<Response> {
     let status = response.status();
     let body = response.text().await.unwrap_or_default();
     Err(build_failure_error(status, body.as_bytes(), action))
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::time::{sleep, timeout};
+
+    use super::{ReqwestTransport, builder};
+
+    #[tokio::test]
+    async fn image_load_allows_slow_daemon_response_headers() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let address = listener.local_addr().expect("listener address");
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("connection should arrive");
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = stream.read(&mut buffer).await.expect("request read");
+                assert_ne!(read, 0, "client closed before sending request headers");
+                request.extend_from_slice(&buffer[..read]);
+            }
+            while !request_body_complete(&request) {
+                let read = stream.read(&mut buffer).await.expect("request body read");
+                assert_ne!(read, 0, "client closed before sending request body");
+                request.extend_from_slice(&buffer[..read]);
+            }
+
+            // Docker can spend a long time importing an already-uploaded archive
+            // before it sends response headers. The Docker client has no
+            // request/read timeout so slow devices are not failed mid-load.
+            sleep(std::time::Duration::from_millis(200)).await;
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await
+                .expect("response write");
+        });
+
+        let archive = tempfile::NamedTempFile::new().expect("temp archive");
+        std::fs::write(archive.path(), b"not really a tar").expect("archive write");
+        let transport = ReqwestTransport {
+            client: builder().build().expect("client"),
+            base_url: format!("http://{address}"),
+        };
+
+        timeout(
+            std::time::Duration::from_secs(2),
+            transport.load_archive(archive.path()),
+        )
+        .await
+        .expect("load should not hang")
+        .expect("load should tolerate delayed daemon response");
+        server.await.expect("server task");
+    }
+
+    fn request_body_complete(request: &[u8]) -> bool {
+        let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n") else {
+            return false;
+        };
+        let body_start = header_end + 4;
+        let headers = String::from_utf8_lossy(&request[..header_end]).to_ascii_lowercase();
+        if headers.contains("transfer-encoding: chunked") {
+            return request[body_start..]
+                .windows(5)
+                .any(|window| window == b"0\r\n\r\n");
+        }
+        let Some(content_length) = headers.lines().find_map(|line| {
+            let value = line.strip_prefix("content-length:")?;
+            value.trim().parse::<usize>().ok()
+        }) else {
+            return true;
+        };
+        request.len().saturating_sub(body_start) >= content_length
+    }
 }

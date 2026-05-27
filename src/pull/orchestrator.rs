@@ -9,7 +9,7 @@ use tracing::warn;
 use crate::auth::{AuthResolver, read_credentials};
 use crate::cli::{ComposePullArgs, PullArgs, PullCommonArgs};
 use crate::error::{DockerPullError, Result};
-use crate::http::build_http_client;
+use crate::http::{build_http_client_with_connect_timeout, connect_timeout_from_seconds};
 use crate::platform::Platform;
 use crate::pull::{
     BlobDownloadLocks, CurrentPullLayers, DEFAULT_BLOB_RETRIES, LoadMode, PullContext, PullOptions,
@@ -30,6 +30,7 @@ pub(crate) struct PullRequestOptions {
     auth: AuthConfig,
     quiet: bool,
     cache: CacheSourceConfig,
+    registry_connection: RegistryConnectionConfig,
     no_animations: bool,
 }
 
@@ -63,6 +64,10 @@ struct AuthConfig {
 struct CacheSourceConfig {
     cache_from: Option<url::Url>,
     cache_only: bool,
+}
+
+struct RegistryConnectionConfig {
+    connect_timeout_seconds: i64,
 }
 
 impl PullRequestOptions {
@@ -115,6 +120,9 @@ impl PullRequestOptions {
             cache: CacheSourceConfig {
                 cache_from: args.cache.cache_from,
                 cache_only: args.cache.cache_only,
+            },
+            registry_connection: RegistryConnectionConfig {
+                connect_timeout_seconds: args.registry_connection.connect_timeout_seconds,
             },
         }
     }
@@ -229,6 +237,8 @@ pub(crate) async fn pull_references(
     references: Vec<String>,
     request: PullRequestOptions,
 ) -> Result<()> {
+    let registry_connect_timeout =
+        connect_timeout_from_seconds(request.registry_connection.connect_timeout_seconds)?;
     let references = pocker_compose::unique_images(&references);
     let store = Arc::new(
         ActiveStore::open(cache_dir.to_path_buf())
@@ -246,7 +256,7 @@ pub(crate) async fn pull_references(
     let credentials = read_credentials(request.auth.username, request.auth.password_stdin)?;
     let auth = Arc::new(AuthResolver::new_async(credentials).await?);
     let client = Arc::new(RegistryClient::new_with_cache_from(
-        build_http_client(
+        build_http_client_with_connect_timeout(
             request.registry.plain_http
                 || request
                     .cache
@@ -255,6 +265,7 @@ pub(crate) async fn pull_references(
                     .is_some_and(|url| url.scheme() == "http"),
             request.registry.insecure_skip_tls_verify,
             request.registry.ca_file.as_deref(),
+            registry_connect_timeout,
         )?,
         auth,
         request.registry.plain_http,

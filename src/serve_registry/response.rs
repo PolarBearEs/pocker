@@ -159,19 +159,26 @@ pub(super) async fn write_response(
             }
         }
     }
-    timeout(RESPONSE_IDLE_TIMEOUT, stream.flush())
-        .await
-        .map_err(|_| DockerPullError::BadResponse("cache registry response stalled".into()))??;
-    timeout(RESPONSE_IDLE_TIMEOUT, stream.shutdown())
-        .await
-        .map_err(|_| DockerPullError::BadResponse("cache registry response stalled".into()))??;
+    stream.flush().await?;
+    stream.shutdown().await?;
     Ok(())
 }
 
 async fn write_all_with_idle_timeout(stream: &mut TcpStream, bytes: &[u8]) -> Result<()> {
-    timeout(RESPONSE_IDLE_TIMEOUT, stream.write_all(bytes))
-        .await
-        .map_err(|_| DockerPullError::BadResponse("cache registry response stalled".into()))??;
+    let mut written = 0;
+    while written < bytes.len() {
+        let count = timeout(RESPONSE_IDLE_TIMEOUT, stream.write(&bytes[written..]))
+            .await
+            .map_err(|_| {
+                DockerPullError::BadResponse("cache registry response stalled".into())
+            })??;
+        if count == 0 {
+            return Err(DockerPullError::BadResponse(
+                "cache registry response connection closed".into(),
+            ));
+        }
+        written += count;
+    }
     Ok(())
 }
 

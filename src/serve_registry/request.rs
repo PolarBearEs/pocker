@@ -7,8 +7,9 @@ use crate::error::{DockerPullError, Result};
 
 // Cap request headers to avoid unbounded memory growth from malformed clients.
 const MAX_REQUEST_HEAD_BYTES: usize = 64 * 1024;
-// This protects the local registry from clients that connect and stop sending
-// headers. It applies only before a request is parsed, not to blob streaming.
+// This protects the local registry from clients that connect and stop making
+// request-header progress. The timeout is applied to each socket read, not to
+// the total time spent sending headers, so very slow clients can still proceed.
 const REQUEST_HEAD_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Debug)]
@@ -19,16 +20,14 @@ pub(super) struct Request {
 }
 
 pub(super) async fn read_request(stream: &mut TcpStream) -> Result<Request> {
-    timeout(REQUEST_HEAD_TIMEOUT, read_request_inner(stream))
-        .await
-        .map_err(|_| DockerPullError::BadResponse("cache registry request timed out".into()))?
-}
-
-async fn read_request_inner(stream: &mut TcpStream) -> Result<Request> {
     let mut bytes = Vec::new();
     let mut buffer = [0_u8; 4096];
     loop {
-        let read = stream.read(&mut buffer).await?;
+        let read = timeout(REQUEST_HEAD_TIMEOUT, stream.read(&mut buffer))
+            .await
+            .map_err(|_| {
+                DockerPullError::BadResponse("cache registry request headers stalled".into())
+            })??;
         if read == 0 {
             return Err(DockerPullError::BadResponse(
                 "cache registry request ended before headers".into(),
