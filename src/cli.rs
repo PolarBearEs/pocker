@@ -4,6 +4,9 @@ use std::path::PathBuf;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use url::Url;
 
+use crate::http::{
+    DEFAULT_EXTERNAL_CONNECT_TIMEOUT_SECONDS, parse_external_connect_timeout_seconds,
+};
 use crate::platform::Platform;
 use crate::pull::LoadMode;
 
@@ -132,6 +135,8 @@ pub struct PullCommonArgs {
     pub output: PullOutputArgs,
     #[command(flatten)]
     pub cache: CacheSourceArgs,
+    #[command(flatten)]
+    pub external_registry_connection: ExternalRegistryConnectionArgs,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -272,6 +277,20 @@ pub struct CacheSourceArgs {
         help = "Require --cache-from content and do not fall back to upstream"
     )]
     pub cache_only: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct ExternalRegistryConnectionArgs {
+    #[arg(
+        long = "connect-timeout-seconds",
+        value_name = "SECONDS",
+        default_value_t = DEFAULT_EXTERNAL_CONNECT_TIMEOUT_SECONDS,
+        allow_hyphen_values = true,
+        value_parser = parse_external_connect_timeout_seconds,
+        help_heading = "External connection options",
+        help = "Timeout for opening retryable registry/cache HTTP connections; use -1 to disable"
+    )]
+    pub connect_timeout_seconds: i64,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -430,6 +449,80 @@ mod tests {
     use super::{
         CacheCommands, Cli, Commands, ComposeCommands, ComposeConfigFormat, LoadMode, platform_help,
     };
+    use crate::http::DEFAULT_EXTERNAL_CONNECT_TIMEOUT_SECONDS;
+
+    #[test]
+    fn pull_external_connect_timeout_defaults_to_20_seconds() {
+        let cli = Cli::parse_from(["pocker", "pull", "alpine:latest"]);
+        let Commands::Pull(args) = cli.command else {
+            panic!("expected pull command");
+        };
+
+        assert_eq!(
+            args.common
+                .external_registry_connection
+                .connect_timeout_seconds,
+            DEFAULT_EXTERNAL_CONNECT_TIMEOUT_SECONDS
+        );
+    }
+
+    #[test]
+    fn pull_external_connect_timeout_accepts_minus_one_to_disable() {
+        let cli = Cli::parse_from([
+            "pocker",
+            "pull",
+            "--connect-timeout-seconds",
+            "-1",
+            "alpine:latest",
+        ]);
+        let Commands::Pull(args) = cli.command else {
+            panic!("expected pull command");
+        };
+
+        assert_eq!(
+            args.common
+                .external_registry_connection
+                .connect_timeout_seconds,
+            -1
+        );
+    }
+
+    #[test]
+    fn pull_external_connect_timeout_rejects_lower_negative_values() {
+        let error = Cli::try_parse_from([
+            "pocker",
+            "pull",
+            "--connect-timeout-seconds=-2",
+            "alpine:latest",
+        ])
+        .expect_err("external connect timeout should only accept -1 or non-negative values");
+
+        assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+    }
+
+    #[test]
+    fn compose_pull_accepts_external_connect_timeout() {
+        let cli = Cli::parse_from([
+            "pocker",
+            "compose",
+            "pull",
+            "--connect-timeout-seconds",
+            "-1",
+        ]);
+        let Commands::Compose(args) = cli.command else {
+            panic!("expected compose command");
+        };
+        let ComposeCommands::Pull(pull) = args.command else {
+            panic!("expected compose pull command");
+        };
+
+        assert_eq!(
+            pull.common
+                .external_registry_connection
+                .connect_timeout_seconds,
+            -1
+        );
+    }
 
     #[test]
     fn pull_accepts_no_animations_flag() {
