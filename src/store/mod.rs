@@ -268,16 +268,11 @@ impl Store {
             })?
     }
 
-    async fn clear_with_report(
+    async fn clear_with_report_locked(
         &self,
         collect_report: bool,
-        wait_for_lock: bool,
+        _exclusive_lock: File,
     ) -> Result<Option<ClearedCache>> {
-        let _exclusive_lock = if wait_for_lock {
-            acquire_exclusive_cache_lock(self.root.clone()).await?
-        } else {
-            try_acquire_exclusive_cache_lock(self.root.clone()).await?
-        };
         let report = if collect_report {
             let root = self.root.clone();
             let files = tokio::task::spawn_blocking(move || collect_cache_files(&root))
@@ -300,6 +295,34 @@ impl Store {
 
         Self::open(self.root.clone()).await?;
         Ok(report)
+    }
+
+    async fn clear_with_report(
+        &self,
+        collect_report: bool,
+        wait_for_lock: bool,
+    ) -> Result<Option<ClearedCache>> {
+        let exclusive_lock = if wait_for_lock {
+            acquire_exclusive_cache_lock(self.root.clone()).await?
+        } else {
+            try_acquire_exclusive_cache_lock(self.root.clone()).await?
+        };
+        self.clear_with_report_locked(collect_report, exclusive_lock)
+            .await
+    }
+
+    async fn clear_with_wait_notice<F>(
+        &self,
+        collect_report: bool,
+        on_wait: F,
+    ) -> Result<Option<ClearedCache>>
+    where
+        F: FnOnce(),
+    {
+        let exclusive_lock =
+            acquire_exclusive_cache_lock_with_wait_notice(self.root.clone(), on_wait).await?;
+        self.clear_with_report_locked(collect_report, exclusive_lock)
+            .await
     }
 
     pub fn root(&self) -> &Path {
@@ -334,11 +357,22 @@ impl MaintenanceStore {
         })
     }
 
+    #[allow(dead_code)]
     pub async fn clear(&self) -> Result<ClearedCache> {
         self.store
             .clear_with_report(true, true)
             .await
             .map(|report| report.expect("clear_with_report(true) must return Some"))
+    }
+
+    pub async fn clear_with_wait_notice<F>(&self, on_wait: F) -> Result<ClearedCache>
+    where
+        F: FnOnce(),
+    {
+        self.store
+            .clear_with_wait_notice(true, on_wait)
+            .await
+            .map(|report| report.expect("clear_with_wait_notice(true) must return Some"))
     }
 
     pub async fn clear_quiet(&self) -> Result<()> {
@@ -354,10 +388,6 @@ impl MaintenanceStore {
 
     pub async fn try_clear_quiet(&self) -> Result<()> {
         self.store.clear_with_report(false, false).await.map(|_| ())
-    }
-
-    pub async fn is_in_use(&self) -> Result<bool> {
-        cache_is_in_use(self.root().to_path_buf()).await
     }
 }
 
@@ -395,16 +425,18 @@ async fn try_acquire_exclusive_cache_lock(root: PathBuf) -> Result<File> {
         .map_err(|e| DockerPullError::InvalidInput(format!("cache lock task panicked: {e}")))?
 }
 
-async fn cache_is_in_use(root: PathBuf) -> Result<bool> {
-    tokio::task::spawn_blocking(
-        move || match try_acquire_exclusive_cache_lock_blocking(&root) {
-            Ok(_lock) => Ok(false),
-            Err(DockerPullError::CacheInUse) => Ok(true),
-            Err(error) => Err(error),
-        },
-    )
-    .await
-    .map_err(|e| DockerPullError::InvalidInput(format!("cache lock task panicked: {e}")))?
+async fn acquire_exclusive_cache_lock_with_wait_notice<F>(root: PathBuf, on_wait: F) -> Result<File>
+where
+    F: FnOnce(),
+{
+    match try_acquire_exclusive_cache_lock(root.clone()).await {
+        Ok(lock) => Ok(lock),
+        Err(DockerPullError::CacheInUse) => {
+            on_wait();
+            acquire_exclusive_cache_lock(root).await
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn try_acquire_exclusive_cache_lock_blocking(root: &Path) -> Result<File> {
@@ -1183,13 +1215,48 @@ mod tests {
             .expect_err("try clear should fail while active store holds shared lock");
 
         assert!(matches!(error, DockerPullError::CacheInUse));
-        assert!(
-            cleaner
-                .is_in_use()
-                .await
-                .expect("cache probe should succeed"),
-            "cache should report active users"
-        );
+    }
+
+    #[tokio::test]
+    async fn clear_with_wait_notice_reports_actual_lock_wait() {
+        let dir = tempdir().expect("tempdir should create");
+        let active_store = ActiveStore::open(dir.path().to_path_buf())
+            .await
+            .expect("active store should open");
+        let cleaner = MaintenanceStore::open(dir.path().to_path_buf())
+            .await
+            .expect("cleaner store should open");
+
+        let (notice_sender, notice_receiver) = tokio::sync::oneshot::channel();
+        let (clear_sender, mut clear_receiver) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let mut notice_sender = Some(notice_sender);
+            let result = cleaner
+                .clear_with_wait_notice(move || {
+                    if let Some(sender) = notice_sender.take() {
+                        let _ = sender.send(());
+                    }
+                })
+                .await;
+            let _ = clear_sender.send(result);
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), notice_receiver)
+            .await
+            .expect("clear should report before waiting")
+            .expect("notice should be sent");
+        tokio::time::timeout(std::time::Duration::from_millis(100), &mut clear_receiver)
+            .await
+            .expect_err("clear should keep waiting while active store holds shared lock");
+
+        drop(active_store);
+        let cleared = tokio::time::timeout(std::time::Duration::from_secs(2), clear_receiver)
+            .await
+            .expect("clear should finish after active store is dropped")
+            .expect("clear task should send result")
+            .expect("clear should succeed");
+
+        assert!(cleared.files.is_empty());
     }
 
     #[tokio::test]

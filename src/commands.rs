@@ -262,10 +262,9 @@ async fn clean_cache(store: &MaintenanceStore, quiet: bool, no_wait: bool) -> Re
         return Ok(());
     }
 
-    if store.is_in_use().await? {
-        println!("Waiting for active cache operations to finish...");
-    }
-    let cleared = store.clear().await?;
+    let cleared = store
+        .clear_with_wait_notice(|| println!("Waiting for active cache operations to finish..."))
+        .await?;
     print_cleared_cache(store, cleared);
     Ok(())
 }
