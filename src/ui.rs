@@ -15,7 +15,10 @@ pub(crate) const YELLOW: Style = AnsiColor::Yellow.on_default();
 pub(crate) const CYAN: Style = AnsiColor::Cyan.on_default();
 pub(crate) const DIM: Style = Style::new().dimmed();
 
-const AGGREGATE_RENDER_INTERVAL: Duration = Duration::from_millis(50);
+// Cap terminal redraws so fast layer streams and concurrent image pulls do not
+// overwhelm slower terminal emulators with repeated clear/repaint cycles.
+const PROGRESS_RENDER_HZ: u8 = 8;
+const AGGREGATE_RENDER_INTERVAL: Duration = Duration::from_millis(125);
 
 pub(crate) fn paint(value: &str, style: Style) -> String {
     if should_color_stderr() {
@@ -131,7 +134,7 @@ impl Ui {
             };
         }
 
-        let multi = MultiProgress::with_draw_target(ProgressDrawTarget::stderr());
+        let multi = MultiProgress::with_draw_target(progress_draw_target());
         let image = multi.add(ProgressBar::new_spinner());
         image.set_style(image_status_style(animated));
         if animated {
@@ -209,15 +212,6 @@ impl Ui {
         };
         if inner.aggregate_layers {
             inner.prepare_aggregate_layers(digests);
-            let mut layers = inner.layers.lock().expect("ui state poisoned");
-            let mut after = inner.image.clone();
-            for digest in digests {
-                let bar = inner.multi.insert_after(&after, ProgressBar::new_spinner());
-                bar.set_style(layer_status_style(false));
-                bar.set_message(format!("{} Waiting", short_digest(digest)));
-                layers.insert(digest.clone(), bar);
-                after = layers.get(digest).expect("layer was just inserted").clone();
-            }
             return;
         }
         let mut layers = inner.layers.lock().expect("ui state poisoned");
@@ -285,6 +279,10 @@ impl Ui {
     pub fn set_layer_status(&self, digest: &str, status: &str) {
         self.dispatch_mode(
             |inner| {
+                if inner.aggregate_layers {
+                    inner.render_aggregate_progress(status);
+                    return;
+                }
                 let Some(bar) = inner.layer_bar(digest) else {
                     return;
                 };
@@ -393,7 +391,7 @@ impl ProgressSink for Ui {
     fn warn(&self, message: &str) {
         let message = format!("warning: {message}");
         match &self.mode {
-            UiMode::Progress(inner) => inner.image.println(message),
+            UiMode::Progress(inner) => inner.image.suspend(|| eprintln!("{message}")),
             UiMode::Plain { .. } => self.plain_line(message),
             UiMode::Quiet => {}
         }
@@ -417,7 +415,7 @@ impl UiGroup {
         Self {
             mode: UiGroupMode::Progress {
                 animated,
-                multi: MultiProgress::with_draw_target(ProgressDrawTarget::stderr()),
+                multi: MultiProgress::with_draw_target(progress_draw_target()),
             },
         }
     }
@@ -606,6 +604,10 @@ fn should_render_progress() -> bool {
     process_is_foreground_tty_job()
 }
 
+fn progress_draw_target() -> ProgressDrawTarget {
+    ProgressDrawTarget::stderr_with_hz(PROGRESS_RENDER_HZ)
+}
+
 #[cfg(target_os = "linux")]
 fn process_is_foreground_tty_job() -> bool {
     let Ok(stat) = fs::read_to_string("/proc/self/stat") else {
@@ -718,7 +720,12 @@ pub(crate) fn should_color_stderr() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::plain_layer_download_message;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget};
+
+    use super::{AggregateProgress, ProgressUiInner, Ui, UiMode, plain_layer_download_message};
 
     #[cfg(target_os = "linux")]
     use super::linux_process_is_foreground_tty_job_from_stat;
@@ -757,5 +764,42 @@ mod tests {
             plain_layer_download_message("sha256:abcdef0123456789", 2_048, 512),
             "layer abcdef012345: Resuming 512 B/2.0 KiB"
         );
+    }
+
+    #[test]
+    fn grouped_progress_uses_aggregate_line_without_layer_bars() {
+        let multi = MultiProgress::with_draw_target(ProgressDrawTarget::hidden());
+        let image = multi.add(ProgressBar::new_spinner());
+        let ui = Ui {
+            mode: UiMode::Progress(Arc::new(ProgressUiInner {
+                animated: false,
+                aggregate_layers: true,
+                multi,
+                image,
+                layers: Mutex::new(HashMap::new()),
+                aggregate: Mutex::new(AggregateProgress::default()),
+                image_name: Mutex::new("example:latest".to_string()),
+            })),
+        };
+        let digests = vec![
+            "sha256:1111111111111111111111111111111111111111111111111111111111111111".to_string(),
+            "sha256:2222222222222222222222222222222222222222222222222222222222222222".to_string(),
+        ];
+
+        ui.prepare_layers(&digests);
+        ui.start_layer_download(&digests[0], 100, 0);
+        ui.advance_layer_download(&digests[0], 50);
+        ui.set_layer_status(&digests[0], "Verifying checksum");
+
+        let inner = ui.progress().expect("test UI should be in progress mode");
+        assert!(
+            inner.layers.lock().expect("ui state poisoned").is_empty(),
+            "grouped progress should not create per-layer bars"
+        );
+
+        let aggregate = inner.aggregate.lock().expect("ui state poisoned");
+        assert_eq!(aggregate.order, digests);
+        assert_eq!(aggregate.layers.len(), 2);
+        assert_eq!(aggregate.layers[&aggregate.order[0]].position, 50);
     }
 }

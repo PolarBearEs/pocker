@@ -1,9 +1,11 @@
+use std::io::Read;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use assert_cmd::Command;
+use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
 use predicates::str::contains;
 use sha2::{Digest, Sha256, Sha384, Sha512};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -237,9 +239,100 @@ async fn pull_rejects_malformed_layer_digest_before_cache_path_use() {
     );
 }
 
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compose_pull_progress_uses_single_aggregate_line_on_tty() {
+    let fixture = Arc::new(Fixture::build());
+    let server = RegistryFixtureServer::spawn(Arc::clone(&fixture)).await;
+
+    let dir = tempfile::tempdir().expect("tempdir should create");
+    let cache_dir = dir.path().join("cache");
+    let compose_path = dir.path().join("docker-compose.yml");
+    let reference = format!("{}/library/test:latest", server.address());
+    std::fs::write(
+        &compose_path,
+        format!("services:\n  app:\n    image: {reference}\n"),
+    )
+    .expect("compose file should write");
+
+    let output = tokio::task::spawn_blocking({
+        let cache_dir = cache_dir.clone();
+        let compose_path = compose_path.clone();
+        move || {
+            run_pocker_in_pty(&[
+                "--cache-dir",
+                cache_dir.to_str().expect("cache path should be UTF-8"),
+                "compose",
+                "-f",
+                compose_path.to_str().expect("compose path should be UTF-8"),
+                "pull",
+                "--plain-http",
+                "--no-load",
+                "--request-retries",
+                "0",
+                "--blob-retries",
+                "0",
+                "--max-parallel-images",
+                "1",
+                "app",
+            ])
+        }
+    })
+    .await
+    .expect("pocker subprocess task should run")
+    .expect("pocker should run in a pty");
+
+    assert!(
+        output.status.success(),
+        "pocker should succeed; output:\n{}",
+        output.transcript
+    );
+    assert!(
+        !output
+            .transcript
+            .contains(&format!("{} [", &fixture.layer_digest[..12])),
+        "grouped compose progress should not render a separate layer progress bar; output:\n{}",
+        output.transcript
+    );
+}
+
 struct RegistryFixtureServer {
     address: SocketAddr,
     task: JoinHandle<()>,
+}
+
+#[cfg(unix)]
+struct PtyRunOutput {
+    status: portable_pty::ExitStatus,
+    transcript: String,
+}
+
+#[cfg(unix)]
+fn run_pocker_in_pty(
+    args: &[&str],
+) -> std::result::Result<PtyRunOutput, Box<dyn std::error::Error + Send + Sync>> {
+    let pty_system = NativePtySystem::default();
+    let pair = pty_system.openpty(PtySize {
+        rows: 24,
+        cols: 120,
+        pixel_width: 0,
+        pixel_height: 0,
+    })?;
+    let mut command = CommandBuilder::new(assert_cmd::cargo::cargo_bin("pocker"));
+    for arg in args {
+        command.arg(arg);
+    }
+
+    let mut child = pair.slave.spawn_command(command)?;
+    drop(pair.slave);
+
+    let mut transcript = String::new();
+    pair.master
+        .try_clone_reader()?
+        .read_to_string(&mut transcript)?;
+    let status = child.wait()?;
+
+    Ok(PtyRunOutput { status, transcript })
 }
 
 impl RegistryFixtureServer {
