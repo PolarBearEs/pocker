@@ -1,3 +1,4 @@
+#[cfg(unix)]
 use std::io::Read;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -5,6 +6,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use assert_cmd::Command;
+#[cfg(unix)]
 use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
 use predicates::str::contains;
 use sha2::{Digest, Sha256, Sha384, Sha512};
@@ -241,7 +243,7 @@ async fn pull_rejects_malformed_layer_digest_before_cache_path_use() {
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn compose_pull_progress_uses_single_aggregate_line_on_tty() {
+async fn compose_pull_progress_shows_layer_bars_on_tty() {
     let fixture = Arc::new(Fixture::build());
     let server = RegistryFixtureServer::spawn(Arc::clone(&fixture)).await;
 
@@ -288,10 +290,10 @@ async fn compose_pull_progress_uses_single_aggregate_line_on_tty() {
         output.transcript
     );
     assert!(
-        !output
+        output
             .transcript
             .contains(&format!("{} [", &fixture.layer_digest[..12])),
-        "grouped compose progress should not render a separate layer progress bar; output:\n{}",
+        "compose progress should render per-layer progress bars; output:\n{}",
         output.transcript
     );
 }
@@ -306,6 +308,11 @@ struct PtyRunOutput {
     status: portable_pty::ExitStatus,
     transcript: String,
 }
+
+#[cfg(unix)]
+const PTY_RUN_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(unix)]
+const PTY_READER_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[cfg(unix)]
 fn run_pocker_in_pty(
@@ -326,11 +333,40 @@ fn run_pocker_in_pty(
     let mut child = pair.slave.spawn_command(command)?;
     drop(pair.slave);
 
-    let mut transcript = String::new();
-    pair.master
-        .try_clone_reader()?
-        .read_to_string(&mut transcript)?;
-    let status = child.wait()?;
+    let mut reader = pair.master.try_clone_reader()?;
+    let (reader_sender, reader_receiver) = std::sync::mpsc::channel();
+    let reader_thread = std::thread::spawn(move || {
+        let mut transcript = String::new();
+        let result = reader
+            .read_to_string(&mut transcript)
+            .map(|_| transcript)
+            .map_err(|error| error.to_string());
+        let _ = reader_sender.send(result);
+    });
+    let deadline = std::time::Instant::now() + PTY_RUN_TIMEOUT;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let transcript = reader_receiver
+                .recv_timeout(PTY_READER_DRAIN_TIMEOUT)
+                .ok()
+                .and_then(std::result::Result::ok)
+                .unwrap_or_default();
+            return Err(format!(
+                "pocker PTY run timed out after {:?}; output:\n{}",
+                PTY_RUN_TIMEOUT, transcript
+            )
+            .into());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let transcript = reader_receiver.recv_timeout(PTY_READER_DRAIN_TIMEOUT)??;
+    reader_thread
+        .join()
+        .map_err(|_| "PTY reader thread panicked")?;
 
     Ok(PtyRunOutput { status, transcript })
 }

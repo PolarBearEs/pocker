@@ -18,7 +18,10 @@ pub(crate) const DIM: Style = Style::new().dimmed();
 // Cap terminal redraws so fast layer streams and concurrent image pulls do not
 // overwhelm slower terminal emulators with repeated clear/repaint cycles.
 const PROGRESS_RENDER_HZ: u8 = 8;
-const AGGREGATE_RENDER_INTERVAL: Duration = Duration::from_millis(125);
+const AGGREGATE_RENDER_INTERVAL: Duration =
+    Duration::from_millis(1_000 / PROGRESS_RENDER_HZ as u64);
+const MAX_PROGRESS_IMAGE_CHARS: usize = 32;
+const MAX_AGGREGATE_STRIP_CHARS: usize = 10;
 
 pub(crate) fn paint(value: &str, style: Style) -> String {
     if should_color_stderr() {
@@ -158,7 +161,8 @@ impl Ui {
         self.dispatch_mode(
             |inner| {
                 inner.reset_for_image();
-                *inner.image_name.lock().expect("ui state poisoned") = image.to_string();
+                let image = progress_image_name(image);
+                *inner.image_name.lock().expect("ui state poisoned") = image.clone();
                 if inner.aggregate_layers {
                     inner.image.set_style(compose_image_style());
                 }
@@ -171,6 +175,7 @@ impl Ui {
     pub fn begin_load(&self, image: &str) {
         self.dispatch_mode(
             |inner| {
+                let image = progress_image_name(image);
                 if inner.aggregate_layers {
                     inner.image.set_style(image_status_style(false));
                 }
@@ -183,6 +188,7 @@ impl Ui {
     pub fn set_image_status(&self, image: &str, status: &str) {
         self.dispatch_mode(
             |inner| {
+                let image = progress_image_name(image);
                 if inner.aggregate_layers {
                     inner.image.set_style(image_status_style(false));
                 }
@@ -197,6 +203,7 @@ impl Ui {
             |inner| {
                 inner.clear_layers();
                 inner.image.disable_steady_tick();
+                let image = progress_image_name(image);
                 if inner.aggregate_layers {
                     inner.image.set_style(image_status_style(false));
                 }
@@ -212,6 +219,15 @@ impl Ui {
         };
         if inner.aggregate_layers {
             inner.prepare_aggregate_layers(digests);
+            let mut layers = inner.layers.lock().expect("ui state poisoned");
+            let mut after = inner.image.clone();
+            for digest in digests {
+                let bar = inner.multi.insert_after(&after, ProgressBar::new_spinner());
+                bar.set_style(layer_status_style(false));
+                bar.set_message(format!("{} Waiting", short_digest(digest)));
+                layers.insert(digest.clone(), bar);
+                after = layers.get(digest).expect("layer was just inserted").clone();
+            }
             return;
         }
         let mut layers = inner.layers.lock().expect("ui state poisoned");
@@ -281,13 +297,13 @@ impl Ui {
             |inner| {
                 if inner.aggregate_layers {
                     inner.render_aggregate_progress(status);
-                    return;
                 }
                 let Some(bar) = inner.layer_bar(digest) else {
                     return;
                 };
-                bar.set_style(layer_status_style(inner.animated));
-                if inner.animated {
+                let animated = inner.animated && !inner.aggregate_layers;
+                bar.set_style(layer_status_style(animated));
+                if animated {
                     bar.enable_steady_tick(Duration::from_millis(120));
                 }
                 bar.set_message(format!("{} {status}", short_digest(digest)));
@@ -563,7 +579,7 @@ impl ProgressUiInner {
         };
         self.image.set_message(format!(
             "{image} [{}]{bytes} {}",
-            paint(&render.strip, GREEN),
+            paint(&progress_aggregate_strip(&render.strip), GREEN),
             render.status
         ));
     }
@@ -642,6 +658,48 @@ fn short_digest(digest: &str) -> String {
         .map(|(_, value)| value)
         .unwrap_or(digest);
     value.chars().take(12).collect()
+}
+
+fn progress_image_name(image: &str) -> String {
+    truncate_middle(image, MAX_PROGRESS_IMAGE_CHARS)
+}
+
+fn progress_aggregate_strip(strip: &str) -> String {
+    truncate_end(strip, MAX_AGGREGATE_STRIP_CHARS)
+}
+
+fn truncate_middle(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    if max_chars <= 3 {
+        return ".".repeat(max_chars);
+    }
+
+    let head_chars = (max_chars - 3) / 2;
+    let tail_chars = max_chars - 3 - head_chars;
+    let head = value.chars().take(head_chars).collect::<String>();
+    let tail = value
+        .chars()
+        .rev()
+        .take(tail_chars)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<String>();
+    format!("{head}...{tail}")
+}
+
+fn truncate_end(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    if max_chars == 0 {
+        return String::new();
+    }
+
+    let prefix = value.chars().take(max_chars - 1).collect::<String>();
+    format!("{prefix}+")
 }
 
 fn plain_layer_download_message(digest: &str, total_bytes: u64, starting_offset: u64) -> String {
@@ -725,7 +783,10 @@ mod tests {
 
     use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget};
 
-    use super::{AggregateProgress, ProgressUiInner, Ui, UiMode, plain_layer_download_message};
+    use super::{
+        AggregateProgress, MAX_PROGRESS_IMAGE_CHARS, ProgressUiInner, Ui, UiMode,
+        plain_layer_download_message, progress_image_name,
+    };
 
     #[cfg(target_os = "linux")]
     use super::linux_process_is_foreground_tty_job_from_stat;
@@ -767,7 +828,7 @@ mod tests {
     }
 
     #[test]
-    fn grouped_progress_uses_aggregate_line_without_layer_bars() {
+    fn grouped_progress_keeps_layer_bars_and_aggregate_state() {
         let multi = MultiProgress::with_draw_target(ProgressDrawTarget::hidden());
         let image = multi.add(ProgressBar::new_spinner());
         let ui = Ui {
@@ -793,13 +854,23 @@ mod tests {
 
         let inner = ui.progress().expect("test UI should be in progress mode");
         assert!(
-            inner.layers.lock().expect("ui state poisoned").is_empty(),
-            "grouped progress should not create per-layer bars"
+            !inner.layers.lock().expect("ui state poisoned").is_empty(),
+            "grouped progress should keep per-layer bars visible"
         );
 
         let aggregate = inner.aggregate.lock().expect("ui state poisoned");
         assert_eq!(aggregate.order, digests);
         assert_eq!(aggregate.layers.len(), 2);
         assert_eq!(aggregate.layers[&aggregate.order[0]].position, 50);
+    }
+
+    #[test]
+    fn progress_image_name_truncates_long_references() {
+        let image = progress_image_name(
+            "registry.digitalocean.com/alfred-gateway/alfred-openhab:2.5.12_1.2.25_azul8.76",
+        );
+
+        assert!(image.len() <= MAX_PROGRESS_IMAGE_CHARS);
+        assert!(image.contains("..."));
     }
 }
