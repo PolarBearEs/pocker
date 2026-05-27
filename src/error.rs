@@ -26,6 +26,8 @@ pub enum DockerPullError {
     DigestMismatch { expected: String, actual: String },
     #[error("download interrupted")]
     Interrupted,
+    #[error("cache is in use by another pocker process; retry after it finishes or omit --no-wait")]
+    CacheInUse,
     #[error("missing blob file `{0}` at `{1}`")]
     MissingBlobFile(String, PathBuf),
     #[error("command failed: {0}")]

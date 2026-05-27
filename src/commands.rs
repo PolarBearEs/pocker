@@ -112,7 +112,9 @@ pub(crate) async fn execute(cli: Cli) -> Result<()> {
         Commands::Cache(args) => {
             let store = MaintenanceStore::open(cli.global.cache_dir.clone()).await?;
             match args.command {
-                CacheCommands::Clean(_) => clean_cache(&store, cli.global.quiet).await?,
+                CacheCommands::Clean(args) => {
+                    clean_cache(&store, cli.global.quiet, args.no_wait).await?
+                }
             }
         }
         Commands::Image(args) => match args.command {
@@ -244,13 +246,31 @@ async fn resolve_compose_images(files: Vec<std::path::PathBuf>) -> Result<compos
         .map_err(Into::into)
 }
 
-async fn clean_cache(store: &MaintenanceStore, quiet: bool) -> Result<()> {
+async fn clean_cache(store: &MaintenanceStore, quiet: bool, no_wait: bool) -> Result<()> {
     if quiet {
-        store.clear_quiet().await?;
+        if no_wait {
+            store.try_clear_quiet().await?;
+        } else {
+            store.clear_quiet().await?;
+        }
         return Ok(());
     }
 
+    if no_wait {
+        let cleared = store.try_clear().await?;
+        print_cleared_cache(store, cleared);
+        return Ok(());
+    }
+
+    if store.is_in_use().await? {
+        println!("Waiting for active cache operations to finish...");
+    }
     let cleared = store.clear().await?;
+    print_cleared_cache(store, cleared);
+    Ok(())
+}
+
+fn print_cleared_cache(store: &MaintenanceStore, cleared: crate::store::ClearedCache) {
     println!("Cleared cache at {}", store.root().display());
     if cleared.files.is_empty() {
         println!("Deleted: nothing");
@@ -268,7 +288,6 @@ async fn clean_cache(store: &MaintenanceStore, quiet: bool) -> Result<()> {
         "Reclaimed space: {}",
         format_size(Some(cleared.reclaimed_bytes))
     );
-    Ok(())
 }
 
 fn print_version() {

@@ -1,7 +1,7 @@
 mod fs;
 
 use std::collections::HashSet;
-use std::fs::{File, OpenOptions};
+use std::fs::{File, OpenOptions, TryLockError};
 use std::io::ErrorKind;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
@@ -268,16 +268,16 @@ impl Store {
             })?
     }
 
-    async fn clear_with_report(&self, collect_report: bool) -> Result<Option<ClearedCache>> {
-        let root = self.root.clone();
-        let _exclusive_lock = tokio::task::spawn_blocking(move || {
-            let lock = open_lock_file(&root)?;
-            lock.lock()?;
-            Result::Ok(lock)
-        })
-        .await
-        .map_err(|e| DockerPullError::InvalidInput(format!("cache lock task panicked: {e}")))??;
-
+    async fn clear_with_report(
+        &self,
+        collect_report: bool,
+        wait_for_lock: bool,
+    ) -> Result<Option<ClearedCache>> {
+        let _exclusive_lock = if wait_for_lock {
+            acquire_exclusive_cache_lock(self.root.clone()).await?
+        } else {
+            try_acquire_exclusive_cache_lock(self.root.clone()).await?
+        };
         let report = if collect_report {
             let root = self.root.clone();
             let files = tokio::task::spawn_blocking(move || collect_cache_files(&root))
@@ -336,13 +336,28 @@ impl MaintenanceStore {
 
     pub async fn clear(&self) -> Result<ClearedCache> {
         self.store
-            .clear_with_report(true)
+            .clear_with_report(true, true)
             .await
             .map(|report| report.expect("clear_with_report(true) must return Some"))
     }
 
     pub async fn clear_quiet(&self) -> Result<()> {
-        self.store.clear_with_report(false).await.map(|_| ())
+        self.store.clear_with_report(false, true).await.map(|_| ())
+    }
+
+    pub async fn try_clear(&self) -> Result<ClearedCache> {
+        self.store
+            .clear_with_report(true, false)
+            .await
+            .map(|report| report.expect("clear_with_report(true) must return Some"))
+    }
+
+    pub async fn try_clear_quiet(&self) -> Result<()> {
+        self.store.clear_with_report(false, false).await.map(|_| ())
+    }
+
+    pub async fn is_in_use(&self) -> Result<bool> {
+        cache_is_in_use(self.root().to_path_buf()).await
     }
 }
 
@@ -362,6 +377,43 @@ async fn acquire_shared_cache_lock(root: PathBuf) -> Result<File> {
     })
     .await
     .map_err(|e| DockerPullError::InvalidInput(format!("cache lock task panicked: {e}")))?
+}
+
+async fn acquire_exclusive_cache_lock(root: PathBuf) -> Result<File> {
+    tokio::task::spawn_blocking(move || {
+        let lock = open_lock_file(&root)?;
+        lock.lock()?;
+        Result::Ok(lock)
+    })
+    .await
+    .map_err(|e| DockerPullError::InvalidInput(format!("cache lock task panicked: {e}")))?
+}
+
+async fn try_acquire_exclusive_cache_lock(root: PathBuf) -> Result<File> {
+    tokio::task::spawn_blocking(move || try_acquire_exclusive_cache_lock_blocking(&root))
+        .await
+        .map_err(|e| DockerPullError::InvalidInput(format!("cache lock task panicked: {e}")))?
+}
+
+async fn cache_is_in_use(root: PathBuf) -> Result<bool> {
+    tokio::task::spawn_blocking(
+        move || match try_acquire_exclusive_cache_lock_blocking(&root) {
+            Ok(_lock) => Ok(false),
+            Err(DockerPullError::CacheInUse) => Ok(true),
+            Err(error) => Err(error),
+        },
+    )
+    .await
+    .map_err(|e| DockerPullError::InvalidInput(format!("cache lock task panicked: {e}")))?
+}
+
+fn try_acquire_exclusive_cache_lock_blocking(root: &Path) -> Result<File> {
+    let lock = open_lock_file(root)?;
+    match lock.try_lock() {
+        Ok(()) => Ok(lock),
+        Err(TryLockError::WouldBlock) => Err(DockerPullError::CacheInUse),
+        Err(TryLockError::Error(error)) => Err(error.into()),
+    }
 }
 
 async fn ensure_directory_blocking(path: PathBuf) -> Result<()> {
@@ -1113,6 +1165,31 @@ mod tests {
 
         assert!(cleared.files.is_empty());
         assert!(dir.path().join("blobs").is_dir());
+    }
+
+    #[tokio::test]
+    async fn try_clear_fails_while_active_cache_lock_is_held() {
+        let dir = tempdir().expect("tempdir should create");
+        let _active_store = ActiveStore::open(dir.path().to_path_buf())
+            .await
+            .expect("active store should open");
+        let cleaner = MaintenanceStore::open(dir.path().to_path_buf())
+            .await
+            .expect("cleaner store should open");
+
+        let error = cleaner
+            .try_clear()
+            .await
+            .expect_err("try clear should fail while active store holds shared lock");
+
+        assert!(matches!(error, DockerPullError::CacheInUse));
+        assert!(
+            cleaner
+                .is_in_use()
+                .await
+                .expect("cache probe should succeed"),
+            "cache should report active users"
+        );
     }
 
     #[tokio::test]
