@@ -4,7 +4,9 @@ use std::path::PathBuf;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use url::Url;
 
-use crate::http::{DEFAULT_CONNECT_TIMEOUT_SECONDS, parse_connect_timeout_seconds};
+use crate::http::{
+    DEFAULT_EXTERNAL_CONNECT_TIMEOUT_SECONDS, parse_external_connect_timeout_seconds,
+};
 use crate::platform::Platform;
 use crate::pull::LoadMode;
 
@@ -134,7 +136,7 @@ pub struct PullCommonArgs {
     #[command(flatten)]
     pub cache: CacheSourceArgs,
     #[command(flatten)]
-    pub registry_connection: RegistryConnectionArgs,
+    pub external_registry_connection: ExternalRegistryConnectionArgs,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -278,15 +280,15 @@ pub struct CacheSourceArgs {
 }
 
 #[derive(Debug, Clone, Args)]
-pub struct RegistryConnectionArgs {
+pub struct ExternalRegistryConnectionArgs {
     #[arg(
         long = "connect-timeout-seconds",
         value_name = "SECONDS",
-        default_value_t = DEFAULT_CONNECT_TIMEOUT_SECONDS,
+        default_value_t = DEFAULT_EXTERNAL_CONNECT_TIMEOUT_SECONDS,
         allow_hyphen_values = true,
-        value_parser = parse_connect_timeout_seconds,
-        help_heading = "Connection options",
-        help = "Timeout for opening registry/cache HTTP connections; use -1 to disable"
+        value_parser = parse_external_connect_timeout_seconds,
+        help_heading = "External connection options",
+        help = "Timeout for opening retryable registry/cache HTTP connections; use -1 to disable"
     )]
     pub connect_timeout_seconds: i64,
 }
@@ -441,23 +443,25 @@ mod tests {
     use super::{
         CacheCommands, Cli, Commands, ComposeCommands, ComposeConfigFormat, LoadMode, platform_help,
     };
-    use crate::http::DEFAULT_CONNECT_TIMEOUT_SECONDS;
+    use crate::http::DEFAULT_EXTERNAL_CONNECT_TIMEOUT_SECONDS;
 
     #[test]
-    fn pull_connect_timeout_defaults_to_20_seconds() {
+    fn pull_external_connect_timeout_defaults_to_20_seconds() {
         let cli = Cli::parse_from(["pocker", "pull", "alpine:latest"]);
         let Commands::Pull(args) = cli.command else {
             panic!("expected pull command");
         };
 
         assert_eq!(
-            args.common.registry_connection.connect_timeout_seconds,
-            DEFAULT_CONNECT_TIMEOUT_SECONDS
+            args.common
+                .external_registry_connection
+                .connect_timeout_seconds,
+            DEFAULT_EXTERNAL_CONNECT_TIMEOUT_SECONDS
         );
     }
 
     #[test]
-    fn pull_connect_timeout_accepts_minus_one_to_disable() {
+    fn pull_external_connect_timeout_accepts_minus_one_to_disable() {
         let cli = Cli::parse_from([
             "pocker",
             "pull",
@@ -469,24 +473,29 @@ mod tests {
             panic!("expected pull command");
         };
 
-        assert_eq!(args.common.registry_connection.connect_timeout_seconds, -1);
+        assert_eq!(
+            args.common
+                .external_registry_connection
+                .connect_timeout_seconds,
+            -1
+        );
     }
 
     #[test]
-    fn pull_connect_timeout_rejects_lower_negative_values() {
+    fn pull_external_connect_timeout_rejects_lower_negative_values() {
         let error = Cli::try_parse_from([
             "pocker",
             "pull",
             "--connect-timeout-seconds=-2",
             "alpine:latest",
         ])
-        .expect_err("connect timeout should only accept -1 or non-negative values");
+        .expect_err("external connect timeout should only accept -1 or non-negative values");
 
         assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
     }
 
     #[test]
-    fn compose_pull_accepts_connect_timeout() {
+    fn compose_pull_accepts_external_connect_timeout() {
         let cli = Cli::parse_from([
             "pocker",
             "compose",
@@ -501,7 +510,12 @@ mod tests {
             panic!("expected compose pull command");
         };
 
-        assert_eq!(pull.common.registry_connection.connect_timeout_seconds, -1);
+        assert_eq!(
+            pull.common
+                .external_registry_connection
+                .connect_timeout_seconds,
+            -1
+        );
     }
 
     #[test]

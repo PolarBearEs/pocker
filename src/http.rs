@@ -6,32 +6,32 @@ use reqwest::{Certificate, Client, ClientBuilder};
 use crate::error::Result;
 
 pub(crate) const USER_AGENT: &str = concat!("pocker/", env!("CARGO_PKG_VERSION"));
-pub(crate) const DEFAULT_CONNECT_TIMEOUT_SECONDS: i64 = 20;
+pub(crate) const DEFAULT_EXTERNAL_CONNECT_TIMEOUT_SECONDS: i64 = 20;
 
 pub fn build_http_client(
     plain_http: bool,
     insecure_skip_tls_verify: bool,
     ca_file: Option<&Path>,
 ) -> Result<Client> {
-    build_http_client_with_connect_timeout(
+    build_http_client_with_external_connect_timeout(
         plain_http,
         insecure_skip_tls_verify,
         ca_file,
-        default_connect_timeout(),
+        default_external_connect_timeout(),
     )
 }
 
-pub(crate) fn build_http_client_with_connect_timeout(
+pub(crate) fn build_http_client_with_external_connect_timeout(
     plain_http: bool,
     insecure_skip_tls_verify: bool,
     ca_file: Option<&Path>,
-    connect_timeout: Option<Duration>,
+    external_connect_timeout: Option<Duration>,
 ) -> Result<Client> {
     build_http_client_with_ca(
         plain_http,
         insecure_skip_tls_verify,
         ca_file,
-        connect_timeout,
+        external_connect_timeout,
     )
 }
 
@@ -39,10 +39,14 @@ fn build_http_client_with_ca(
     plain_http: bool,
     insecure_skip_tls_verify: bool,
     ca_file: Option<&Path>,
-    connect_timeout: Option<Duration>,
+    external_connect_timeout: Option<Duration>,
 ) -> Result<Client> {
-    let mut builder = http_client_builder(plain_http, insecure_skip_tls_verify, connect_timeout)
-        .user_agent(USER_AGENT);
+    let mut builder = http_client_builder(
+        plain_http,
+        insecure_skip_tls_verify,
+        external_connect_timeout,
+    )
+    .user_agent(USER_AGENT);
 
     if let Some(path) = ca_file {
         let pem = std::fs::read(path)?;
@@ -55,14 +59,14 @@ fn build_http_client_with_ca(
 fn http_client_builder(
     plain_http: bool,
     insecure_skip_tls_verify: bool,
-    connect_timeout: Option<Duration>,
+    external_connect_timeout: Option<Duration>,
 ) -> ClientBuilder {
     let mut builder = Client::builder()
         .danger_accept_invalid_certs(insecure_skip_tls_verify)
         .redirect(reqwest::redirect::Policy::limited(10));
 
-    if let Some(connect_timeout) = connect_timeout {
-        builder = builder.connect_timeout(connect_timeout);
+    if let Some(external_connect_timeout) = external_connect_timeout {
+        builder = builder.connect_timeout(external_connect_timeout);
     }
 
     if plain_http {
@@ -72,26 +76,32 @@ fn http_client_builder(
     builder
 }
 
-pub(crate) fn connect_timeout_from_seconds(seconds: i64) -> Result<Option<Duration>> {
+pub(crate) fn external_connect_timeout_from_seconds(seconds: i64) -> Result<Option<Duration>> {
     match seconds {
         -1 => Ok(None),
         seconds if seconds >= 0 => Ok(Some(Duration::from_secs(seconds as u64))),
         _ => Err(crate::error::DockerPullError::InvalidInput(
-            "connect timeout must be -1 or a non-negative number of seconds".into(),
+            "external connect timeout must be -1 or a non-negative number of seconds".into(),
         )),
     }
 }
 
-pub(crate) fn default_connect_timeout() -> Option<Duration> {
-    Some(Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECONDS as u64))
+pub(crate) fn default_external_connect_timeout() -> Option<Duration> {
+    Some(Duration::from_secs(
+        DEFAULT_EXTERNAL_CONNECT_TIMEOUT_SECONDS as u64,
+    ))
 }
 
-pub(crate) fn parse_connect_timeout_seconds(value: &str) -> std::result::Result<i64, String> {
+pub(crate) fn parse_external_connect_timeout_seconds(
+    value: &str,
+) -> std::result::Result<i64, String> {
     let seconds = value
         .parse::<i64>()
-        .map_err(|error| format!("invalid connect timeout: {error}"))?;
+        .map_err(|error| format!("invalid external connect timeout: {error}"))?;
     if seconds < -1 {
-        return Err("connect timeout must be -1 or a non-negative number of seconds".into());
+        return Err(
+            "external connect timeout must be -1 or a non-negative number of seconds".into(),
+        );
     }
     Ok(seconds)
 }
