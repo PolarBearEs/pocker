@@ -346,13 +346,7 @@ pub enum CacheCommands {
 
 #[derive(Debug, Clone, Args, Default)]
 #[command(about = "Delete cached blobs and partial downloads")]
-pub struct CacheCleanArgs {
-    #[arg(
-        long,
-        help = "Fail instead of waiting when another pocker process is using the cache"
-    )]
-    pub no_wait: bool,
-}
+pub struct CacheCleanArgs {}
 
 #[derive(Debug, Clone, Args)]
 #[command(about = "Run Docker image helper commands")]
@@ -790,17 +784,6 @@ mod tests {
         };
 
         assert!(matches!(args.command, CacheCommands::Clean(_)));
-    }
-
-    #[test]
-    fn cache_clean_no_wait_parses() {
-        let cli = Cli::parse_from(["pocker", "cache", "clean", "--no-wait"]);
-        let Commands::Cache(args) = cli.command else {
-            panic!("expected cache command");
-        };
-        let CacheCommands::Clean(clean) = args.command;
-
-        assert!(clean.no_wait);
     }
 
     #[test]

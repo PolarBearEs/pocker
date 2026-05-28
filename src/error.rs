@@ -26,8 +26,13 @@ pub enum DockerPullError {
     DigestMismatch { expected: String, actual: String },
     #[error("download interrupted")]
     Interrupted,
-    #[error("cache is in use by another pocker process; retry after it finishes or omit --no-wait")]
-    CacheInUse,
+    #[error(
+        "{operation} cannot continue because the cache is in use by another pocker process: {path}\nOnly one pocker process may use a cache directory at a time. The .lock file may remain after exit; only a live OS lock blocks this operation."
+    )]
+    CacheLocked {
+        operation: &'static str,
+        path: PathBuf,
+    },
     #[error("missing blob file `{0}` at `{1}`")]
     MissingBlobFile(String, PathBuf),
     #[error("command failed: {0}")]
