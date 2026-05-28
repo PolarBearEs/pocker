@@ -476,6 +476,8 @@ impl Drop for CacheLayerClaimGuard {
         if entries.is_empty() {
             return;
         }
+        // Move claim handles to a plain OS thread so async worker threads do
+        // not perform file close/remove calls on slow filesystems.
         let _ = std::thread::Builder::new()
             .name("pocker-layer-claim-cleanup".into())
             .spawn(move || cleanup_layer_claim_entries(entries));
@@ -808,6 +810,10 @@ fn claim_file_is_live(path: &Path) -> Result<bool> {
 }
 
 fn cleanup_stale_claim_file(path: &Path, file: File) {
+    if std::fs::remove_file(path).is_ok() {
+        drop(file);
+        return;
+    }
     drop(file);
     let _ = std::fs::remove_file(path);
 }

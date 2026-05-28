@@ -30,6 +30,25 @@ function Invoke-Docker {
     }
 }
 
+function Invoke-PockerWithRetry {
+    param(
+        [string[]]$PockerArgs,
+        [int]$Attempts = 3
+    )
+
+    for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
+        & $Bin @PockerArgs
+        if ($LASTEXITCODE -eq 0) {
+            return
+        }
+        if ($attempt -eq $Attempts) {
+            throw "pocker failed with exit code ${LASTEXITCODE}: $Bin $($PockerArgs -join ' ')"
+        }
+        Write-Warning "pocker failed with exit code ${LASTEXITCODE}; retrying external pull smoke ($attempt/$Attempts)"
+        Start-Sleep -Seconds 5
+    }
+}
+
 function Test-DockerDaemon {
     & docker version --format "{{.Server.Os}}" *> $null
     return $LASTEXITCODE -eq 0
@@ -104,12 +123,12 @@ Remove-Item -Recurse -Force $cacheDir -ErrorAction SilentlyContinue
 
 Write-Host "smoke: pull and load $image through pocker"
 docker image rm --force $image *> $null
-Invoke-Pocker -PockerArgs @("--cache-dir", $cacheDir, "pull", $image)
+Invoke-PockerWithRetry -PockerArgs @("--cache-dir", $cacheDir, "pull", $image)
 Invoke-Docker -DockerArgs @("image", "inspect", $image) | Out-Null
 
 Write-Host "smoke: pull $image into cache without Docker load"
 Remove-Item -Recurse -Force $cacheDir -ErrorAction SilentlyContinue
-Invoke-Pocker -PockerArgs @("--cache-dir", $cacheDir, "pull", "--no-load", $image)
+Invoke-PockerWithRetry -PockerArgs @("--cache-dir", $cacheDir, "pull", "--no-load", $image)
 if (-not (Get-ChildItem -Path (Join-Path $cacheDir "blobs\sha256") -File -ErrorAction SilentlyContinue)) {
     throw "expected cached sha256 blobs after no-load pull"
 }
