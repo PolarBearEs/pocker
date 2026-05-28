@@ -275,6 +275,7 @@ impl Puller {
             .collect::<Vec<_>>();
 
         let layer_claim = self.context.layer_usage.claim(&layer_digests);
+        let cache_layer_claim = self.context.store.claim_layers(&layer_digests).await?;
         if !options.no_load
             && load::finalize_existing_reference(
                 &self.context,
@@ -282,6 +283,8 @@ impl Puller {
                 &stored_reference,
                 &options,
                 &layer_claim,
+                &cache_layer_claim,
+                &layer_digests,
             )
             .await?
         {
@@ -366,6 +369,8 @@ impl Puller {
                 &stored_reference,
                 &options,
                 &layer_claim,
+                &cache_layer_claim,
+                &layer_digests,
             )
             .await?;
         }
@@ -411,6 +416,19 @@ async fn load_blob_bytes(
     reference: &ImageReference,
     descriptor: &Descriptor,
 ) -> Result<Vec<u8>> {
+    if let Some(bytes) = context
+        .store
+        .read_blob_bytes_if_complete(descriptor)
+        .await?
+    {
+        return Ok(bytes);
+    }
+
+    let _blob_guard = context.blob_locks.lock(&descriptor.digest).await;
+    let _file_guard = context
+        .store
+        .acquire_blob_download_lock(&descriptor.digest, &context.stop)
+        .await?;
     if let Some(bytes) = context
         .store
         .read_blob_bytes_if_complete(descriptor)

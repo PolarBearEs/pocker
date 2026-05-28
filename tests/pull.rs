@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::process::Command as StdCommand;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -143,6 +144,57 @@ async fn pulls_multiple_oci_images_from_fake_registry_into_cache() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_pocker_processes_share_layer_download() {
+    let fixture = Arc::new(Fixture::build());
+    let layer_gets = Arc::new(AtomicUsize::new(0));
+    let server = RegistryFixtureServer::spawn_with_slow_layer_gets(
+        Arc::clone(&fixture),
+        Arc::clone(&layer_gets),
+    )
+    .await;
+
+    let cache_dir = tempfile::tempdir().expect("cache tempdir should create");
+    let reference = format!("{}/library/test:latest", server.address());
+    let bin = assert_cmd::cargo::cargo_bin("pocker");
+
+    let mut first = pocker_pull_command(&bin, cache_dir.path(), &reference)
+        .spawn()
+        .expect("first pocker process should start");
+    let mut second = pocker_pull_command(&bin, cache_dir.path(), &reference)
+        .spawn()
+        .expect("second pocker process should start");
+
+    let (first_status, second_status) = tokio::task::spawn_blocking(move || {
+        let first_status = first.wait().expect("first pocker process should exit");
+        let second_status = second.wait().expect("second pocker process should exit");
+        (first_status, second_status)
+    })
+    .await
+    .expect("pocker wait task should run");
+
+    assert!(
+        first_status.success(),
+        "first pocker process should succeed"
+    );
+    assert!(
+        second_status.success(),
+        "second pocker process should succeed"
+    );
+
+    let layer_path = cache_dir
+        .path()
+        .join("blobs")
+        .join("sha256")
+        .join(&fixture.layer_digest);
+    assert!(layer_path.exists(), "expected layer blob at {layer_path:?}");
+    assert_eq!(
+        layer_gets.load(Ordering::SeqCst),
+        1,
+        "shared layer blob should be downloaded once across pocker processes"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pulls_oci_image_with_sha384_layer_digest_into_cache() {
     pulls_oci_image_with_layer_algorithm_into_cache("sha384").await;
 }
@@ -244,16 +296,29 @@ struct RegistryFixtureServer {
 
 impl RegistryFixtureServer {
     async fn spawn(fixture: Arc<Fixture>) -> Self {
-        Self::spawn_with_optional_layer_gets(fixture, None).await
+        Self::spawn_with_optional_layer_gets(fixture, None, None).await
     }
 
     async fn spawn_with_layer_gets(fixture: Arc<Fixture>, layer_gets: Arc<AtomicUsize>) -> Self {
-        Self::spawn_with_optional_layer_gets(fixture, Some(layer_gets)).await
+        Self::spawn_with_optional_layer_gets(fixture, Some(layer_gets), None).await
+    }
+
+    async fn spawn_with_slow_layer_gets(
+        fixture: Arc<Fixture>,
+        layer_gets: Arc<AtomicUsize>,
+    ) -> Self {
+        Self::spawn_with_optional_layer_gets(
+            fixture,
+            Some(layer_gets),
+            Some(Duration::from_millis(300)),
+        )
+        .await
     }
 
     async fn spawn_with_optional_layer_gets(
         fixture: Arc<Fixture>,
         layer_gets: Option<Arc<AtomicUsize>>,
+        layer_body_delay: Option<Duration>,
     ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -270,11 +335,13 @@ impl RegistryFixtureServer {
                 };
                 let request_fixture = Arc::clone(&fixture);
                 let request_layer_gets = layer_gets.clone();
+                let request_layer_body_delay = layer_body_delay;
                 tokio::spawn(async move {
                     let _ = handle_connection_with_optional_layer_gets(
                         stream,
                         request_fixture,
                         request_layer_gets,
+                        request_layer_body_delay,
                     )
                     .await;
                 });
@@ -366,10 +433,34 @@ fn hash_hex<D: Digest>(bytes: &[u8]) -> String {
     hex::encode(hasher.finalize())
 }
 
+fn pocker_pull_command(
+    bin: &std::path::Path,
+    cache_dir: &std::path::Path,
+    reference: &str,
+) -> StdCommand {
+    let mut command = StdCommand::new(bin);
+    command
+        .arg("--cache-dir")
+        .arg(cache_dir)
+        .args([
+            "pull",
+            "--plain-http",
+            "--no-load",
+            "--quiet",
+            "--request-retries",
+            "0",
+            "--blob-retries",
+            "0",
+        ])
+        .arg(reference);
+    command
+}
+
 async fn handle_connection_with_optional_layer_gets(
     mut stream: TcpStream,
     fixture: Arc<Fixture>,
     layer_gets: Option<Arc<AtomicUsize>>,
+    layer_body_delay: Option<Duration>,
 ) -> std::io::Result<()> {
     let mut buffer = Vec::with_capacity(2048);
     let mut chunk = [0_u8; 1024];
@@ -397,6 +488,7 @@ async fn handle_connection_with_optional_layer_gets(
     let method = tokens.next().unwrap_or_default().to_string();
     let path = tokens.next().unwrap_or_default().to_string();
 
+    let mut delay_body = false;
     let (status, content_type, body): (&str, &str, &[u8]) = if path.contains("/manifests/") {
         (
             "200 OK",
@@ -415,6 +507,7 @@ async fn handle_connection_with_optional_layer_gets(
         {
             layer_gets.fetch_add(1, Ordering::SeqCst);
         }
+        delay_body = true;
         ("200 OK", "application/octet-stream", &fixture.layer_bytes)
     } else {
         ("404 Not Found", "text/plain", &[][..])
@@ -426,6 +519,9 @@ async fn handle_connection_with_optional_layer_gets(
     );
     stream.write_all(response_head.as_bytes()).await?;
     if method != "HEAD" {
+        if delay_body && let Some(delay) = layer_body_delay {
+            tokio::time::sleep(delay).await;
+        }
         stream.write_all(body).await?;
     }
     stream.shutdown().await.ok();

@@ -27,10 +27,15 @@ pub async fn download_blob(
     descriptor: Descriptor,
 ) -> Result<()> {
     let _blob_guard = context.blob_locks.lock(&descriptor.digest).await;
+    let _file_guard = context
+        .store
+        .acquire_blob_download_lock(&descriptor.digest, &context.stop)
+        .await?;
+    let expected_size = descriptor.expected_size()?;
 
     if context
         .store
-        .ensure_blob_complete(&descriptor.digest, descriptor.expected_size()?)
+        .ensure_blob_complete(&descriptor.digest, expected_size)
         .await?
     {
         return Ok(());
@@ -38,7 +43,6 @@ pub async fn download_blob(
 
     // OCI descriptors carry the authoritative blob size, so avoid a pre-flight
     // HEAD request and let the first ranged GET surface missing blobs.
-    let expected_size = descriptor.expected_size()?;
     let mut plan = context
         .store
         .prepare_download(&descriptor, expected_size)

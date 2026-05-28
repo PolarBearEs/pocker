@@ -8,7 +8,7 @@ use crate::error::{DockerPullError, Result};
 use crate::reference::{ImageReference, ReferenceTarget};
 use crate::registry::{RegistryClient, cache_repository};
 use crate::serve_registry::{self, ServeListenerConfig};
-use crate::store::{Store, StoredReference};
+use crate::store::{CacheLayerClaimGuard, Store, StoredReference};
 
 use super::{LayerClaimGuard, LoadMode, PullContext, PullOptions};
 
@@ -18,6 +18,8 @@ pub(super) async fn finalize_existing_reference(
     stored_reference: &StoredReference,
     options: &PullOptions,
     layer_claim: &LayerClaimGuard<'_>,
+    cache_layer_claim: &CacheLayerClaimGuard,
+    layer_digests: &[String],
 ) -> Result<bool> {
     let normalized = &stored_reference.reference;
     let already_loaded = docker::daemon_has_reference(reference, &stored_reference.config_digest)
@@ -32,7 +34,8 @@ pub(super) async fn finalize_existing_reference(
     context.store.save_reference(stored_reference).await?;
     if !options.keep_layer_blobs {
         context.ui.set_image_status(normalized, "Pruning cache");
-        let protected_layer_digests = layer_claim.protected_digests();
+        let protected_layer_digests =
+            protected_layer_digests(context, layer_claim, cache_layer_claim, layer_digests).await?;
         context
             .store
             .prune_reference_layer_blobs_except(stored_reference, &protected_layer_digests)
@@ -48,6 +51,8 @@ pub(super) async fn load_reference(
     stored_reference: &StoredReference,
     options: &PullOptions,
     layer_claim: &LayerClaimGuard<'_>,
+    cache_layer_claim: &CacheLayerClaimGuard,
+    layer_digests: &[String],
 ) -> Result<()> {
     let normalized = &stored_reference.reference;
     context.ui.begin_load(normalized);
@@ -61,7 +66,8 @@ pub(super) async fn load_reference(
     }
     if !options.keep_layer_blobs {
         context.ui.set_image_status(normalized, "Pruning cache");
-        let protected_layer_digests = layer_claim.protected_digests();
+        let protected_layer_digests =
+            protected_layer_digests(context, layer_claim, cache_layer_claim, layer_digests).await?;
         context
             .store
             .prune_reference_layer_blobs_except(stored_reference, &protected_layer_digests)
@@ -69,6 +75,22 @@ pub(super) async fn load_reference(
     }
     context.ui.finish_image(normalized, "Ready");
     Ok(())
+}
+
+async fn protected_layer_digests(
+    context: &PullContext,
+    layer_claim: &LayerClaimGuard<'_>,
+    cache_layer_claim: &CacheLayerClaimGuard,
+    layer_digests: &[String],
+) -> Result<std::collections::HashSet<String>> {
+    let mut protected = layer_claim.protected_digests();
+    protected.extend(
+        context
+            .store
+            .live_external_layer_claims(layer_digests, Some(cache_layer_claim))
+            .await?,
+    );
+    Ok(protected)
 }
 
 async fn load_reference_through_cache_registry(
