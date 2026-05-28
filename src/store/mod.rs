@@ -469,7 +469,6 @@ impl Deref for MaintenanceStore {
 }
 
 const FILE_LOCK_RETRY_DELAY: Duration = Duration::from_millis(150);
-const STALE_CLAIM_RECHECK_DELAY: Duration = Duration::from_millis(10);
 
 impl Drop for CacheLayerClaimGuard {
     fn drop(&mut self) {
@@ -804,16 +803,7 @@ fn claim_file_is_live(path: &Path) -> Result<bool> {
             cleanup_stale_claim_file(path, file);
             Ok(false)
         }
-        None => {
-            std::thread::sleep(STALE_CLAIM_RECHECK_DELAY);
-            match try_acquire_file_lock_blocking(path)? {
-                Some(file) => {
-                    cleanup_stale_claim_file(path, file);
-                    Ok(false)
-                }
-                None => Ok(true),
-            }
-        }
+        None => Ok(true),
     }
 }
 
@@ -1631,40 +1621,6 @@ mod tests {
         assert!(
             !protected.contains(digest),
             "unlocked stale claim should not protect digest"
-        );
-        assert!(!path.exists(), "stale claim file should be removed");
-    }
-
-    #[tokio::test]
-    async fn briefly_locked_stale_layer_claim_is_rechecked_before_protecting() {
-        let dir = tempdir().expect("tempdir should create");
-        let store = Store::open(dir.path().to_path_buf())
-            .await
-            .expect("store should open");
-        let digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        let path = store
-            .layer_claim_path(digest, "briefly-locked-stale-test")
-            .expect("claim path should build");
-        let file = super::open_coordination_file(&path).expect("claim file should open");
-        file.lock().expect("test claim lock should acquire");
-
-        let scan_store = store.clone();
-        let scan = tokio::spawn(async move {
-            scan_store
-                .live_external_layer_claims(&[digest.to_string()], None)
-                .await
-        });
-        tokio::time::sleep(super::STALE_CLAIM_RECHECK_DELAY / 2).await;
-        drop(file);
-
-        let protected = scan
-            .await
-            .expect("claim scan task should not panic")
-            .expect("claim scan should succeed");
-
-        assert!(
-            !protected.contains(digest),
-            "briefly locked stale claim should be rechecked before protecting"
         );
         assert!(!path.exists(), "stale claim file should be removed");
     }
