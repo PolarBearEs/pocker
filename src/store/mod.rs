@@ -1330,6 +1330,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn leftover_lock_file_does_not_block_maintenance_store_open() {
+        let dir = tempdir().expect("tempdir should create");
+        let lock = dir.path().join(".lock");
+        std::fs::write(&lock, b"leftover").expect("lock file should be created");
+
+        let store = MaintenanceStore::open(dir.path().to_path_buf())
+            .await
+            .expect("leftover lock file must not block maintenance store open");
+
+        assert!(store.root().join(".lock").exists());
+    }
+
+    #[tokio::test]
     async fn clear_fails_fast_for_active_cache_lock() {
         let dir = tempdir().expect("tempdir should create");
         let active_store = ActiveStore::open(dir.path().to_path_buf(), "pull")
@@ -1435,6 +1448,31 @@ mod tests {
             .expect("waiter should acquire after first drops")
             .expect("waiter task should not panic")
             .expect("second blob lock should acquire");
+    }
+
+    #[tokio::test]
+    async fn stale_blob_download_lock_file_does_not_block_future_lockers() {
+        let dir = tempdir().expect("tempdir should create");
+        let store = Store::open(dir.path().to_path_buf())
+            .await
+            .expect("store should open");
+        let digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let lock_path = store
+            .blob_download_lock_path(digest)
+            .expect("blob lock path should build");
+        std::fs::create_dir_all(lock_path.parent().expect("lock parent"))
+            .expect("lock parent should create");
+        std::fs::write(&lock_path, b"stale").expect("stale blob lock file should be written");
+
+        store
+            .acquire_blob_download_lock(digest, &CancellationToken::new())
+            .await
+            .expect("stale blob lock file must not block a live lock");
+
+        assert!(
+            lock_path.exists(),
+            "blob lock files are stable coordination handles"
+        );
     }
 
     #[tokio::test]

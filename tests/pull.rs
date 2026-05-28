@@ -195,6 +195,67 @@ async fn concurrent_pocker_processes_share_layer_download() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn interrupted_pocker_process_releases_cache_and_blob_locks() {
+    let fixture = Arc::new(Fixture::build());
+    let layer_gets = Arc::new(AtomicUsize::new(0));
+    let server = RegistryFixtureServer::spawn_with_delayed_layer_gets(
+        Arc::clone(&fixture),
+        Arc::clone(&layer_gets),
+        Duration::from_secs(3),
+    )
+    .await;
+
+    let cache_dir = tempfile::tempdir().expect("cache tempdir should create");
+    let reference = format!("{}/library/test:latest", server.address());
+    let bin = assert_cmd::cargo::cargo_bin("pocker");
+    let mut interrupted = pocker_pull_command(&bin, cache_dir.path(), &reference)
+        .spawn()
+        .expect("interrupted pocker process should start");
+
+    wait_for_layer_get(&layer_gets).await;
+    interrupted
+        .kill()
+        .expect("interrupted pocker process should be killed");
+    let interrupted_status = tokio::task::spawn_blocking(move || {
+        interrupted
+            .wait()
+            .expect("interrupted pocker process should exit")
+    })
+    .await
+    .expect("interrupted wait task should run");
+    assert!(
+        !interrupted_status.success(),
+        "interrupted process should not report success"
+    );
+
+    Command::cargo_bin("pocker")
+        .expect("pocker binary should be built")
+        .arg("--cache-dir")
+        .arg(cache_dir.path())
+        .args([
+            "pull",
+            "--plain-http",
+            "--no-load",
+            "--quiet",
+            "--request-retries",
+            "0",
+            "--blob-retries",
+            "0",
+        ])
+        .arg(&reference)
+        .timeout(Duration::from_secs(30))
+        .assert()
+        .success();
+
+    let layer_path = cache_dir
+        .path()
+        .join("blobs")
+        .join("sha256")
+        .join(&fixture.layer_digest);
+    assert!(layer_path.exists(), "expected layer blob at {layer_path:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pulls_oci_image_with_sha384_layer_digest_into_cache() {
     pulls_oci_image_with_layer_algorithm_into_cache("sha384").await;
 }
@@ -307,12 +368,15 @@ impl RegistryFixtureServer {
         fixture: Arc<Fixture>,
         layer_gets: Arc<AtomicUsize>,
     ) -> Self {
-        Self::spawn_with_optional_layer_gets(
-            fixture,
-            Some(layer_gets),
-            Some(Duration::from_millis(300)),
-        )
-        .await
+        Self::spawn_with_delayed_layer_gets(fixture, layer_gets, Duration::from_millis(300)).await
+    }
+
+    async fn spawn_with_delayed_layer_gets(
+        fixture: Arc<Fixture>,
+        layer_gets: Arc<AtomicUsize>,
+        delay: Duration,
+    ) -> Self {
+        Self::spawn_with_optional_layer_gets(fixture, Some(layer_gets), Some(delay)).await
     }
 
     async fn spawn_with_optional_layer_gets(
@@ -454,6 +518,16 @@ fn pocker_pull_command(
         ])
         .arg(reference);
     command
+}
+
+async fn wait_for_layer_get(layer_gets: &AtomicUsize) {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while layer_gets.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("layer download should start");
 }
 
 async fn handle_connection_with_optional_layer_gets(
