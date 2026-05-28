@@ -29,7 +29,11 @@ pub async fn download_blob(
     let _blob_guard = context.blob_locks.lock(&descriptor.digest).await;
     let _file_guard = context
         .store
-        .acquire_blob_download_lock(&descriptor.digest, &context.stop)
+        .acquire_blob_download_lock_with_wait_notice(&descriptor.digest, &context.stop, || {
+            context
+                .ui
+                .set_layer_status(&descriptor.digest, "Waiting for another pocker process");
+        })
         .await?;
     let expected_size = descriptor.expected_size()?;
 
@@ -38,6 +42,7 @@ pub async fn download_blob(
         .ensure_blob_complete(&descriptor.digest, expected_size)
         .await?
     {
+        context.ui.mark_layer_cached(&descriptor.digest);
         return Ok(());
     }
 
@@ -364,16 +369,25 @@ fn register_retry(
 
 #[cfg(test)]
 mod tests {
-    use reqwest::StatusCode;
-    use reqwest::header::{CONTENT_RANGE, HeaderMap, HeaderValue};
-
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
 
+    use reqwest::StatusCode;
+    use reqwest::header::{CONTENT_RANGE, HeaderMap, HeaderValue};
+    use tempfile::tempdir;
+
     use super::{
-        DownloadProgress, premature_eof_detail, sleep_or_interrupt_on_token,
+        DownloadProgress, download_blob, premature_eof_detail, sleep_or_interrupt_on_token,
         validate_blob_response_status,
     };
+    use crate::auth::AuthResolver;
     use crate::error::DockerPullError;
+    use crate::pull::{BlobDownloadLocks, CurrentPullLayers, PullContext};
+    use crate::reference::ImageReference;
+    use crate::registry::{Descriptor, RegistryClient};
+    use crate::store::Store;
+    use crate::ui::ProgressSink;
 
     #[test]
     fn missing_blob_status_maps_to_not_found() {
@@ -480,5 +494,101 @@ mod tests {
             .expect_err("cancelled retry sleep should return immediately");
 
         assert!(matches!(error, DockerPullError::Interrupted));
+    }
+
+    #[tokio::test]
+    async fn download_blob_marks_layer_cached_after_waiting_for_other_process() {
+        let dir = tempdir().expect("tempdir should create");
+        let store = Arc::new(
+            Store::open(dir.path().to_path_buf())
+                .await
+                .expect("store should open"),
+        );
+        let bytes = b"shared layer";
+        let descriptor = Descriptor {
+            media_type: "application/octet-stream".into(),
+            digest: crate::digest::canonical_digest_bytes(bytes),
+            size: bytes.len() as i64,
+            platform: None,
+            annotations: None,
+        };
+        let stop = tokio_util::sync::CancellationToken::new();
+        let file_lock = store
+            .acquire_blob_download_lock(&descriptor.digest, &stop)
+            .await
+            .expect("first process lock should acquire");
+        let ui = Arc::new(RecordingProgress::default());
+        let context = PullContext {
+            store: Arc::clone(&store),
+            registry: Arc::new(RegistryClient::new(
+                reqwest::Client::new(),
+                Arc::new(AuthResolver::new(None).expect("auth resolver should create")),
+                true,
+                Some(0),
+            )),
+            stop,
+            ui: ui.clone(),
+            blob_retry_limit: Some(0),
+            blob_locks: Arc::new(BlobDownloadLocks::default()),
+            layer_usage: Arc::new(CurrentPullLayers::default()),
+            daemon_layer_cache: None,
+        };
+        let reference = ImageReference::parse("example.com/library/test:latest")
+            .expect("reference should parse");
+
+        let task = tokio::spawn({
+            let context = context.clone();
+            let reference = reference.clone();
+            let descriptor = descriptor.clone();
+            async move { download_blob(&context, &reference, descriptor).await }
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !ui.waiting.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("download should report lock wait");
+
+        store
+            .save_blob_bytes(&descriptor, bytes)
+            .await
+            .expect("other process should complete blob");
+        drop(file_lock);
+
+        task.await
+            .expect("download task should not panic")
+            .expect("download should reuse completed blob");
+        assert!(
+            ui.cached.load(Ordering::SeqCst),
+            "layer should be marked cached after waiting for another process"
+        );
+    }
+
+    #[derive(Default)]
+    struct RecordingProgress {
+        waiting: AtomicBool,
+        cached: AtomicBool,
+    }
+
+    impl ProgressSink for RecordingProgress {
+        fn begin_image(&self, _image: &str) {}
+        fn begin_load(&self, _image: &str) {}
+        fn set_image_status(&self, _image: &str, _status: &str) {}
+        fn finish_image(&self, _image: &str, _status: &str) {}
+        fn prepare_layers(&self, _digests: &[String]) {}
+        fn mark_layer_cached(&self, _digest: &str) {
+            self.cached.store(true, Ordering::SeqCst);
+        }
+        fn mark_layer_daemon(&self, _digest: &str) {}
+        fn start_layer_download(&self, _digest: &str, _total_bytes: u64, _starting_offset: u64) {}
+        fn advance_layer_download(&self, _digest: &str, _amount: u64) {}
+        fn finish_layer_download(&self, _digest: &str) {}
+        fn set_layer_status(&self, _digest: &str, status: &str) {
+            if status == "Waiting for another pocker process" {
+                self.waiting.store(true, Ordering::SeqCst);
+            }
+        }
+        fn warn(&self, _message: &str) {}
     }
 }
