@@ -240,13 +240,14 @@ pub(crate) async fn pull_references(
     global_quiet: bool,
     references: Vec<String>,
     request: PullRequestOptions,
+    operation: &'static str,
 ) -> Result<()> {
     let external_registry_connect_timeout = external_connect_timeout_from_seconds(
         request.external_registry_connection.connect_timeout_seconds,
     )?;
     let references = pocker_compose::unique_images(&references);
     let store = Arc::new(
-        ActiveStore::open(cache_dir.to_path_buf())
+        ActiveStore::open(cache_dir.to_path_buf(), operation)
             .await?
             .into_store(),
     );

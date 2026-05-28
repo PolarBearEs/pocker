@@ -19,7 +19,14 @@ pub(crate) async fn execute(cli: Cli) -> Result<()> {
     match cli.command {
         Commands::Pull(args) => {
             let (references, request) = PullRequestOptions::from_pull_args(args);
-            pull_references(&cli.global.cache_dir, cli.global.quiet, references, request).await?;
+            pull_references(
+                &cli.global.cache_dir,
+                cli.global.quiet,
+                references,
+                request,
+                "pull",
+            )
+            .await?;
         }
         Commands::Compose(args) => match args.command {
             ComposeCommands::Config(config_args) => {
@@ -51,12 +58,19 @@ pub(crate) async fn execute(cli: Cli) -> Result<()> {
                 )?;
                 let images = compose::unique_images(&resolved.images);
                 let request = PullRequestOptions::from_compose_pull_args(*pull_args);
-                pull_references(&cli.global.cache_dir, cli.global.quiet, images, request).await?;
+                pull_references(
+                    &cli.global.cache_dir,
+                    cli.global.quiet,
+                    images,
+                    request,
+                    "compose pull",
+                )
+                .await?;
             }
         },
         Commands::Serve(args) => {
             let store = Arc::new(
-                ActiveStore::open(cli.global.cache_dir.clone())
+                ActiveStore::open(cli.global.cache_dir.clone(), "serve")
                     .await?
                     .into_store(),
             );
@@ -112,9 +126,7 @@ pub(crate) async fn execute(cli: Cli) -> Result<()> {
         Commands::Cache(args) => {
             let store = MaintenanceStore::open(cli.global.cache_dir.clone()).await?;
             match args.command {
-                CacheCommands::Clean(args) => {
-                    clean_cache(&store, cli.global.quiet, args.no_wait).await?
-                }
+                CacheCommands::Clean(_) => clean_cache(&store, cli.global.quiet).await?,
             }
         }
         Commands::Image(args) => match args.command {
@@ -246,25 +258,13 @@ async fn resolve_compose_images(files: Vec<std::path::PathBuf>) -> Result<compos
         .map_err(Into::into)
 }
 
-async fn clean_cache(store: &MaintenanceStore, quiet: bool, no_wait: bool) -> Result<()> {
+async fn clean_cache(store: &MaintenanceStore, quiet: bool) -> Result<()> {
     if quiet {
-        if no_wait {
-            store.try_clear_quiet().await?;
-        } else {
-            store.clear_quiet().await?;
-        }
+        store.clear_quiet().await?;
         return Ok(());
     }
 
-    if no_wait {
-        let cleared = store.try_clear().await?;
-        print_cleared_cache(store, cleared);
-        return Ok(());
-    }
-
-    let cleared = store
-        .clear_with_wait_notice(|| println!("Waiting for active cache operations to finish..."))
-        .await?;
+    let cleared = store.clear().await?;
     print_cleared_cache(store, cleared);
     Ok(())
 }
