@@ -274,8 +274,6 @@ impl Store {
     }
 
     async fn clear_with_report(&self, collect_report: bool) -> Result<Option<ClearedCache>> {
-        let _exclusive_lock =
-            try_acquire_exclusive_cache_lock(self.root.clone(), "cache clean").await?;
         let report = if collect_report {
             let root = self.root.clone();
             let files = tokio::task::spawn_blocking(move || collect_cache_files(&root))
@@ -328,7 +326,7 @@ impl Deref for ActiveStore {
 impl MaintenanceStore {
     pub async fn open(root: PathBuf) -> Result<Self> {
         Ok(Self {
-            store: Store::open_without_lock(root).await?,
+            store: Store::open_with_exclusive_lock(root, "cache clean").await?,
         })
     }
 
@@ -1114,20 +1112,19 @@ mod tests {
         let active_store = ActiveStore::open(dir.path().to_path_buf(), "pull")
             .await
             .expect("active store should open");
-        let cleaner = MaintenanceStore::open(dir.path().to_path_buf())
-            .await
-            .expect("cleaner store should open");
 
-        let error = cleaner
-            .clear()
+        let error = MaintenanceStore::open(dir.path().to_path_buf())
             .await
-            .expect_err("clear should fail while active store holds cache lock");
+            .expect_err("cleaner store should fail while active store holds cache lock");
 
         assert!(
             matches!(error, DockerPullError::CacheLocked { operation, .. } if operation == "cache clean")
         );
 
         drop(active_store);
+        let cleaner = MaintenanceStore::open(dir.path().to_path_buf())
+            .await
+            .expect("cleaner store should open");
         let cleared = cleaner.clear().await.expect("clear should succeed");
 
         assert!(cleared.files.is_empty());
