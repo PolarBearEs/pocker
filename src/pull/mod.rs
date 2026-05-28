@@ -260,6 +260,17 @@ impl Puller {
             .store
             .save_blob_bytes(&resolved.manifest, &resolved.manifest_bytes)
             .await?;
+        let layer_digests = resolved
+            .layers
+            .iter()
+            .map(|layer| layer.digest.clone())
+            .collect::<Vec<_>>();
+        // Claim layers as soon as the manifest tells us which blobs this pull
+        // may use. Config fetches can be slow, and pruning in another process
+        // must see this active pull before deciding cached layers are disposable.
+        let layer_claim = self.context.layer_usage.claim(&layer_digests);
+        let cache_layer_claim = self.context.store.claim_layers(&layer_digests).await?;
+
         let config_bytes = load_blob_bytes(&self.context, &reference, &resolved.config).await?;
 
         let stored_reference = StoredReference {
@@ -269,13 +280,7 @@ impl Puller {
         };
 
         let layers = pair_layers(resolved.layers.clone(), &config_bytes)?;
-        let layer_digests = layers
-            .iter()
-            .map(|layer| layer.descriptor.digest.clone())
-            .collect::<Vec<_>>();
 
-        let layer_claim = self.context.layer_usage.claim(&layer_digests);
-        let cache_layer_claim = self.context.store.claim_layers(&layer_digests).await?;
         if !options.no_load
             && load::finalize_existing_reference(
                 &self.context,
