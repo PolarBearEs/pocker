@@ -339,7 +339,8 @@ impl Store {
         Ok(())
     }
 
-    pub async fn prune_reference_layer_blobs_except(
+    #[cfg(test)]
+    async fn prune_reference_layer_blobs_except(
         &self,
         reference: &StoredReference,
         protected: &HashSet<String>,
@@ -353,6 +354,46 @@ impl Store {
             if protected.contains(&digest) {
                 continue;
             }
+            let path = self.blob_path(&digest)?;
+            match tokio_fs::remove_file(path).await {
+                Ok(()) => removed += 1,
+                Err(error) if error.kind() == ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+
+        Ok(removed)
+    }
+
+    pub async fn prune_reference_layer_blobs_except_claimed(
+        &self,
+        reference: &StoredReference,
+        protected: &HashSet<String>,
+        own_claim: Option<&CacheLayerClaimGuard>,
+        stop: &CancellationToken,
+    ) -> Result<usize> {
+        let manifest_path = self.blob_path(&reference.manifest.digest)?;
+        let manifest_bytes = tokio_fs::read(&manifest_path).await?;
+        let layer_digests = layer_digests_from_manifest(&manifest_bytes)?;
+
+        let mut removed = 0_usize;
+        for digest in layer_digests {
+            if protected.contains(&digest) {
+                continue;
+            }
+
+            // Prune and cache-hit checks share the blob lock. If a new pull
+            // claims after an earlier snapshot, it either shows up in this
+            // claim scan or waits here and re-checks after the delete.
+            let _blob_lock = self.acquire_blob_download_lock(&digest, stop).await?;
+            if self
+                .live_external_layer_claims(std::slice::from_ref(&digest), own_claim)
+                .await?
+                .contains(&digest)
+            {
+                continue;
+            }
+
             let path = self.blob_path(&digest)?;
             match tokio_fs::remove_file(path).await {
                 Ok(()) => removed += 1,
@@ -1103,6 +1144,84 @@ mod tests {
                 .expect("unique layer")
                 .exists(),
             "unprotected layer should be removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn prune_reference_layer_blobs_except_claimed_keeps_live_claims() {
+        let dir = tempdir().expect("tempdir should create");
+        let store = Store::open(dir.path().to_path_buf())
+            .await
+            .expect("store should open");
+        let claimed_layer =
+            "sha256:5555555555555555555555555555555555555555555555555555555555555555";
+        let unclaimed_layer =
+            "sha256:6666666666666666666666666666666666666666666666666666666666666666";
+        let manifest = Descriptor {
+            media_type: "application/vnd.oci.image.manifest.v1+json".into(),
+            digest: "sha256:7777777777777777777777777777777777777777777777777777777777777777"
+                .into(),
+            size: 0,
+            platform: None,
+            annotations: None,
+        };
+        let layer_json = [claimed_layer, unclaimed_layer]
+            .iter()
+            .map(|digest| {
+                format!(
+                    r#"{{"mediaType":"application/vnd.oci.image.layer.v1.tar+gzip","digest":"{digest}","size":5}}"#
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let bytes = format!(
+            r#"{{"schemaVersion":2,"config":{{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","size":2}},"layers":[{layer_json}]}}"#
+        );
+        let path = store.blob_path(&manifest.digest).expect("manifest path");
+        std::fs::create_dir_all(path.parent().expect("manifest parent"))
+            .expect("manifest parent should exist");
+        std::fs::write(path, bytes).expect("manifest should be written");
+        for digest in [claimed_layer, unclaimed_layer] {
+            let path = store.blob_path(digest).expect("layer path");
+            std::fs::create_dir_all(path.parent().expect("layer parent"))
+                .expect("layer parent should exist");
+            std::fs::write(path, b"layer").expect("layer should be written");
+        }
+        let reference = StoredReference {
+            reference: "registry-1.docker.io/library/alpine:latest".into(),
+            manifest,
+            config_digest:
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+        };
+        let _external_claim = store
+            .claim_layers(&[claimed_layer.to_string()])
+            .await
+            .expect("external claim should be created");
+
+        let removed = store
+            .prune_reference_layer_blobs_except_claimed(
+                &reference,
+                &HashSet::new(),
+                None,
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("layer prune should succeed");
+
+        assert_eq!(removed, 1);
+        assert!(
+            store
+                .blob_path(claimed_layer)
+                .expect("claimed layer")
+                .exists(),
+            "claimed layer should be kept"
+        );
+        assert!(
+            !store
+                .blob_path(unclaimed_layer)
+                .expect("unclaimed layer")
+                .exists(),
+            "unclaimed layer should be removed"
         );
     }
 

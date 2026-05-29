@@ -289,7 +289,6 @@ impl Puller {
                 &options,
                 &layer_claim,
                 &cache_layer_claim,
-                &layer_digests,
             )
             .await?
         {
@@ -320,12 +319,14 @@ impl Puller {
         let mut cache_checks = stream::iter(layers)
             .map(|layer| {
                 let store = Arc::clone(&self.context.store);
+                let stop = self.context.stop.clone();
                 async move {
+                    let expected_size = layer.descriptor.expected_size()?;
+                    let _blob_lock = store
+                        .acquire_blob_download_lock(&layer.descriptor.digest, &stop)
+                        .await?;
                     let cached = store
-                        .ensure_blob_complete(
-                            &layer.descriptor.digest,
-                            layer.descriptor.expected_size()?,
-                        )
+                        .ensure_blob_complete(&layer.descriptor.digest, expected_size)
                         .await?;
                     Result::Ok((layer, cached))
                 }
@@ -375,7 +376,6 @@ impl Puller {
                 &options,
                 &layer_claim,
                 &cache_layer_claim,
-                &layer_digests,
             )
             .await?;
         }
