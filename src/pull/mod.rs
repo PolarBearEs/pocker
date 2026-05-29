@@ -260,6 +260,17 @@ impl Puller {
             .store
             .save_blob_bytes(&resolved.manifest, &resolved.manifest_bytes)
             .await?;
+        let layer_digests = resolved
+            .layers
+            .iter()
+            .map(|layer| layer.digest.clone())
+            .collect::<Vec<_>>();
+        // Claim layers as soon as the manifest tells us which blobs this pull
+        // may use. Config fetches can be slow, and pruning in another process
+        // must see this active pull before deciding cached layers are disposable.
+        let layer_claim = self.context.layer_usage.claim(&layer_digests);
+        let cache_layer_claim = self.context.store.claim_layers(&layer_digests).await?;
+
         let config_bytes = load_blob_bytes(&self.context, &reference, &resolved.config).await?;
 
         let stored_reference = StoredReference {
@@ -269,12 +280,7 @@ impl Puller {
         };
 
         let layers = pair_layers(resolved.layers.clone(), &config_bytes)?;
-        let layer_digests = layers
-            .iter()
-            .map(|layer| layer.descriptor.digest.clone())
-            .collect::<Vec<_>>();
 
-        let layer_claim = self.context.layer_usage.claim(&layer_digests);
         if !options.no_load
             && load::finalize_existing_reference(
                 &self.context,
@@ -282,6 +288,7 @@ impl Puller {
                 &stored_reference,
                 &options,
                 &layer_claim,
+                &cache_layer_claim,
             )
             .await?
         {
@@ -312,12 +319,14 @@ impl Puller {
         let mut cache_checks = stream::iter(layers)
             .map(|layer| {
                 let store = Arc::clone(&self.context.store);
+                let stop = self.context.stop.clone();
                 async move {
+                    let expected_size = layer.descriptor.expected_size()?;
+                    let _blob_lock = store
+                        .acquire_blob_download_lock(&layer.descriptor.digest, &stop)
+                        .await?;
                     let cached = store
-                        .ensure_blob_complete(
-                            &layer.descriptor.digest,
-                            layer.descriptor.expected_size()?,
-                        )
+                        .ensure_blob_complete(&layer.descriptor.digest, expected_size)
                         .await?;
                     Result::Ok((layer, cached))
                 }
@@ -366,6 +375,7 @@ impl Puller {
                 &stored_reference,
                 &options,
                 &layer_claim,
+                &cache_layer_claim,
             )
             .await?;
         }
@@ -411,6 +421,19 @@ async fn load_blob_bytes(
     reference: &ImageReference,
     descriptor: &Descriptor,
 ) -> Result<Vec<u8>> {
+    if let Some(bytes) = context
+        .store
+        .read_blob_bytes_if_complete(descriptor)
+        .await?
+    {
+        return Ok(bytes);
+    }
+
+    let _blob_guard = context.blob_locks.lock(&descriptor.digest).await;
+    let _file_guard = context
+        .store
+        .acquire_blob_download_lock(&descriptor.digest, &context.stop)
+        .await?;
     if let Some(bytes) = context
         .store
         .read_blob_bytes_if_complete(descriptor)

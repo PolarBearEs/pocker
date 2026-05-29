@@ -8,7 +8,7 @@ use crate::error::{DockerPullError, Result};
 use crate::reference::{ImageReference, ReferenceTarget};
 use crate::registry::{RegistryClient, cache_repository};
 use crate::serve_registry::{self, ServeListenerConfig};
-use crate::store::{Store, StoredReference};
+use crate::store::{CacheLayerClaimGuard, Store, StoredReference};
 
 use super::{LayerClaimGuard, LoadMode, PullContext, PullOptions};
 
@@ -18,6 +18,7 @@ pub(super) async fn finalize_existing_reference(
     stored_reference: &StoredReference,
     options: &PullOptions,
     layer_claim: &LayerClaimGuard<'_>,
+    cache_layer_claim: &CacheLayerClaimGuard,
 ) -> Result<bool> {
     let normalized = &stored_reference.reference;
     let already_loaded = docker::daemon_has_reference(reference, &stored_reference.config_digest)
@@ -35,7 +36,12 @@ pub(super) async fn finalize_existing_reference(
         let protected_layer_digests = layer_claim.protected_digests();
         context
             .store
-            .prune_reference_layer_blobs_except(stored_reference, &protected_layer_digests)
+            .prune_reference_layer_blobs_except_claimed(
+                stored_reference,
+                &protected_layer_digests,
+                Some(cache_layer_claim),
+                &context.stop,
+            )
             .await?;
     }
     context.ui.finish_image(normalized, "Already exists");
@@ -48,6 +54,7 @@ pub(super) async fn load_reference(
     stored_reference: &StoredReference,
     options: &PullOptions,
     layer_claim: &LayerClaimGuard<'_>,
+    cache_layer_claim: &CacheLayerClaimGuard,
 ) -> Result<()> {
     let normalized = &stored_reference.reference;
     context.ui.begin_load(normalized);
@@ -64,7 +71,12 @@ pub(super) async fn load_reference(
         let protected_layer_digests = layer_claim.protected_digests();
         context
             .store
-            .prune_reference_layer_blobs_except(stored_reference, &protected_layer_digests)
+            .prune_reference_layer_blobs_except_claimed(
+                stored_reference,
+                &protected_layer_digests,
+                Some(cache_layer_claim),
+                &context.stop,
+            )
             .await?;
     }
     context.ui.finish_image(normalized, "Ready");

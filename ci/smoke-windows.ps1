@@ -30,6 +30,34 @@ function Invoke-Docker {
     }
 }
 
+function Test-RetryableExternalRegistryFailure {
+    param([object[]]$Output)
+
+    $text = ($Output | Out-String)
+    return $text -match "bad registry response: registry returned (403 Forbidden|429 Too Many Requests|5[0-9][0-9] .*) for manifest"
+}
+
+function Invoke-PockerExternalPull {
+    param(
+        [string[]]$PockerArgs,
+        [int]$Attempts = 3
+    )
+
+    for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
+        $output = & $Bin @PockerArgs 2>&1
+        $exitCode = $LASTEXITCODE
+        $output | ForEach-Object { Write-Host $_ }
+        if ($exitCode -eq 0) {
+            return
+        }
+        if (-not (Test-RetryableExternalRegistryFailure -Output $output) -or $attempt -eq $Attempts) {
+            throw "pocker failed with exit code ${exitCode}: $Bin $($PockerArgs -join ' ')"
+        }
+        Write-Warning "external registry returned a retryable manifest error; retrying pocker pull smoke ($attempt/$Attempts)"
+        Start-Sleep -Seconds 5
+    }
+}
+
 function Test-DockerDaemon {
     & docker version --format "{{.Server.Os}}" *> $null
     return $LASTEXITCODE -eq 0
@@ -104,12 +132,12 @@ Remove-Item -Recurse -Force $cacheDir -ErrorAction SilentlyContinue
 
 Write-Host "smoke: pull and load $image through pocker"
 docker image rm --force $image *> $null
-Invoke-Pocker -PockerArgs @("--cache-dir", $cacheDir, "pull", $image)
+Invoke-PockerExternalPull -PockerArgs @("--cache-dir", $cacheDir, "pull", $image)
 Invoke-Docker -DockerArgs @("image", "inspect", $image) | Out-Null
 
 Write-Host "smoke: pull $image into cache without Docker load"
 Remove-Item -Recurse -Force $cacheDir -ErrorAction SilentlyContinue
-Invoke-Pocker -PockerArgs @("--cache-dir", $cacheDir, "pull", "--no-load", $image)
+Invoke-PockerExternalPull -PockerArgs @("--cache-dir", $cacheDir, "pull", "--no-load", $image)
 if (-not (Get-ChildItem -Path (Join-Path $cacheDir "blobs\sha256") -File -ErrorAction SilentlyContinue)) {
     throw "expected cached sha256 blobs after no-load pull"
 }

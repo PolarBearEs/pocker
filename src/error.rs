@@ -27,7 +27,7 @@ pub enum DockerPullError {
     #[error("download interrupted")]
     Interrupted,
     #[error(
-        "{operation} cannot continue because the cache is in use by another pocker process: {path}\nOnly one pocker process may use a cache directory at a time. The .lock file may remain after exit; only a live OS lock blocks this operation."
+        "{operation} cannot continue because another pocker process holds exclusive cache access: {path}\nThe .lock file may remain after exit; only a live OS lock blocks this operation."
     )]
     CacheLocked {
         operation: &'static str,

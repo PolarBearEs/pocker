@@ -5,9 +5,11 @@ use std::fs::{File, OpenOptions, TryLockError};
 use std::io::ErrorKind;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use tokio::fs as tokio_fs;
+use tokio_util::sync::CancellationToken;
 
 use crate::digest::{
     DigestAlgorithm, digest_bytes_for_digest, digest_file_for_digest, parse_digest, sha256_hex,
@@ -22,7 +24,7 @@ use fs::{
 #[derive(Debug, Clone)]
 pub struct Store {
     root: PathBuf,
-    // Keeps the active cache lock held for the Store lifetime.
+    // Keeps the active shared cache lock held for the Store lifetime.
     #[allow(dead_code)]
     cache_lock: Option<std::sync::Arc<File>>,
 }
@@ -48,6 +50,25 @@ pub struct StoredReference {
 pub struct DownloadPlan {
     pub durable_offset: u64,
     pub partial_path: PathBuf,
+}
+
+#[derive(Debug)]
+pub struct BlobDownloadFileLock {
+    #[allow(dead_code)]
+    file: File,
+}
+
+#[derive(Debug)]
+pub struct CacheLayerClaimGuard {
+    entries: Vec<LayerClaimEntry>,
+    own_paths: HashSet<PathBuf>,
+}
+
+#[derive(Debug)]
+struct LayerClaimEntry {
+    path: PathBuf,
+    #[allow(dead_code)]
+    file: File,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,10 +103,10 @@ impl Store {
         })
     }
 
-    async fn open_with_exclusive_lock(root: PathBuf, operation: &'static str) -> Result<Self> {
+    async fn open_with_shared_lock(root: PathBuf, operation: &'static str) -> Result<Self> {
         ensure_directory_blocking(root.clone()).await?;
         let lock = Some(std::sync::Arc::new(
-            try_acquire_exclusive_cache_lock(root.clone(), operation).await?,
+            acquire_shared_cache_lock(root.clone(), operation).await?,
         ));
         ensure_store_layout_blocking(root.clone()).await?;
         Ok(Self {
@@ -112,6 +133,95 @@ impl Store {
         self.root
             .join("references")
             .join(format!("{}.json", reference_key(reference)))
+    }
+
+    pub async fn acquire_blob_download_lock(
+        &self,
+        digest: &str,
+        stop: &CancellationToken,
+    ) -> Result<BlobDownloadFileLock> {
+        self.acquire_blob_download_lock_with_wait_notice(digest, stop, || {})
+            .await
+    }
+
+    pub async fn acquire_blob_download_lock_with_wait_notice<F>(
+        &self,
+        digest: &str,
+        stop: &CancellationToken,
+        on_wait: F,
+    ) -> Result<BlobDownloadFileLock>
+    where
+        F: FnOnce() + Send,
+    {
+        let path = self.blob_download_lock_path(digest)?;
+        let mut on_wait = Some(on_wait);
+        loop {
+            if stop.is_cancelled() {
+                return Err(DockerPullError::Interrupted);
+            }
+            match try_acquire_file_lock(path.clone()).await? {
+                Some(file) => return Ok(BlobDownloadFileLock { file }),
+                None => {
+                    if let Some(on_wait) = on_wait.take() {
+                        on_wait();
+                    }
+                    tokio::select! {
+                        _ = tokio::time::sleep(FILE_LOCK_RETRY_DELAY) => {}
+                        _ = stop.cancelled() => return Err(DockerPullError::Interrupted),
+                    }
+                }
+            }
+        }
+    }
+
+    pub async fn claim_layers(&self, digests: &[String]) -> Result<CacheLayerClaimGuard> {
+        let mut entries = Vec::new();
+        let mut own_paths = HashSet::new();
+        for digest in unique_digests(digests) {
+            let path = self.layer_claim_path(&digest, &claim_id())?;
+            let file = acquire_file_lock(path.clone()).await?;
+            own_paths.insert(path.clone());
+            entries.push(LayerClaimEntry { path, file });
+        }
+        Ok(CacheLayerClaimGuard { entries, own_paths })
+    }
+
+    pub async fn live_external_layer_claims(
+        &self,
+        digests: &[String],
+        own_claim: Option<&CacheLayerClaimGuard>,
+    ) -> Result<HashSet<String>> {
+        let root = self.root.clone();
+        let digests = unique_digests(digests);
+        let own_paths = own_claim
+            .map(|claim| claim.own_paths.clone())
+            .unwrap_or_default();
+        tokio::task::spawn_blocking(move || {
+            let mut protected = HashSet::new();
+            for digest in digests {
+                if scan_live_layer_claims(&root, &digest, &own_paths)? {
+                    protected.insert(digest);
+                }
+            }
+            Result::Ok(protected)
+        })
+        .await
+        .map_err(|e| DockerPullError::InvalidInput(format!("layer claim scan panicked: {e}")))?
+    }
+
+    fn blob_download_lock_path(&self, digest: &str) -> Result<PathBuf> {
+        let path = digest_path(self.root.join("locks").join("blobs"), digest)?;
+        Ok(path.with_extension("lock"))
+    }
+
+    fn layer_claim_dir(&self, digest: &str) -> Result<PathBuf> {
+        digest_path(self.root.join("claims").join("layers"), digest)
+    }
+
+    fn layer_claim_path(&self, digest: &str, claim_id: &str) -> Result<PathBuf> {
+        Ok(self
+            .layer_claim_dir(digest)?
+            .join(format!("{claim_id}.lock")))
     }
 
     pub async fn ensure_blob_complete(&self, digest: &str, expected_size: u64) -> Result<bool> {
@@ -229,7 +339,8 @@ impl Store {
         Ok(())
     }
 
-    pub async fn prune_reference_layer_blobs_except(
+    #[cfg(test)]
+    async fn prune_reference_layer_blobs_except(
         &self,
         reference: &StoredReference,
         protected: &HashSet<String>,
@@ -243,6 +354,46 @@ impl Store {
             if protected.contains(&digest) {
                 continue;
             }
+            let path = self.blob_path(&digest)?;
+            match tokio_fs::remove_file(path).await {
+                Ok(()) => removed += 1,
+                Err(error) if error.kind() == ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+
+        Ok(removed)
+    }
+
+    pub async fn prune_reference_layer_blobs_except_claimed(
+        &self,
+        reference: &StoredReference,
+        protected: &HashSet<String>,
+        own_claim: Option<&CacheLayerClaimGuard>,
+        stop: &CancellationToken,
+    ) -> Result<usize> {
+        let manifest_path = self.blob_path(&reference.manifest.digest)?;
+        let manifest_bytes = tokio_fs::read(&manifest_path).await?;
+        let layer_digests = layer_digests_from_manifest(&manifest_bytes)?;
+
+        let mut removed = 0_usize;
+        for digest in layer_digests {
+            if protected.contains(&digest) {
+                continue;
+            }
+
+            // Prune and cache-hit checks share the blob lock. If a new pull
+            // claims after an earlier snapshot, it either shows up in this
+            // claim scan or waits here and re-checks after the delete.
+            let _blob_lock = self.acquire_blob_download_lock(&digest, stop).await?;
+            if self
+                .live_external_layer_claims(std::slice::from_ref(&digest), own_claim)
+                .await?
+                .contains(&digest)
+            {
+                continue;
+            }
+
             let path = self.blob_path(&digest)?;
             match tokio_fs::remove_file(path).await {
                 Ok(()) => removed += 1,
@@ -306,7 +457,7 @@ impl Store {
 impl ActiveStore {
     pub async fn open(root: PathBuf, operation: &'static str) -> Result<Self> {
         Ok(Self {
-            store: Store::open_with_exclusive_lock(root, operation).await?,
+            store: Store::open_with_shared_lock(root, operation).await?,
         })
     }
 
@@ -325,8 +476,16 @@ impl Deref for ActiveStore {
 
 impl MaintenanceStore {
     pub async fn open(root: PathBuf) -> Result<Self> {
+        ensure_directory_blocking(root.clone()).await?;
+        let lock = Some(std::sync::Arc::new(
+            try_acquire_exclusive_cache_lock(root.clone(), "cache clean").await?,
+        ));
+        ensure_store_layout_blocking(root.clone()).await?;
         Ok(Self {
-            store: Store::open_with_exclusive_lock(root, "cache clean").await?,
+            store: Store {
+                root,
+                cache_lock: lock,
+            },
         })
     }
 
@@ -350,10 +509,51 @@ impl Deref for MaintenanceStore {
     }
 }
 
+const FILE_LOCK_RETRY_DELAY: Duration = Duration::from_millis(150);
+
+impl Drop for CacheLayerClaimGuard {
+    fn drop(&mut self) {
+        let entries = std::mem::take(&mut self.entries);
+        if entries.is_empty() {
+            return;
+        }
+        // Move claim handles to a plain OS thread so async worker threads do
+        // not perform file close/remove calls on slow filesystems.
+        let _ = std::thread::Builder::new()
+            .name("pocker-layer-claim-cleanup".into())
+            .spawn(move || cleanup_layer_claim_entries(entries));
+    }
+}
+
+fn cleanup_layer_claim_entries(entries: Vec<LayerClaimEntry>) {
+    let paths = entries
+        .iter()
+        .map(|entry| entry.path.clone())
+        .collect::<Vec<_>>();
+    drop(entries);
+    for path in paths {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
 async fn try_acquire_exclusive_cache_lock(root: PathBuf, operation: &'static str) -> Result<File> {
     tokio::task::spawn_blocking(move || try_acquire_exclusive_cache_lock_blocking(&root, operation))
         .await
         .map_err(|e| DockerPullError::InvalidInput(format!("cache lock task panicked: {e}")))?
+}
+
+async fn acquire_shared_cache_lock(root: PathBuf, operation: &'static str) -> Result<File> {
+    tokio::task::spawn_blocking(move || {
+        let lock = open_lock_file(&root)?;
+        let path = cache_lock_path(&root);
+        match lock.try_lock_shared() {
+            Ok(()) => Ok(lock),
+            Err(TryLockError::WouldBlock) => Err(DockerPullError::CacheLocked { operation, path }),
+            Err(TryLockError::Error(error)) => Err(error.into()),
+        }
+    })
+    .await
+    .map_err(|e| DockerPullError::InvalidInput(format!("cache lock task panicked: {e}")))?
 }
 
 fn try_acquire_exclusive_cache_lock_blocking(root: &Path, operation: &'static str) -> Result<File> {
@@ -364,6 +564,44 @@ fn try_acquire_exclusive_cache_lock_blocking(root: &Path, operation: &'static st
         Err(TryLockError::WouldBlock) => Err(DockerPullError::CacheLocked { operation, path }),
         Err(TryLockError::Error(error)) => Err(error.into()),
     }
+}
+
+async fn acquire_file_lock(path: PathBuf) -> Result<File> {
+    tokio::task::spawn_blocking(move || {
+        let file = open_coordination_file(&path)?;
+        file.lock()?;
+        Result::Ok(file)
+    })
+    .await
+    .map_err(|e| DockerPullError::InvalidInput(format!("file lock task panicked: {e}")))?
+}
+
+async fn try_acquire_file_lock(path: PathBuf) -> Result<Option<File>> {
+    tokio::task::spawn_blocking(move || try_acquire_file_lock_blocking(&path))
+        .await
+        .map_err(|e| DockerPullError::InvalidInput(format!("file lock task panicked: {e}")))?
+}
+
+fn try_acquire_file_lock_blocking(path: &Path) -> Result<Option<File>> {
+    let file = open_coordination_file(path)?;
+    match file.try_lock() {
+        Ok(()) => Ok(Some(file)),
+        Err(TryLockError::WouldBlock) => Ok(None),
+        Err(TryLockError::Error(error)) => Err(error.into()),
+    }
+}
+
+fn open_coordination_file(path: &Path) -> Result<File> {
+    if let Some(parent) = path.parent() {
+        ensure_directory(parent)?;
+    }
+    OpenOptions::new()
+        .create(true)
+        .read(true)
+        .truncate(false)
+        .write(true)
+        .open(path)
+        .map_err(Into::into)
 }
 
 async fn ensure_directory_blocking(path: PathBuf) -> Result<()> {
@@ -378,6 +616,8 @@ async fn ensure_store_layout_blocking(root: PathBuf) -> Result<()> {
             let algorithm = algorithm.to_string();
             ensure_directory(&root.join("blobs").join(&algorithm))?;
             ensure_directory(&root.join("partials").join(&algorithm))?;
+            ensure_directory(&root.join("locks").join("blobs").join(&algorithm))?;
+            ensure_directory(&root.join("claims").join("layers").join(&algorithm))?;
         }
         ensure_directory(&root.join("references"))?;
         Result::Ok(())
@@ -574,6 +814,72 @@ fn digest_path(root: PathBuf, digest: &str) -> Result<PathBuf> {
     Ok(root.join(parsed.algorithm.to_string()).join(parsed.value))
 }
 
+fn scan_live_layer_claims(root: &Path, digest: &str, own_paths: &HashSet<PathBuf>) -> Result<bool> {
+    let dir = digest_path(root.join("claims").join("layers"), digest)?;
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        if own_paths.contains(&path) {
+            continue;
+        }
+        let file_type = entry.file_type()?;
+        if !file_type.is_file() {
+            continue;
+        }
+        if claim_file_is_live(&path)? {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
+fn claim_file_is_live(path: &Path) -> Result<bool> {
+    match try_acquire_file_lock_blocking(path)? {
+        Some(file) => {
+            cleanup_stale_claim_file(path, file);
+            Ok(false)
+        }
+        None => Ok(true),
+    }
+}
+
+fn cleanup_stale_claim_file(path: &Path, file: File) {
+    if std::fs::remove_file(path).is_ok() {
+        drop(file);
+        return;
+    }
+    drop(file);
+    let _ = std::fs::remove_file(path);
+}
+
+fn claim_id() -> String {
+    let pid = std::process::id();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let random = fastrand::u64(..);
+    format!("{pid}-{nanos}-{random:016x}")
+}
+
+fn unique_digests(digests: &[String]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut unique = Vec::new();
+    for digest in digests {
+        if seen.insert(digest.as_str()) {
+            unique.push(digest.clone());
+        }
+    }
+    unique
+}
+
 #[cfg(test)]
 fn digest_bytes(bytes: &[u8]) -> String {
     crate::digest::canonical_digest_bytes(bytes)
@@ -637,6 +943,7 @@ mod tests {
     use std::path::Path;
 
     use tempfile::tempdir;
+    use tokio_util::sync::CancellationToken;
 
     use super::{
         ActiveStore, ClearedCacheFile, MaintenanceStore, Store, StoredReference, reference_key,
@@ -837,6 +1144,84 @@ mod tests {
                 .expect("unique layer")
                 .exists(),
             "unprotected layer should be removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn prune_reference_layer_blobs_except_claimed_keeps_live_claims() {
+        let dir = tempdir().expect("tempdir should create");
+        let store = Store::open(dir.path().to_path_buf())
+            .await
+            .expect("store should open");
+        let claimed_layer =
+            "sha256:5555555555555555555555555555555555555555555555555555555555555555";
+        let unclaimed_layer =
+            "sha256:6666666666666666666666666666666666666666666666666666666666666666";
+        let manifest = Descriptor {
+            media_type: "application/vnd.oci.image.manifest.v1+json".into(),
+            digest: "sha256:7777777777777777777777777777777777777777777777777777777777777777"
+                .into(),
+            size: 0,
+            platform: None,
+            annotations: None,
+        };
+        let layer_json = [claimed_layer, unclaimed_layer]
+            .iter()
+            .map(|digest| {
+                format!(
+                    r#"{{"mediaType":"application/vnd.oci.image.layer.v1.tar+gzip","digest":"{digest}","size":5}}"#
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let bytes = format!(
+            r#"{{"schemaVersion":2,"config":{{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","size":2}},"layers":[{layer_json}]}}"#
+        );
+        let path = store.blob_path(&manifest.digest).expect("manifest path");
+        std::fs::create_dir_all(path.parent().expect("manifest parent"))
+            .expect("manifest parent should exist");
+        std::fs::write(path, bytes).expect("manifest should be written");
+        for digest in [claimed_layer, unclaimed_layer] {
+            let path = store.blob_path(digest).expect("layer path");
+            std::fs::create_dir_all(path.parent().expect("layer parent"))
+                .expect("layer parent should exist");
+            std::fs::write(path, b"layer").expect("layer should be written");
+        }
+        let reference = StoredReference {
+            reference: "registry-1.docker.io/library/alpine:latest".into(),
+            manifest,
+            config_digest:
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+        };
+        let _external_claim = store
+            .claim_layers(&[claimed_layer.to_string()])
+            .await
+            .expect("external claim should be created");
+
+        let removed = store
+            .prune_reference_layer_blobs_except_claimed(
+                &reference,
+                &HashSet::new(),
+                None,
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("layer prune should succeed");
+
+        assert_eq!(removed, 1);
+        assert!(
+            store
+                .blob_path(claimed_layer)
+                .expect("claimed layer")
+                .exists(),
+            "claimed layer should be kept"
+        );
+        assert!(
+            !store
+                .blob_path(unclaimed_layer)
+                .expect("unclaimed layer")
+                .exists(),
+            "unclaimed layer should be removed"
         );
     }
 
@@ -1107,6 +1492,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn leftover_lock_file_does_not_block_maintenance_store_open() {
+        let dir = tempdir().expect("tempdir should create");
+        let lock = dir.path().join(".lock");
+        std::fs::write(&lock, b"leftover").expect("lock file should be created");
+
+        let store = MaintenanceStore::open(dir.path().to_path_buf())
+            .await
+            .expect("leftover lock file must not block maintenance store open");
+
+        assert!(store.root().join(".lock").exists());
+    }
+
+    #[tokio::test]
     async fn clear_fails_fast_for_active_cache_lock() {
         let dir = tempdir().expect("tempdir should create");
         let active_store = ActiveStore::open(dir.path().to_path_buf(), "pull")
@@ -1132,19 +1530,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn second_active_store_fails_fast() {
+    async fn second_active_store_opens_with_shared_lock() {
         let dir = tempdir().expect("tempdir should create");
         let _active_store = ActiveStore::open(dir.path().to_path_buf(), "pull")
             .await
             .expect("active store should open");
 
-        let error = ActiveStore::open(dir.path().to_path_buf(), "serve")
+        ActiveStore::open(dir.path().to_path_buf(), "serve")
             .await
-            .expect_err("second active store should fail while cache lock is held");
-
-        assert!(
-            matches!(error, DockerPullError::CacheLocked { operation, .. } if operation == "serve")
-        );
+            .expect("second active store should share cache lock");
     }
 
     #[tokio::test]
@@ -1180,6 +1574,180 @@ mod tests {
         ActiveStore::open(dir.path().to_path_buf(), "serve")
             .await
             .expect("active store should open after previous store drops");
+    }
+
+    #[tokio::test]
+    async fn blob_download_lock_blocks_other_lockers_until_drop() {
+        let dir = tempdir().expect("tempdir should create");
+        let store = Store::open(dir.path().to_path_buf())
+            .await
+            .expect("store should open");
+        let digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let stop = CancellationToken::new();
+        let first = store
+            .acquire_blob_download_lock(digest, &stop)
+            .await
+            .expect("first blob lock should acquire");
+        let waiter_store = store.clone();
+        let waiter_stop = CancellationToken::new();
+        let waiter = tokio::spawn(async move {
+            waiter_store
+                .acquire_blob_download_lock(digest, &waiter_stop)
+                .await
+        });
+
+        tokio::time::timeout(std::time::Duration::from_millis(75), async {
+            while !waiter.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect_err("second lock should wait while first is held");
+
+        drop(first);
+        tokio::time::timeout(std::time::Duration::from_secs(2), waiter)
+            .await
+            .expect("waiter should acquire after first drops")
+            .expect("waiter task should not panic")
+            .expect("second blob lock should acquire");
+    }
+
+    #[tokio::test]
+    async fn blob_download_lock_wait_notice_only_runs_on_contention() {
+        let dir = tempdir().expect("tempdir should create");
+        let store = Store::open(dir.path().to_path_buf())
+            .await
+            .expect("store should open");
+        let digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let stop = CancellationToken::new();
+        let notices = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let first = store
+            .acquire_blob_download_lock_with_wait_notice(digest, &stop, {
+                let notices = std::sync::Arc::clone(&notices);
+                move || {
+                    notices.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            })
+            .await
+            .expect("first blob lock should acquire");
+        assert_eq!(
+            notices.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "uncontended lock acquisition should not report waiting"
+        );
+
+        let waiter_store = store.clone();
+        let waiter_stop = CancellationToken::new();
+        let waiter_notices = std::sync::Arc::clone(&notices);
+        let waiter = tokio::spawn(async move {
+            waiter_store
+                .acquire_blob_download_lock_with_wait_notice(digest, &waiter_stop, move || {
+                    waiter_notices.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                })
+                .await
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while notices.load(std::sync::atomic::Ordering::SeqCst) < 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("contended lock acquisition should report waiting");
+
+        drop(first);
+        waiter
+            .await
+            .expect("waiter task should not panic")
+            .expect("second blob lock should acquire");
+        assert_eq!(
+            notices.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "wait notice should run once per contended acquisition"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_blob_download_lock_file_does_not_block_future_lockers() {
+        let dir = tempdir().expect("tempdir should create");
+        let store = Store::open(dir.path().to_path_buf())
+            .await
+            .expect("store should open");
+        let digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let lock_path = store
+            .blob_download_lock_path(digest)
+            .expect("blob lock path should build");
+        std::fs::create_dir_all(lock_path.parent().expect("lock parent"))
+            .expect("lock parent should create");
+        std::fs::write(&lock_path, b"stale").expect("stale blob lock file should be written");
+
+        store
+            .acquire_blob_download_lock(digest, &CancellationToken::new())
+            .await
+            .expect("stale blob lock file must not block a live lock");
+
+        assert!(
+            lock_path.exists(),
+            "blob lock files are stable coordination handles"
+        );
+    }
+
+    #[tokio::test]
+    async fn layer_claims_protect_external_prune_candidates() {
+        let dir = tempdir().expect("tempdir should create");
+        let store = Store::open(dir.path().to_path_buf())
+            .await
+            .expect("store should open");
+        let digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let digests = vec![digest.to_string()];
+        let own_claim = store
+            .claim_layers(&digests)
+            .await
+            .expect("layer claim should acquire");
+
+        let own_protected = store
+            .live_external_layer_claims(&digests, Some(&own_claim))
+            .await
+            .expect("own claims should scan");
+        assert!(
+            !own_protected.contains(digest),
+            "own layer claim should not protect itself"
+        );
+
+        let external_protected = store
+            .live_external_layer_claims(&digests, None)
+            .await
+            .expect("external claims should scan");
+        assert!(
+            external_protected.contains(digest),
+            "live external layer claim should protect digest"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_layer_claim_files_are_ignored_and_cleaned() {
+        let dir = tempdir().expect("tempdir should create");
+        let store = Store::open(dir.path().to_path_buf())
+            .await
+            .expect("store should open");
+        let digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let path = store
+            .layer_claim_path(digest, "stale-test")
+            .expect("claim path should build");
+        std::fs::create_dir_all(path.parent().expect("claim parent"))
+            .expect("claim parent should create");
+        std::fs::write(&path, b"stale").expect("stale claim should be written");
+
+        let protected = store
+            .live_external_layer_claims(&[digest.to_string()], None)
+            .await
+            .expect("stale claims should scan");
+
+        assert!(
+            !protected.contains(digest),
+            "unlocked stale claim should not protect digest"
+        );
+        assert!(!path.exists(), "stale claim file should be removed");
     }
 
     #[tokio::test]
