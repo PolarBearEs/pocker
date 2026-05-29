@@ -363,6 +363,9 @@ fn register_retry(
         "{detail} for {digest}; retrying in {:?} ({retry_budget})",
         delay
     );
+    context
+        .ui
+        .set_layer_status(digest, &format!("Retrying in {:?}: {detail}", delay));
     context.ui.warn(&warning);
     Ok(retries)
 }
