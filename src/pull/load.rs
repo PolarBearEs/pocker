@@ -81,13 +81,13 @@ pub(super) async fn load_reference(
         .await
         .unwrap_or(false)
     {
-        if waited_for_load.load(Ordering::SeqCst) {
-            context
-                .ui
-                .set_image_status(normalized, "Loaded by another pocker process");
+        let status = if waited_for_load.load(Ordering::SeqCst) {
+            "Loaded by another pocker process"
         } else {
-            context.ui.set_image_status(normalized, "Already exists");
-        }
+            "Already exists"
+        };
+        context.ui.begin_load(normalized);
+        context.ui.set_image_status(normalized, status);
         prune_after_load_if_needed(
             context,
             normalized,
@@ -97,7 +97,7 @@ pub(super) async fn load_reference(
             cache_layer_claim,
         )
         .await?;
-        context.ui.finish_image(normalized, "Already exists");
+        context.ui.finish_image(normalized, status);
         return Ok(());
     }
 
