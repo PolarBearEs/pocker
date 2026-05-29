@@ -1,19 +1,17 @@
 use std::collections::HashMap;
 #[cfg(target_os = "linux")]
 use std::fs;
-use std::io::{self, IsTerminal};
+use std::io::{self, IsTerminal, Write};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use anstyle::{AnsiColor, Style};
-use ratatui::backend::CrosstermBackend;
-#[cfg(test)]
+use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style as TuiStyle};
-use ratatui::{Terminal, TerminalOptions, Viewport};
 
 use crate::units::format_units;
 
@@ -23,12 +21,14 @@ pub(crate) const CYAN: Style = AnsiColor::Cyan.on_default();
 pub(crate) const DIM: Style = Style::new().dimmed();
 
 // Rendering is capped to protect slow terminals, remote shells, and constrained
-// devices from spending more work repainting than pulling while still waking
-// immediately for meaningful phase/status changes.
-const MAX_RENDER_FPS: u64 = 8;
+// devices from spending more work repainting than pulling. Fifteen frames per
+// second keeps a single remaining layer responsive without making terminal I/O
+// compete with slow transfers.
+const MAX_RENDER_FPS: u64 = 15;
 const FRAME_INTERVAL: Duration = Duration::from_millis(1_000 / MAX_RENDER_FPS);
+const DEFAULT_TERMINAL_WIDTH: u16 = 80;
+const MIN_TERMINAL_WIDTH: u16 = 40;
 const BAR_WIDTH: usize = 22;
-const SPINNER: [char; 4] = ['-', '\\', '|', '/'];
 
 pub(crate) fn paint(value: &str, style: Style) -> String {
     if should_color_stderr() {
@@ -635,8 +635,11 @@ impl Drop for ProgressRenderer {
 
 fn render_loop(shared: Arc<RendererShared>, animated: bool) {
     let mut last_render = Instant::now() - FRAME_INTERVAL;
-    let mut terminal = None;
-    let mut terminal_rows = 0_u16;
+    let mut rendered_rows = 0_usize;
+    let mut previous_lines = Vec::new();
+    let mut stderr = io::stderr();
+    let _ = write!(stderr, "\x1b[?25l");
+    let _ = stderr.flush();
 
     loop {
         let mut state = shared.state.lock().expect("ui state poisoned");
@@ -646,15 +649,21 @@ fn render_loop(shared: Arc<RendererShared>, animated: bool) {
 
         let now = Instant::now();
         if !state.shutdown
-            && !state.immediate
             && let Some(wait) =
                 FRAME_INTERVAL.checked_sub(now.saturating_duration_since(last_render))
         {
-            let (next_state, _) = shared
-                .wake
-                .wait_timeout(state, wait)
-                .expect("ui state poisoned");
-            state = next_state;
+            let deadline = now + wait;
+            while !state.shutdown {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                let (next_state, _) = shared
+                    .wake
+                    .wait_timeout(state, remaining)
+                    .expect("ui state poisoned");
+                state = next_state;
+            }
             if !state.dirty && !state.shutdown {
                 continue;
             }
@@ -668,51 +677,64 @@ fn render_loop(shared: Arc<RendererShared>, animated: bool) {
         state.immediate = false;
         drop(state);
 
-        let rows = model_height(&model).max(1).min(u16::MAX as usize) as u16;
-        if terminal_rows != rows {
-            terminal = match inline_terminal(rows) {
-                Ok(mut next_terminal) => {
-                    let _ = next_terminal.hide_cursor();
-                    terminal_rows = rows;
-                    Some(next_terminal)
-                }
-                Err(_) => None,
-            };
-        }
-
-        if let Some(terminal) = terminal.as_mut() {
-            let _ = terminal.draw(|frame_ref| {
-                render_model_to_buffer(
-                    &model,
-                    frame_ref.area(),
-                    frame_ref.buffer_mut(),
-                    frame,
-                    animated,
-                );
-            });
-        }
+        let lines = render_model_lines(&model, terminal_width(), frame, animated);
+        rendered_rows = draw_inline_frame(&mut stderr, &lines, &mut previous_lines, rendered_rows);
 
         last_render = Instant::now();
 
         if shutdown {
-            if let Some(terminal) = terminal.as_mut() {
-                let _ = terminal.show_cursor();
+            clear_inline_frame(&mut stderr, rendered_rows);
+            let _ = write!(stderr, "\x1b[?25h");
+            let _ = stderr.flush();
+            for line in final_summary_lines(&model) {
+                eprintln!("{line}");
             }
             break;
         }
     }
 }
 
-fn inline_terminal(rows: u16) -> io::Result<Terminal<CrosstermBackend<io::Stderr>>> {
-    Terminal::with_options(
-        CrosstermBackend::new(io::stderr()),
-        TerminalOptions {
-            viewport: Viewport::Inline(rows),
-        },
-    )
+fn draw_inline_frame(
+    stderr: &mut io::Stderr,
+    lines: &[String],
+    previous_lines: &mut Vec<String>,
+    rendered_rows: usize,
+) -> usize {
+    let rows = rendered_rows.max(lines.len());
+    if rendered_rows > 0 {
+        let _ = write!(stderr, "\x1b[{rendered_rows}F");
+    }
+    for row in 0..rows {
+        match (lines.get(row), previous_lines.get(row)) {
+            (Some(line), Some(previous)) if line == previous => {}
+            (Some(line), _) => {
+                let _ = write!(stderr, "\r{}\x1b[K", colorize_image_progress_strip(line));
+            }
+            (None, Some(_)) => {
+                let _ = write!(stderr, "\r\x1b[2K");
+            }
+            (None, None) => {}
+        }
+        let _ = writeln!(stderr);
+    }
+    let _ = stderr.flush();
+    previous_lines.clear();
+    previous_lines.extend_from_slice(lines);
+    rows
 }
 
-#[cfg(test)]
+fn clear_inline_frame(stderr: &mut io::Stderr, rendered_rows: usize) {
+    if rendered_rows == 0 {
+        return;
+    }
+    let _ = write!(stderr, "\x1b[{rendered_rows}F");
+    for _ in 0..rendered_rows {
+        let _ = write!(stderr, "\r\x1b[2K");
+        let _ = writeln!(stderr);
+    }
+    let _ = write!(stderr, "\x1b[{rendered_rows}F");
+}
+
 fn render_model_lines(
     model: &ProgressModel,
     width: u16,
@@ -795,45 +817,43 @@ fn render_model_to_buffer(
     }
 }
 
-fn image_line(image: &ImageProgress, frame: usize, animated: bool) -> String {
-    let (complete_layers, total_layers) = image_layer_counts(image);
+fn image_line(image: &ImageProgress, _frame: usize, _animated: bool) -> String {
+    let (_, total_layers) = image_layer_counts(image);
     let (current_bytes, total_bytes) = image_byte_counts(image);
     let phase = image_phase_label(&image.phase);
-    let pulse = pulse_suffix(frame, animated);
-    let layers = if total_layers > 0 {
-        format!("  {complete_layers}/{total_layers} layers")
+    let strip = if total_layers > 0 {
+        format!(" [{}]", image_progress_strip(image))
     } else {
         String::new()
     };
     let bytes = if total_bytes > 0 {
         format!(
-            "  {}/{}",
+            "  {} / {}",
             format_bytes(current_bytes.min(total_bytes)),
             format_bytes(total_bytes)
         )
     } else {
         String::new()
     };
-    format!("{}  {phase}{pulse}{layers}{bytes}", image.display)
+    format!("{}{strip}{bytes} {phase}", image.display)
 }
 
-fn layer_line(layer: &LayerProgress, frame: usize, animated: bool) -> String {
+fn layer_line(layer: &LayerProgress, _frame: usize, _animated: bool) -> String {
     let digest = short_digest(&layer.digest);
     match &layer.status {
         LayerStatus::Waiting => format!("  {digest}  Waiting"),
         LayerStatus::Cached => format!("  {digest}  Already exists"),
-        LayerStatus::Daemon => format!("  {digest}  Already exists in Docker daemon"),
+        LayerStatus::Daemon => format!("  {digest}  Already exists"),
         LayerStatus::Downloading => {
-            let pulse = pulse_suffix(frame, animated);
             let rate = layer
                 .bytes_per_second
                 .map(|rate| format!("  {}/s", format_bytes(rate)))
                 .unwrap_or_default();
             format!(
-                "  {digest}  Downloading{pulse}  [{}]  {}/{}{rate}",
+                "  {digest}  Downloading  [{}]  {}/{}{rate}",
                 progress_bar(layer.current, layer.total, BAR_WIDTH),
-                format_bytes(layer.current.min(layer.total)),
-                format_bytes(layer.total)
+                format_detail_bytes(layer.current.min(layer.total)),
+                format_detail_bytes(layer.total)
             )
         }
         LayerStatus::Verifying => format!("  {digest}  Verifying checksum"),
@@ -873,6 +893,28 @@ fn image_byte_counts(image: &ImageProgress) -> (u64, u64) {
         })
 }
 
+fn image_progress_strip(image: &ImageProgress) -> String {
+    image
+        .layer_order
+        .iter()
+        .filter_map(|digest| image.layers.get(digest))
+        .map(layer_progress_char)
+        .collect()
+}
+
+fn layer_progress_char(layer: &LayerProgress) -> char {
+    const PERCENT_CHARS: [char; 9] = ['⠀', '⡀', '⣀', '⣄', '⣤', '⣦', '⣶', '⣷', '⣿'];
+    if layer.is_complete() {
+        return PERCENT_CHARS[PERCENT_CHARS.len() - 1];
+    }
+    if layer.total == 0 {
+        return PERCENT_CHARS[0];
+    }
+    let percent = layer.current.min(layer.total).saturating_mul(100) / layer.total;
+    let index = (PERCENT_CHARS.len() as u64 - 1) * percent.min(100) / 100;
+    PERCENT_CHARS[index as usize]
+}
+
 fn image_phase_label(phase: &ImagePhase) -> &str {
     match phase {
         ImagePhase::Pulling => "Pulling",
@@ -883,6 +925,15 @@ fn image_phase_label(phase: &ImagePhase) -> &str {
         ImagePhase::Failed(status) => status,
         ImagePhase::Status(status) => status,
     }
+}
+
+fn final_summary_lines(model: &ProgressModel) -> Vec<String> {
+    model
+        .image_order
+        .iter()
+        .filter_map(|key| model.images.get(key))
+        .map(|image| format!("{}  {}", image.display, image_phase_label(&image.phase)))
+        .collect()
 }
 
 fn image_phase_from_status(status: &str) -> ImagePhase {
@@ -937,12 +988,24 @@ fn progress_bar(current: u64, total: u64, width: usize) -> String {
     bar
 }
 
-fn pulse_suffix(frame: usize, animated: bool) -> String {
-    if animated {
-        format!(" {}", SPINNER[frame % SPINNER.len()])
-    } else {
-        String::new()
+fn colorize_image_progress_strip(line: &str) -> String {
+    if line.starts_with("  ") || !should_color_stderr() {
+        return line.to_string();
     }
+    let Some(start) = line.find(" [") else {
+        return line.to_string();
+    };
+    let strip_start = start + 2;
+    let Some(end_offset) = line[strip_start..].find(']') else {
+        return line.to_string();
+    };
+    let strip_end = strip_start + end_offset;
+    format!(
+        "{}{}{}",
+        &line[..strip_start],
+        paint(&line[strip_start..strip_end], GREEN),
+        &line[strip_end..]
+    )
 }
 
 fn model_height(model: &ProgressModel) -> usize {
@@ -955,7 +1018,6 @@ fn model_height(model: &ProgressModel) -> usize {
     image_rows + model.warnings.len()
 }
 
-#[cfg(test)]
 fn buffer_lines(buffer: &Buffer) -> Vec<String> {
     let area = buffer.area;
     (area.y..area.bottom())
@@ -972,6 +1034,14 @@ fn buffer_lines(buffer: &Buffer) -> Vec<String> {
 fn truncate_to_width(value: &str, width: u16) -> String {
     let width = width as usize;
     value.chars().take(width).collect()
+}
+
+fn terminal_width() -> u16 {
+    std::env::var("COLUMNS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(DEFAULT_TERMINAL_WIDTH)
+        .max(MIN_TERMINAL_WIDTH)
 }
 
 fn should_render_progress() -> bool {
@@ -1041,6 +1111,22 @@ fn format_bytes(bytes: u64) -> String {
     format_units(bytes, 1024.0, &UNITS)
 }
 
+fn format_detail_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0usize;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+
+    match unit {
+        0 => format!("{bytes} {}", UNITS[unit]),
+        1 => format!("{value:.1} {}", UNITS[unit]),
+        _ => format!("{value:.2} {}", UNITS[unit]),
+    }
+}
+
 pub(crate) fn should_color_stderr() -> bool {
     static SHOULD_COLOR_STDERR: OnceLock<bool> = OnceLock::new();
 
@@ -1051,7 +1137,7 @@ pub(crate) fn should_color_stderr() -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        ImagePhase, ImageProgress, LayerProgress, LayerStatus, ProgressModel,
+        ImagePhase, ImageProgress, LayerProgress, LayerStatus, ProgressModel, final_summary_lines,
         linux_process_is_foreground_tty_job_from_stat, plain_layer_download_message,
         render_model_lines,
     };
@@ -1167,11 +1253,11 @@ mod tests {
 
         let lines = render_model_lines(&model, 100, 0, false);
 
-        assert!(lines[0].contains("2/3 layers"));
+        assert!(lines[0].contains("[⣿⣿"));
     }
 
     #[test]
-    fn no_animations_disables_pulse_glyphs() {
+    fn no_animations_keeps_progress_bars_without_spinner_glyphs() {
         let mut model = model_with_image("docker.io/library/alpine:latest");
         insert_layer(
             &mut model,
@@ -1184,8 +1270,39 @@ mod tests {
         let animated = render_model_lines(&model, 100, 2, true);
         let still = render_model_lines(&model, 100, 2, false);
 
-        assert!(animated[1].contains("Downloading |"));
+        assert!(animated[1].contains("Downloading  ["));
         assert!(still[1].contains("Downloading  ["));
+        assert_eq!(animated, still);
+    }
+
+    #[test]
+    fn final_image_status_does_not_show_animation_glyph() {
+        let mut model = model_with_image("docker.io/library/alpine:latest");
+        model.images.get_mut("image-0").expect("image exists").phase =
+            ImagePhase::Ready("Pulled".into());
+
+        let lines = render_model_lines(&model, 100, 2, true);
+
+        assert_eq!(lines[0], "docker.io/library/alpine:latest Pulled");
+    }
+
+    #[test]
+    fn final_summary_omits_layer_rows() {
+        let mut model = model_with_image("docker.io/library/alpine:latest");
+        insert_layer(
+            &mut model,
+            "sha256:abcdef0123456789",
+            LayerStatus::Complete,
+            2048,
+            2048,
+        );
+        model.images.get_mut("image-0").expect("image exists").phase =
+            ImagePhase::Ready("Pulled".into());
+
+        assert_eq!(
+            final_summary_lines(&model),
+            vec!["docker.io/library/alpine:latest  Pulled"]
+        );
     }
 
     #[test]
@@ -1214,7 +1331,7 @@ mod tests {
         assert_eq!(
             lines,
             vec![
-                "docker.io/library/alpine:latest  Ready  2/3 layers  1.0 KiB/1.0 KiB",
+                "docker.io/library/alpine:latest [⠀⣿⣿]  1.0 KiB / 1.0 KiB Ready",
                 "  aaaabbbbcccc  Waiting",
                 "  ddddeeeeffff  Already exists",
                 "  111122223333  Pull complete",
