@@ -59,6 +59,12 @@ pub struct BlobDownloadFileLock {
 }
 
 #[derive(Debug)]
+pub struct ImageLoadFileLock {
+    #[allow(dead_code)]
+    file: File,
+}
+
+#[derive(Debug)]
 pub struct CacheLayerClaimGuard {
     entries: Vec<LayerClaimEntry>,
     own_paths: HashSet<PathBuf>,
@@ -135,6 +141,14 @@ impl Store {
             .join(format!("{}.json", reference_key(reference)))
     }
 
+    fn image_load_lock_path(&self, reference: &str, config_digest: &str) -> PathBuf {
+        let key = image_load_key(reference, config_digest);
+        self.root
+            .join("locks")
+            .join("images")
+            .join(format!("{key}.lock"))
+    }
+
     pub async fn acquire_blob_download_lock(
         &self,
         digest: &str,
@@ -161,6 +175,41 @@ impl Store {
             }
             match try_acquire_file_lock(path.clone()).await? {
                 Some(file) => return Ok(BlobDownloadFileLock { file }),
+                None => {
+                    if let Some(on_wait) = on_wait.take() {
+                        on_wait();
+                    }
+                    tokio::select! {
+                        _ = tokio::time::sleep(FILE_LOCK_RETRY_DELAY) => {}
+                        _ = stop.cancelled() => return Err(DockerPullError::Interrupted),
+                    }
+                }
+            }
+        }
+    }
+
+    pub async fn acquire_image_load_lock_with_wait_notice<F>(
+        &self,
+        reference: &str,
+        config_digest: &str,
+        stop: &CancellationToken,
+        on_wait: F,
+    ) -> Result<ImageLoadFileLock>
+    where
+        F: FnOnce() + Send,
+    {
+        // The image-load lock protects Docker daemon import work, not cache
+        // integrity. It is scoped to the normalized reference and resolved
+        // config so different tags can still be applied independently, while
+        // concurrent pulls of the same loaded result wait and re-check Docker.
+        let path = self.image_load_lock_path(reference, config_digest);
+        let mut on_wait = Some(on_wait);
+        loop {
+            if stop.is_cancelled() {
+                return Err(DockerPullError::Interrupted);
+            }
+            match try_acquire_file_lock(path.clone()).await? {
+                Some(file) => return Ok(ImageLoadFileLock { file }),
                 None => {
                     if let Some(on_wait) = on_wait.take() {
                         on_wait();
@@ -619,6 +668,7 @@ async fn ensure_store_layout_blocking(root: PathBuf) -> Result<()> {
             ensure_directory(&root.join("locks").join("blobs").join(&algorithm))?;
             ensure_directory(&root.join("claims").join("layers").join(&algorithm))?;
         }
+        ensure_directory(&root.join("locks").join("images"))?;
         ensure_directory(&root.join("references"))?;
         Result::Ok(())
     })
@@ -887,6 +937,14 @@ fn digest_bytes(bytes: &[u8]) -> String {
 
 fn reference_key(reference: &str) -> String {
     sha256_hex(reference.as_bytes())
+}
+
+fn image_load_key(reference: &str, config_digest: &str) -> String {
+    let mut input = Vec::with_capacity(reference.len() + config_digest.len() + 1);
+    input.extend_from_slice(reference.as_bytes());
+    input.push(0);
+    input.extend_from_slice(config_digest.as_bytes());
+    sha256_hex(&input)
 }
 
 fn collect_cache_files(root: &Path) -> Result<Vec<ClearedCacheFile>> {
@@ -1693,6 +1751,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn image_load_lock_blocks_other_lockers_until_drop() {
+        let dir = tempdir().expect("tempdir should create");
+        let store = Store::open(dir.path().to_path_buf())
+            .await
+            .expect("store should open");
+        let reference = "registry-1.docker.io/library/alpine:latest";
+        let config_digest =
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let stop = CancellationToken::new();
+        let first = store
+            .acquire_image_load_lock_with_wait_notice(reference, config_digest, &stop, || {})
+            .await
+            .expect("first image load lock should acquire");
+
+        let notices = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let waiter_store = store.clone();
+        let waiter_stop = CancellationToken::new();
+        let waiter_notices = std::sync::Arc::clone(&notices);
+        let waiter = tokio::spawn(async move {
+            waiter_store
+                .acquire_image_load_lock_with_wait_notice(
+                    reference,
+                    config_digest,
+                    &waiter_stop,
+                    move || {
+                        waiter_notices.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    },
+                )
+                .await
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while notices.load(std::sync::atomic::Ordering::SeqCst) < 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("contended image load lock should report waiting");
+
+        drop(first);
+        tokio::time::timeout(std::time::Duration::from_secs(2), waiter)
+            .await
+            .expect("waiter should acquire after first drops")
+            .expect("waiter task should not panic")
+            .expect("second image load lock should acquire");
+    }
+
+    #[tokio::test]
+    async fn stale_image_load_lock_file_does_not_block_future_lockers() {
+        let dir = tempdir().expect("tempdir should create");
+        let store = Store::open(dir.path().to_path_buf())
+            .await
+            .expect("store should open");
+        let reference = "registry-1.docker.io/library/alpine:latest";
+        let config_digest =
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let lock_path = store.image_load_lock_path(reference, config_digest);
+        std::fs::create_dir_all(lock_path.parent().expect("lock parent"))
+            .expect("lock parent should create");
+        std::fs::write(&lock_path, b"stale").expect("stale image lock file should be written");
+
+        store
+            .acquire_image_load_lock_with_wait_notice(
+                reference,
+                config_digest,
+                &CancellationToken::new(),
+                || {},
+            )
+            .await
+            .expect("stale image lock file must not block a live lock");
+
+        assert!(
+            lock_path.exists(),
+            "image lock files are stable coordination handles"
+        );
+    }
+
+    #[tokio::test]
     async fn layer_claims_protect_external_prune_candidates() {
         let dir = tempdir().expect("tempdir should create");
         let store = Store::open(dir.path().to_path_buf())
@@ -1807,6 +1943,31 @@ mod tests {
         assert_eq!(key.len(), 64);
         assert!(key.chars().all(|ch| ch.is_ascii_hexdigit()));
         assert_eq!(key, reference_key("registry.example:5000/team/app:latest"));
+    }
+
+    #[test]
+    fn image_load_key_is_stable_and_filesystem_safe() {
+        let key = super::image_load_key(
+            "registry.example:5000/team/app:latest",
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        );
+
+        assert_eq!(key.len(), 64);
+        assert!(key.chars().all(|ch| ch.is_ascii_hexdigit()));
+        assert_eq!(
+            key,
+            super::image_load_key(
+                "registry.example:5000/team/app:latest",
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )
+        );
+        assert_ne!(
+            key,
+            super::image_load_key(
+                "registry.example:5000/team/app:other",
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )
+        );
     }
 
     #[tokio::test]

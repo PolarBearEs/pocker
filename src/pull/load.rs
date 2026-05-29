@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -57,6 +58,49 @@ pub(super) async fn load_reference(
     cache_layer_claim: &CacheLayerClaimGuard,
 ) -> Result<()> {
     let normalized = &stored_reference.reference;
+    let waited_for_load = Arc::new(AtomicBool::new(false));
+    let _load_lock = context
+        .store
+        .acquire_image_load_lock_with_wait_notice(
+            normalized,
+            &stored_reference.config_digest,
+            &context.stop,
+            {
+                let ui = Arc::clone(&context.ui);
+                let normalized = normalized.clone();
+                let waited_for_load = Arc::clone(&waited_for_load);
+                move || {
+                    waited_for_load.store(true, Ordering::SeqCst);
+                    ui.set_image_status(&normalized, "Waiting for another pocker load");
+                }
+            },
+        )
+        .await?;
+
+    if docker::daemon_has_reference(reference, &stored_reference.config_digest)
+        .await
+        .unwrap_or(false)
+    {
+        let status = if waited_for_load.load(Ordering::SeqCst) {
+            "Loaded by another pocker process"
+        } else {
+            "Already exists"
+        };
+        context.ui.begin_load(normalized);
+        context.ui.set_image_status(normalized, status);
+        prune_after_load_if_needed(
+            context,
+            normalized,
+            stored_reference,
+            options,
+            layer_claim,
+            cache_layer_claim,
+        )
+        .await?;
+        context.ui.finish_image(normalized, status);
+        return Ok(());
+    }
+
     context.ui.begin_load(normalized);
     match options.load_mode {
         LoadMode::Stream => {
@@ -66,20 +110,42 @@ pub(super) async fn load_reference(
             load_reference_through_cache_registry(context, reference, stored_reference).await?;
         }
     }
-    if !options.keep_layer_blobs {
-        context.ui.set_image_status(normalized, "Pruning cache");
-        let protected_layer_digests = layer_claim.protected_digests();
-        context
-            .store
-            .prune_reference_layer_blobs_except_claimed(
-                stored_reference,
-                &protected_layer_digests,
-                Some(cache_layer_claim),
-                &context.stop,
-            )
-            .await?;
-    }
+    prune_after_load_if_needed(
+        context,
+        normalized,
+        stored_reference,
+        options,
+        layer_claim,
+        cache_layer_claim,
+    )
+    .await?;
     context.ui.finish_image(normalized, "Ready");
+    Ok(())
+}
+
+async fn prune_after_load_if_needed(
+    context: &PullContext,
+    normalized: &str,
+    stored_reference: &StoredReference,
+    options: &PullOptions,
+    layer_claim: &LayerClaimGuard<'_>,
+    cache_layer_claim: &CacheLayerClaimGuard,
+) -> Result<()> {
+    if options.keep_layer_blobs {
+        return Ok(());
+    }
+
+    context.ui.set_image_status(normalized, "Pruning cache");
+    let protected_layer_digests = layer_claim.protected_digests();
+    context
+        .store
+        .prune_reference_layer_blobs_except_claimed(
+            stored_reference,
+            &protected_layer_digests,
+            Some(cache_layer_claim),
+            &context.stop,
+        )
+        .await?;
     Ok(())
 }
 
