@@ -15,7 +15,12 @@ pub(crate) const YELLOW: Style = AnsiColor::Yellow.on_default();
 pub(crate) const CYAN: Style = AnsiColor::Cyan.on_default();
 pub(crate) const DIM: Style = Style::new().dimmed();
 
-const AGGREGATE_RENDER_INTERVAL: Duration = Duration::from_millis(50);
+const PROGRESS_REFRESH_HZ: u8 = 12;
+// Keep aggregate progress below indicatif's default terminal refresh rate. This
+// protects slower terminals from chunk-driven redraw storms while still showing
+// sub-second progress during long pulls.
+const AGGREGATE_RENDER_INTERVAL: Duration = Duration::from_millis(100);
+const DETAIL_RENDER_INTERVAL: Duration = Duration::from_millis(100);
 
 pub(crate) fn paint(value: &str, style: Style) -> String {
     if should_color_stderr() {
@@ -73,8 +78,22 @@ struct ProgressUiInner {
     multi: MultiProgress,
     image: ProgressBar,
     layers: Mutex<HashMap<String, ProgressBar>>,
+    layer_renders: Mutex<HashMap<String, LayerRender>>,
     aggregate: Mutex<AggregateProgress>,
     image_name: Mutex<String>,
+}
+
+struct LayerRender {
+    total: u64,
+    position: u64,
+    last_rendered_at: Option<Instant>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum LayerRenderAdvance {
+    Render(u64),
+    Throttled,
+    Missing,
 }
 
 #[derive(Default)]
@@ -89,7 +108,16 @@ struct AggregateProgress {
 struct AggregateLayer {
     total: u64,
     position: u64,
-    complete: bool,
+    state: AggregateLayerState,
+    status: Option<String>,
+}
+
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+enum AggregateLayerState {
+    #[default]
+    Waiting,
+    Downloading,
+    Complete,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -98,6 +126,8 @@ struct AggregateRender {
     total_bytes: u64,
     position: u64,
     hide_bytes: bool,
+    completed_layers: usize,
+    total_layers: usize,
     status: String,
 }
 
@@ -131,7 +161,9 @@ impl Ui {
             };
         }
 
-        let multi = MultiProgress::with_draw_target(ProgressDrawTarget::stderr());
+        let multi = MultiProgress::with_draw_target(ProgressDrawTarget::stderr_with_hz(
+            PROGRESS_REFRESH_HZ,
+        ));
         let image = multi.add(ProgressBar::new_spinner());
         image.set_style(image_status_style(animated));
         if animated {
@@ -145,6 +177,7 @@ impl Ui {
                 multi,
                 image,
                 layers: Mutex::new(HashMap::new()),
+                layer_renders: Mutex::new(HashMap::new()),
                 aggregate: Mutex::new(AggregateProgress::default()),
                 image_name: Mutex::new(String::new()),
             })),
@@ -253,6 +286,7 @@ impl Ui {
                 bar.set_length(total_bytes);
                 bar.set_position(starting_offset);
                 bar.set_message(short_digest(digest));
+                inner.start_layer_render(digest, total_bytes, starting_offset);
             },
             || {
                 self.plain_line(plain_layer_download_message(
@@ -270,8 +304,18 @@ impl Ui {
                 if inner.aggregate_layers {
                     inner.advance_aggregate_layer(digest, amount);
                 }
-                if let Some(bar) = inner.layer_bar(digest) {
-                    bar.inc(amount);
+                match inner.advance_layer_render(digest, amount) {
+                    LayerRenderAdvance::Render(position) => {
+                        if let Some(bar) = inner.layer_bar(digest) {
+                            bar.set_position(position);
+                        }
+                    }
+                    LayerRenderAdvance::Missing => {
+                        if let Some(bar) = inner.layer_bar(digest) {
+                            bar.inc(amount);
+                        }
+                    }
+                    LayerRenderAdvance::Throttled => {}
                 }
             },
             || {},
@@ -285,9 +329,15 @@ impl Ui {
     pub fn set_layer_status(&self, digest: &str, status: &str) {
         self.dispatch_mode(
             |inner| {
+                if inner.aggregate_layers {
+                    inner.set_aggregate_layer_status(digest, status);
+                }
                 let Some(bar) = inner.layer_bar(digest) else {
                     return;
                 };
+                if let Some(position) = inner.flush_layer_render(digest) {
+                    bar.set_position(position);
+                }
                 bar.set_style(layer_status_style(inner.animated));
                 if inner.animated {
                     bar.enable_steady_tick(Duration::from_millis(120));
@@ -304,11 +354,14 @@ impl Ui {
         self.dispatch_mode(
             |inner| {
                 if inner.aggregate_layers {
-                    inner.finish_aggregate_layer(digest);
+                    inner.finish_aggregate_layer(digest, progress_status);
                 }
                 let Some(bar) = inner.layer_bar(digest) else {
                     return;
                 };
+                if let Some(position) = inner.finish_layer_render(digest) {
+                    bar.set_position(position);
+                }
                 bar.set_style(layer_status_style(inner.animated));
                 bar.disable_steady_tick();
                 bar.finish_with_message(format!("{} {progress_status}", short_digest(digest)));
@@ -414,11 +467,12 @@ impl UiGroup {
             };
         }
 
+        let multi = MultiProgress::with_draw_target(ProgressDrawTarget::stderr_with_hz(
+            PROGRESS_REFRESH_HZ,
+        ));
+
         Self {
-            mode: UiGroupMode::Progress {
-                animated,
-                multi: MultiProgress::with_draw_target(ProgressDrawTarget::stderr()),
-            },
+            mode: UiGroupMode::Progress { animated, multi },
         }
     }
 
@@ -445,6 +499,7 @@ impl UiGroup {
                         multi: multi.clone(),
                         image,
                         layers: Mutex::new(HashMap::new()),
+                        layer_renders: Mutex::new(HashMap::new()),
                         aggregate: Mutex::new(AggregateProgress::default()),
                         image_name: Mutex::new(String::new()),
                     })),
@@ -479,7 +534,57 @@ impl ProgressUiInner {
             bar.finish_and_clear();
             self.multi.remove(&bar);
         }
+        self.layer_renders
+            .lock()
+            .expect("ui state poisoned")
+            .clear();
         self.aggregate.lock().expect("ui state poisoned").clear();
+    }
+
+    fn start_layer_render(&self, digest: &str, total: u64, position: u64) {
+        self.layer_renders
+            .lock()
+            .expect("ui state poisoned")
+            .insert(
+                digest.to_string(),
+                LayerRender {
+                    total,
+                    position: position.min(total),
+                    last_rendered_at: Some(Instant::now()),
+                },
+            );
+    }
+
+    fn advance_layer_render(&self, digest: &str, amount: u64) -> LayerRenderAdvance {
+        let mut layer_renders = self.layer_renders.lock().expect("ui state poisoned");
+        let Some(render) = layer_renders.get_mut(digest) else {
+            return LayerRenderAdvance::Missing;
+        };
+        render.position = render.position.saturating_add(amount).min(render.total);
+        if render
+            .last_rendered_at
+            .is_some_and(|last| last.elapsed() < DETAIL_RENDER_INTERVAL)
+        {
+            return LayerRenderAdvance::Throttled;
+        }
+        render.last_rendered_at = Some(Instant::now());
+        LayerRenderAdvance::Render(render.position)
+    }
+
+    fn flush_layer_render(&self, digest: &str) -> Option<u64> {
+        let mut layer_renders = self.layer_renders.lock().expect("ui state poisoned");
+        let render = layer_renders.get_mut(digest)?;
+        render.last_rendered_at = Some(Instant::now());
+        Some(render.position)
+    }
+
+    fn finish_layer_render(&self, digest: &str) -> Option<u64> {
+        let mut layer_renders = self.layer_renders.lock().expect("ui state poisoned");
+        let mut render = layer_renders.remove(digest)?;
+        if render.total > 0 {
+            render.position = render.total;
+        }
+        Some(render.position)
     }
 
     fn prepare_aggregate_layers(&self, digests: &[String]) {
@@ -500,7 +605,12 @@ impl ProgressUiInner {
         let layer = aggregate.touch_layer(digest);
         layer.total = total_bytes;
         layer.position = starting_offset.min(total_bytes);
-        layer.complete = layer.position >= total_bytes && total_bytes > 0;
+        layer.state = if layer.position >= total_bytes && total_bytes > 0 {
+            AggregateLayerState::Complete
+        } else {
+            AggregateLayerState::Downloading
+        };
+        layer.status = Some("Pulling".to_string());
         drop(aggregate);
         self.render_aggregate_progress("Pulling");
     }
@@ -509,18 +619,35 @@ impl ProgressUiInner {
         let mut aggregate = self.aggregate.lock().expect("ui state poisoned");
         let layer = aggregate.touch_layer(digest);
         layer.position = layer.position.saturating_add(amount).min(layer.total);
-        layer.complete = layer.total > 0 && layer.position >= layer.total;
+        layer.state = if layer.total > 0 && layer.position >= layer.total {
+            AggregateLayerState::Complete
+        } else {
+            AggregateLayerState::Downloading
+        };
+        layer.status = Some("Pulling".to_string());
         drop(aggregate);
         self.render_aggregate_progress_throttled("Pulling");
     }
 
-    fn finish_aggregate_layer(&self, digest: &str) {
+    fn set_aggregate_layer_status(&self, digest: &str, status: &str) {
+        let mut aggregate = self.aggregate.lock().expect("ui state poisoned");
+        let layer = aggregate.touch_layer(digest);
+        layer.status = Some(status.to_string());
+        if layer.state != AggregateLayerState::Complete {
+            layer.state = aggregate_layer_state_for_status(status);
+        }
+        drop(aggregate);
+        self.render_aggregate_progress("Pulling");
+    }
+
+    fn finish_aggregate_layer(&self, digest: &str, status: &str) {
         let mut aggregate = self.aggregate.lock().expect("ui state poisoned");
         let layer = aggregate.touch_layer(digest);
         if layer.total > 0 {
             layer.position = layer.total;
         }
-        layer.complete = true;
+        layer.state = AggregateLayerState::Complete;
+        layer.status = Some(status.to_string());
         drop(aggregate);
         self.render_aggregate_progress("Pulling");
     }
@@ -537,16 +664,16 @@ impl ProgressUiInner {
         let mut aggregate = self.aggregate.lock().expect("ui state poisoned");
         let render = aggregate_render(&aggregate, status);
 
-        if !force {
-            if aggregate
+        if aggregate.last_rendered.as_ref() == Some(&render) {
+            return;
+        }
+
+        if !force
+            && aggregate
                 .last_rendered_at
                 .is_some_and(|last| last.elapsed() < AGGREGATE_RENDER_INTERVAL)
-            {
-                return;
-            }
-            if aggregate.last_rendered.as_ref() == Some(&render) {
-                return;
-            }
+        {
+            return;
         }
         aggregate.last_rendered = Some(render.clone());
         aggregate.last_rendered_at = Some(Instant::now());
@@ -563,8 +690,12 @@ impl ProgressUiInner {
         } else {
             String::new()
         };
+        let layers = format!(
+            " {}/{} layers",
+            render.completed_layers, render.total_layers
+        );
         self.image.set_message(format!(
-            "{image} [{}]{bytes} {}",
+            "{image} [{}]{layers}{bytes} {}",
             paint(&render.strip, GREEN),
             render.status
         ));
@@ -576,14 +707,18 @@ fn aggregate_render(aggregate: &AggregateProgress, status: &str) -> AggregateRen
     let mut total_bytes = 0;
     let mut position = 0;
     let mut hide_bytes = false;
+    let mut completed_layers = 0;
     for digest in &aggregate.order {
         let Some(layer) = aggregate.layers.get(digest) else {
             continue;
         };
         total_bytes += layer.total;
         position += layer.position;
-        if !layer.complete && layer.total == 0 {
+        if layer.state != AggregateLayerState::Complete && layer.total == 0 {
             hide_bytes = true;
+        }
+        if layer.state == AggregateLayerState::Complete {
+            completed_layers += 1;
         }
         strip.push(layer_progress_char(layer));
     }
@@ -593,6 +728,8 @@ fn aggregate_render(aggregate: &AggregateProgress, status: &str) -> AggregateRen
         total_bytes,
         position,
         hide_bytes,
+        completed_layers,
+        total_layers: aggregate.order.len(),
         status: status.to_string(),
     }
 }
@@ -698,7 +835,7 @@ fn compose_image_style() -> ProgressStyle {
 
 fn layer_progress_char(layer: &AggregateLayer) -> char {
     const PERCENT_CHARS: [char; 9] = ['⠀', '⡀', '⣀', '⣄', '⣤', '⣦', '⣶', '⣷', '⣿'];
-    if layer.complete {
+    if layer.state == AggregateLayerState::Complete {
         return PERCENT_CHARS[PERCENT_CHARS.len() - 1];
     }
     if layer.total == 0 {
@@ -707,6 +844,16 @@ fn layer_progress_char(layer: &AggregateLayer) -> char {
     let percent = layer.position.saturating_mul(100) / layer.total;
     let index = (PERCENT_CHARS.len() as u64 - 1) * percent.min(100) / 100;
     PERCENT_CHARS[index as usize]
+}
+
+fn aggregate_layer_state_for_status(status: &str) -> AggregateLayerState {
+    if status.contains("Pull complete") || status.contains("Already exists") {
+        AggregateLayerState::Complete
+    } else if status.contains("Waiting") {
+        AggregateLayerState::Waiting
+    } else {
+        AggregateLayerState::Downloading
+    }
 }
 
 pub(crate) fn should_color_stderr() -> bool {
@@ -718,10 +865,17 @@ pub(crate) fn should_color_stderr() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::plain_layer_download_message;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
 
     #[cfg(target_os = "linux")]
     use super::linux_process_is_foreground_tty_job_from_stat;
+    use super::{
+        AggregateLayer, AggregateLayerState, AggregateProgress, LayerRenderAdvance,
+        ProgressUiInner, Ui, UiMode, aggregate_render, compose_image_style,
+        plain_layer_download_message,
+    };
+    use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget};
 
     #[cfg(target_os = "linux")]
     #[test]
@@ -757,5 +911,152 @@ mod tests {
             plain_layer_download_message("sha256:abcdef0123456789", 2_048, 512),
             "layer abcdef012345: Resuming 512 B/2.0 KiB"
         );
+    }
+
+    #[test]
+    fn aggregate_prepare_keeps_detailed_layer_bars() {
+        let ui = aggregate_test_ui();
+        let digests = vec![
+            "sha256:first".to_string(),
+            "sha256:second".to_string(),
+            "sha256:third".to_string(),
+        ];
+
+        ui.prepare_layers(&digests);
+
+        let inner = ui.progress().expect("test ui should be progress");
+        let aggregate = inner.aggregate.lock().expect("ui state poisoned");
+        assert_eq!(aggregate.order, digests);
+        assert_eq!(aggregate.layers.len(), 3);
+        drop(aggregate);
+        assert_eq!(inner.layers.lock().expect("ui state poisoned").len(), 3);
+    }
+
+    #[test]
+    fn aggregate_render_includes_layer_counts() {
+        let mut aggregate = AggregateProgress {
+            order: vec![
+                "sha256:first".to_string(),
+                "sha256:second".to_string(),
+                "sha256:third".to_string(),
+            ],
+            layers: HashMap::new(),
+            last_rendered: None,
+            last_rendered_at: None,
+        };
+        aggregate.layers.insert(
+            "sha256:first".to_string(),
+            AggregateLayer {
+                total: 100,
+                position: 100,
+                state: AggregateLayerState::Complete,
+                status: Some("Pull complete".to_string()),
+            },
+        );
+        aggregate.layers.insert(
+            "sha256:second".to_string(),
+            AggregateLayer {
+                total: 100,
+                position: 50,
+                state: AggregateLayerState::Downloading,
+                status: Some("Pulling".to_string()),
+            },
+        );
+        aggregate
+            .layers
+            .insert("sha256:third".to_string(), AggregateLayer::default());
+
+        let render = aggregate_render(&aggregate, "Pulling");
+
+        assert_eq!(render.completed_layers, 1);
+        assert_eq!(render.total_layers, 3);
+        assert_eq!(render.status, "Pulling");
+    }
+
+    #[test]
+    fn aggregate_render_throttles_fast_updates() {
+        let ui = aggregate_test_ui();
+        let inner = ui.progress().expect("test ui should be progress");
+        inner.prepare_aggregate_layers(&["sha256:first".to_string()]);
+        inner.start_aggregate_layer("sha256:first", 100, 0);
+        let first_rendered_at = inner
+            .aggregate
+            .lock()
+            .expect("ui state poisoned")
+            .last_rendered_at
+            .expect("forced render should be recorded");
+
+        inner.advance_aggregate_layer("sha256:first", 10);
+
+        let second_rendered_at = inner
+            .aggregate
+            .lock()
+            .expect("ui state poisoned")
+            .last_rendered_at
+            .expect("render timestamp should remain present");
+        assert_eq!(first_rendered_at, second_rendered_at);
+    }
+
+    #[test]
+    fn aggregate_render_skips_forced_unchanged_summary() {
+        let ui = aggregate_test_ui();
+        let inner = ui.progress().expect("test ui should be progress");
+        inner.prepare_aggregate_layers(&["sha256:first".to_string()]);
+        let first_rendered_at = inner
+            .aggregate
+            .lock()
+            .expect("ui state poisoned")
+            .last_rendered_at
+            .expect("forced render should be recorded");
+
+        inner.set_aggregate_layer_status("sha256:first", "Waiting for another pocker process");
+
+        let second_rendered_at = inner
+            .aggregate
+            .lock()
+            .expect("ui state poisoned")
+            .last_rendered_at
+            .expect("render timestamp should remain present");
+        assert_eq!(first_rendered_at, second_rendered_at);
+    }
+
+    #[test]
+    fn detailed_layer_render_throttles_fast_updates() {
+        let ui = aggregate_test_ui();
+        let inner = ui.progress().expect("test ui should be progress");
+        inner.start_layer_render("sha256:first", 100, 0);
+
+        assert_eq!(
+            inner.advance_layer_render("sha256:first", 10),
+            LayerRenderAdvance::Throttled
+        );
+
+        let render = inner
+            .layer_renders
+            .lock()
+            .expect("ui state poisoned")
+            .get("sha256:first")
+            .map(|render| render.position);
+        assert_eq!(render, Some(10));
+        assert_eq!(inner.flush_layer_render("sha256:first"), Some(10));
+        assert_eq!(inner.finish_layer_render("sha256:first"), Some(100));
+    }
+
+    fn aggregate_test_ui() -> Ui {
+        let multi = MultiProgress::with_draw_target(ProgressDrawTarget::hidden());
+        let image = multi.add(ProgressBar::new_spinner());
+        image.set_style(compose_image_style());
+        Ui {
+            mode: UiMode::Progress(Arc::new(ProgressUiInner {
+                animated: false,
+                aggregate_layers: true,
+                multi,
+                image,
+                layers: Mutex::new(HashMap::new()),
+                layer_renders: Mutex::new(HashMap::new()),
+                aggregate: Mutex::new(AggregateProgress::default()),
+                image_name: Mutex::new("example:latest".to_string()),
+            })),
+        }
     }
 }
