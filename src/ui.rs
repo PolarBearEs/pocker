@@ -21,7 +21,6 @@ const PROGRESS_REFRESH_HZ: u8 = 12;
 // sub-second progress during long pulls.
 const AGGREGATE_RENDER_INTERVAL: Duration = Duration::from_millis(100);
 const DETAIL_RENDER_INTERVAL: Duration = Duration::from_millis(100);
-
 pub(crate) fn paint(value: &str, style: Style) -> String {
     if should_color_stderr() {
         format!("{style}{value}{style:#}")
@@ -112,7 +111,7 @@ struct AggregateLayer {
     status: Option<String>,
 }
 
-#[derive(Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 enum AggregateLayerState {
     #[default]
     Waiting,
@@ -123,6 +122,7 @@ enum AggregateLayerState {
 #[derive(Clone, PartialEq, Eq)]
 struct AggregateRender {
     strip: String,
+    strip_states: Vec<AggregateLayerState>,
     total_bytes: u64,
     position: u64,
     hide_bytes: bool,
@@ -190,7 +190,7 @@ impl Ui {
                 inner.reset_for_image();
                 *inner.image_name.lock().expect("ui state poisoned") = image.to_string();
                 if inner.aggregate_layers {
-                    inner.image.set_style(compose_image_style());
+                    inner.image.set_style(compose_image_style(inner.animated));
                 }
                 inner.image.set_message(format!("{image} Pulling"));
             },
@@ -488,7 +488,7 @@ impl UiGroup {
             },
             UiGroupMode::Progress { animated, multi } => {
                 let image = multi.add(ProgressBar::new_spinner());
-                image.set_style(compose_image_style());
+                image.set_style(compose_image_style(*animated));
                 if *animated {
                     image.enable_steady_tick(Duration::from_millis(100));
                 }
@@ -679,8 +679,9 @@ impl ProgressUiInner {
         aggregate.last_rendered_at = Some(Instant::now());
         drop(aggregate);
 
-        self.image.set_style(compose_image_style());
+        self.image.set_style(compose_image_style(self.animated));
         let image = self.image_name.lock().expect("ui state poisoned").clone();
+        let strip = paint_aggregate_strip(&render.strip, &render.strip_states);
         let bytes = if render.total_bytes > 0 && !render.hide_bytes {
             format!(
                 " {} / {}",
@@ -696,14 +697,14 @@ impl ProgressUiInner {
         );
         self.image.set_message(format!(
             "{image} [{}]{layers}{bytes} {}",
-            paint(&render.strip, GREEN),
-            render.status
+            strip, render.status
         ));
     }
 }
 
 fn aggregate_render(aggregate: &AggregateProgress) -> AggregateRender {
     let mut strip = String::new();
+    let mut strip_states = Vec::new();
     let mut total_bytes = 0;
     let mut position = 0;
     let mut hide_bytes = false;
@@ -721,10 +722,12 @@ fn aggregate_render(aggregate: &AggregateProgress) -> AggregateRender {
             completed_layers += 1;
         }
         strip.push(layer_progress_char(layer));
+        strip_states.push(layer.state);
     }
 
     AggregateRender {
         strip,
+        strip_states,
         total_bytes,
         position,
         hide_bytes,
@@ -732,6 +735,20 @@ fn aggregate_render(aggregate: &AggregateProgress) -> AggregateRender {
         total_layers: aggregate.order.len(),
         status: aggregate_status(aggregate),
     }
+}
+
+fn paint_aggregate_strip(strip: &str, states: &[AggregateLayerState]) -> String {
+    strip
+        .chars()
+        .zip(states)
+        .map(|(cell, state)| {
+            let style = match state {
+                AggregateLayerState::Waiting => DIM,
+                AggregateLayerState::Downloading | AggregateLayerState::Complete => GREEN,
+            };
+            paint(&cell.to_string(), style)
+        })
+        .collect()
 }
 
 fn aggregate_status(aggregate: &AggregateProgress) -> String {
@@ -862,14 +879,20 @@ fn layer_download_style() -> ProgressStyle {
     .progress_chars("=> ")
 }
 
-fn compose_image_style() -> ProgressStyle {
-    ProgressStyle::with_template("{msg}").expect("valid compose image template")
+fn compose_image_style(animated: bool) -> ProgressStyle {
+    if animated {
+        ProgressStyle::with_template("{spinner:.cyan} {msg}")
+            .expect("valid compose image template")
+            .tick_strings(&["-", "\\", "|", "/"])
+    } else {
+        ProgressStyle::with_template("{msg}").expect("valid compose image template")
+    }
 }
 
 fn layer_progress_char(layer: &AggregateLayer) -> char {
     const PERCENT_CHARS: [char; 9] = ['⠀', '⡀', '⣀', '⣄', '⣤', '⣦', '⣶', '⣷', '⣿'];
     if layer.state == AggregateLayerState::Waiting {
-        return '⠂';
+        return ' ';
     }
     if layer.state == AggregateLayerState::Complete {
         return PERCENT_CHARS[PERCENT_CHARS.len() - 1];
@@ -1029,7 +1052,8 @@ mod tests {
 
         let render = aggregate_render(&aggregate);
 
-        assert_eq!(render.strip, "⠂");
+        assert_eq!(render.strip, " ");
+        assert_eq!(render.strip_states, vec![AggregateLayerState::Waiting]);
         assert_eq!(render.status, "Waiting for another pocker process");
     }
 
@@ -1105,7 +1129,7 @@ mod tests {
     fn aggregate_test_ui() -> Ui {
         let multi = MultiProgress::with_draw_target(ProgressDrawTarget::hidden());
         let image = multi.add(ProgressBar::new_spinner());
-        image.set_style(compose_image_style());
+        image.set_style(compose_image_style(false));
         Ui {
             mode: UiMode::Progress(Arc::new(ProgressUiInner {
                 animated: false,
