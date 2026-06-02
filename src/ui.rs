@@ -597,7 +597,7 @@ impl ProgressUiInner {
                 .insert(digest.clone(), AggregateLayer::default());
         }
         drop(aggregate);
-        self.render_aggregate_progress("Pulling");
+        self.render_aggregate_progress();
     }
 
     fn start_aggregate_layer(&self, digest: &str, total_bytes: u64, starting_offset: u64) {
@@ -612,7 +612,7 @@ impl ProgressUiInner {
         };
         layer.status = Some("Pulling".to_string());
         drop(aggregate);
-        self.render_aggregate_progress("Pulling");
+        self.render_aggregate_progress();
     }
 
     fn advance_aggregate_layer(&self, digest: &str, amount: u64) {
@@ -626,7 +626,7 @@ impl ProgressUiInner {
         };
         layer.status = Some("Pulling".to_string());
         drop(aggregate);
-        self.render_aggregate_progress_throttled("Pulling");
+        self.render_aggregate_progress_throttled();
     }
 
     fn set_aggregate_layer_status(&self, digest: &str, status: &str) {
@@ -637,7 +637,7 @@ impl ProgressUiInner {
             layer.state = aggregate_layer_state_for_status(status);
         }
         drop(aggregate);
-        self.render_aggregate_progress("Pulling");
+        self.render_aggregate_progress();
     }
 
     fn finish_aggregate_layer(&self, digest: &str, status: &str) {
@@ -649,20 +649,20 @@ impl ProgressUiInner {
         layer.state = AggregateLayerState::Complete;
         layer.status = Some(status.to_string());
         drop(aggregate);
-        self.render_aggregate_progress("Pulling");
+        self.render_aggregate_progress();
     }
 
-    fn render_aggregate_progress(&self, status: &str) {
-        self.render_aggregate_progress_with_throttle(status, true);
+    fn render_aggregate_progress(&self) {
+        self.render_aggregate_progress_with_throttle(true);
     }
 
-    fn render_aggregate_progress_throttled(&self, status: &str) {
-        self.render_aggregate_progress_with_throttle(status, false);
+    fn render_aggregate_progress_throttled(&self) {
+        self.render_aggregate_progress_with_throttle(false);
     }
 
-    fn render_aggregate_progress_with_throttle(&self, status: &str, force: bool) {
+    fn render_aggregate_progress_with_throttle(&self, force: bool) {
         let mut aggregate = self.aggregate.lock().expect("ui state poisoned");
-        let render = aggregate_render(&aggregate, status);
+        let render = aggregate_render(&aggregate);
 
         if aggregate.last_rendered.as_ref() == Some(&render) {
             return;
@@ -702,7 +702,7 @@ impl ProgressUiInner {
     }
 }
 
-fn aggregate_render(aggregate: &AggregateProgress, status: &str) -> AggregateRender {
+fn aggregate_render(aggregate: &AggregateProgress) -> AggregateRender {
     let mut strip = String::new();
     let mut total_bytes = 0;
     let mut position = 0;
@@ -730,7 +730,40 @@ fn aggregate_render(aggregate: &AggregateProgress, status: &str) -> AggregateRen
         hide_bytes,
         completed_layers,
         total_layers: aggregate.order.len(),
-        status: status.to_string(),
+        status: aggregate_status(aggregate),
+    }
+}
+
+fn aggregate_status(aggregate: &AggregateProgress) -> String {
+    let mut has_incomplete_layer = false;
+    let mut complete_status = None;
+    for digest in &aggregate.order {
+        let Some(layer) = aggregate.layers.get(digest) else {
+            continue;
+        };
+        let Some(status) = layer.status.as_deref() else {
+            if layer.state != AggregateLayerState::Complete {
+                has_incomplete_layer = true;
+            }
+            continue;
+        };
+        if layer.state == AggregateLayerState::Waiting {
+            return status.to_string();
+        }
+        if layer.state != AggregateLayerState::Complete && status != "Pulling" {
+            return status.to_string();
+        }
+        if layer.state == AggregateLayerState::Complete {
+            complete_status = Some(status);
+        } else {
+            has_incomplete_layer = true;
+        }
+    }
+
+    if has_incomplete_layer {
+        "Pulling".to_string()
+    } else {
+        complete_status.unwrap_or("Pulling").to_string()
     }
 }
 
@@ -835,6 +868,9 @@ fn compose_image_style() -> ProgressStyle {
 
 fn layer_progress_char(layer: &AggregateLayer) -> char {
     const PERCENT_CHARS: [char; 9] = ['⠀', '⡀', '⣀', '⣄', '⣤', '⣦', '⣶', '⣷', '⣿'];
+    if layer.state == AggregateLayerState::Waiting {
+        return '⠂';
+    }
     if layer.state == AggregateLayerState::Complete {
         return PERCENT_CHARS[PERCENT_CHARS.len() - 1];
     }
@@ -966,11 +1002,35 @@ mod tests {
             .layers
             .insert("sha256:third".to_string(), AggregateLayer::default());
 
-        let render = aggregate_render(&aggregate, "Pulling");
+        let render = aggregate_render(&aggregate);
 
         assert_eq!(render.completed_layers, 1);
         assert_eq!(render.total_layers, 3);
         assert_eq!(render.status, "Pulling");
+    }
+
+    #[test]
+    fn aggregate_render_uses_waiting_layer_status() {
+        let mut aggregate = AggregateProgress {
+            order: vec!["sha256:first".to_string()],
+            layers: HashMap::new(),
+            last_rendered: None,
+            last_rendered_at: None,
+        };
+        aggregate.layers.insert(
+            "sha256:first".to_string(),
+            AggregateLayer {
+                total: 0,
+                position: 0,
+                state: AggregateLayerState::Waiting,
+                status: Some("Waiting for another pocker process".to_string()),
+            },
+        );
+
+        let render = aggregate_render(&aggregate);
+
+        assert_eq!(render.strip, "⠂");
+        assert_eq!(render.status, "Waiting for another pocker process");
     }
 
     #[test]
@@ -1009,7 +1069,7 @@ mod tests {
             .last_rendered_at
             .expect("forced render should be recorded");
 
-        inner.set_aggregate_layer_status("sha256:first", "Waiting for another pocker process");
+        inner.render_aggregate_progress();
 
         let second_rendered_at = inner
             .aggregate
