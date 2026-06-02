@@ -126,7 +126,9 @@ pub(crate) async fn execute(cli: Cli) -> Result<()> {
         Commands::Cache(args) => {
             let store = MaintenanceStore::open(cli.global.cache_dir.clone()).await?;
             match args.command {
-                CacheCommands::Clean(_) => clean_cache(&store, cli.global.quiet).await?,
+                CacheCommands::Clean(args) => {
+                    clean_cache(&store, cli.global.quiet, args.verbose).await?
+                }
             }
         }
         Commands::Image(args) => match args.command {
@@ -258,30 +260,38 @@ async fn resolve_compose_images(files: Vec<std::path::PathBuf>) -> Result<compos
         .map_err(Into::into)
 }
 
-async fn clean_cache(store: &MaintenanceStore, quiet: bool) -> Result<()> {
+async fn clean_cache(store: &MaintenanceStore, quiet: bool, verbose: bool) -> Result<()> {
     if quiet {
         store.clear_quiet().await?;
         return Ok(());
     }
 
     let cleared = store.clear().await?;
-    print_cleared_cache(store, cleared);
+    print_cleared_cache(store, cleared, verbose);
     Ok(())
 }
 
-fn print_cleared_cache(store: &MaintenanceStore, cleared: crate::store::ClearedCache) {
+fn print_cleared_cache(
+    store: &MaintenanceStore,
+    cleared: crate::store::ClearedCache,
+    verbose: bool,
+) {
     println!("Cleared cache at {}", store.root().display());
     if cleared.files.is_empty() {
         println!("Deleted: nothing");
-    } else {
+    } else if verbose {
         println!("Deleted:");
-        for file in cleared.files {
+        for file in &cleared.files {
             println!(
                 "  {} ({})",
                 file.path.display(),
                 format_size(Some(file.size))
             );
         }
+    } else {
+        let file_count = cleared.files.len();
+        let noun = if file_count == 1 { "file" } else { "files" };
+        println!("Deleted: {file_count} {noun}");
     }
     println!(
         "Reclaimed space: {}",

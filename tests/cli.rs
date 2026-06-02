@@ -1,6 +1,7 @@
 use std::fs;
 
 use assert_cmd::Command;
+use predicates::prelude::PredicateBooleanExt;
 use predicates::str::contains;
 
 fn pocker() -> Command {
@@ -32,6 +33,57 @@ fn version_flags_print_name_and_version() {
 #[test]
 fn help_flag_exits_success() {
     pocker().arg("--help").assert().success();
+}
+
+#[test]
+fn cache_clean_summarizes_deleted_files_by_default() {
+    let dir = tempfile::tempdir().expect("tempdir should create");
+    seed_cache_clean_files(dir.path());
+
+    pocker()
+        .arg("--cache-dir")
+        .arg(dir.path())
+        .arg("cache")
+        .arg("clean")
+        .assert()
+        .success()
+        .stdout(contains("Deleted: 2 files"))
+        .stdout(contains("Reclaimed space: 8 B"))
+        .stdout(contains("locks/images/stale.lock").not());
+}
+
+#[test]
+fn cache_clean_verbose_prints_deleted_file_list() {
+    let dir = tempfile::tempdir().expect("tempdir should create");
+    seed_cache_clean_files(dir.path());
+
+    pocker()
+        .arg("--cache-dir")
+        .arg(dir.path())
+        .arg("cache")
+        .arg("clean")
+        .arg("-V")
+        .assert()
+        .success()
+        .stdout(contains("Deleted:"))
+        .stdout(contains(
+            "blobs/sha256/4444444444444444444444444444444444444444444444444444444444444444 (4 B)",
+        ))
+        .stdout(contains("locks/images/stale.lock (4 B)"));
+}
+
+fn seed_cache_clean_files(root: &std::path::Path) {
+    let blob = root
+        .join("blobs")
+        .join("sha256")
+        .join("4444444444444444444444444444444444444444444444444444444444444444");
+    let lock = root.join("locks").join("images").join("stale.lock");
+    fs::create_dir_all(blob.parent().expect("blob parent should exist"))
+        .expect("blob parent should create");
+    fs::create_dir_all(lock.parent().expect("lock parent should exist"))
+        .expect("lock parent should create");
+    fs::write(blob, b"blob").expect("blob should write");
+    fs::write(lock, b"lock").expect("lock should write");
 }
 
 #[test]
