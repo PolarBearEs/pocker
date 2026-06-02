@@ -126,7 +126,9 @@ pub(crate) async fn execute(cli: Cli) -> Result<()> {
         Commands::Cache(args) => {
             let store = MaintenanceStore::open(cli.global.cache_dir.clone()).await?;
             match args.command {
-                CacheCommands::Clean(_) => clean_cache(&store, cli.global.quiet).await?,
+                CacheCommands::Clean(args) => {
+                    clean_cache(&store, cli.global.quiet, args.verbose).await?
+                }
             }
         }
         Commands::Image(args) => match args.command {
@@ -258,35 +260,79 @@ async fn resolve_compose_images(files: Vec<std::path::PathBuf>) -> Result<compos
         .map_err(Into::into)
 }
 
-async fn clean_cache(store: &MaintenanceStore, quiet: bool) -> Result<()> {
+async fn clean_cache(store: &MaintenanceStore, quiet: bool, verbose: bool) -> Result<()> {
     if quiet {
         store.clear_quiet().await?;
         return Ok(());
     }
 
     let cleared = store.clear().await?;
-    print_cleared_cache(store, cleared);
+    print_cleared_cache(store, cleared, verbose);
     Ok(())
 }
 
-fn print_cleared_cache(store: &MaintenanceStore, cleared: crate::store::ClearedCache) {
+fn print_cleared_cache(
+    store: &MaintenanceStore,
+    cleared: crate::store::ClearedCache,
+    verbose: bool,
+) {
     println!("Cleared cache at {}", store.root().display());
     if cleared.files.is_empty() {
         println!("Deleted: nothing");
-    } else {
+    } else if verbose {
         println!("Deleted:");
-        for file in cleared.files {
+        for file in &cleared.files {
             println!(
                 "  {} ({})",
                 file.path.display(),
                 format_size(Some(file.size))
             );
         }
+    } else {
+        print_deleted_cache_summary(&cleared.files);
     }
     println!(
         "Reclaimed space: {}",
         format_size(Some(cleared.reclaimed_bytes))
     );
+}
+
+fn print_deleted_cache_summary(files: &[crate::store::ClearedCacheFile]) {
+    println!("Deleted:");
+    let mut cache_files = 0usize;
+    let mut cache_bytes = 0u64;
+    let mut coordination_files = 0usize;
+    let mut coordination_bytes = 0u64;
+
+    for file in files {
+        if file.path.starts_with("locks") {
+            coordination_files += 1;
+            coordination_bytes = coordination_bytes.saturating_add(file.size);
+        } else {
+            cache_files += 1;
+            cache_bytes = cache_bytes.saturating_add(file.size);
+        }
+    }
+
+    if cache_files > 0 {
+        println!(
+            "  Cached files/layers: {} ({})",
+            format_file_count(cache_files),
+            format_size(Some(cache_bytes))
+        );
+    }
+    if coordination_files > 0 {
+        println!(
+            "  Coordination files: {} ({})",
+            format_file_count(coordination_files),
+            format_size(Some(coordination_bytes))
+        );
+    }
+}
+
+fn format_file_count(count: usize) -> String {
+    let noun = if count == 1 { "file" } else { "files" };
+    format!("{count} {noun}")
 }
 
 fn print_version() {

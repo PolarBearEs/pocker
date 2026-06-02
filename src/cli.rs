@@ -346,7 +346,15 @@ pub enum CacheCommands {
 
 #[derive(Debug, Clone, Args, Default)]
 #[command(about = "Delete cached blobs and partial downloads")]
-pub struct CacheCleanArgs {}
+pub struct CacheCleanArgs {
+    #[arg(
+        long,
+        short = 'v',
+        help_heading = "Output options",
+        help = "Print each deleted cache file unless --quiet is set"
+    )]
+    pub verbose: bool,
+}
 
 #[derive(Debug, Clone, Args)]
 #[command(about = "Run Docker image helper commands")]
@@ -778,12 +786,20 @@ mod tests {
 
     #[test]
     fn cache_clean_parses() {
-        let cli = Cli::parse_from(["pocker", "cache", "clean"]);
-        let Commands::Cache(args) = cli.command else {
-            panic!("expected cache command");
-        };
+        for verbose_flag in [None, Some("--verbose"), Some("-v")] {
+            let mut command = vec!["pocker", "cache", "clean"];
+            if let Some(flag) = verbose_flag {
+                command.push(flag);
+            }
 
-        assert!(matches!(args.command, CacheCommands::Clean(_)));
+            let cli = Cli::parse_from(command);
+            let Commands::Cache(args) = cli.command else {
+                panic!("expected cache command");
+            };
+            let CacheCommands::Clean(args) = args.command;
+
+            assert_eq!(args.verbose, verbose_flag.is_some());
+        }
     }
 
     #[test]
