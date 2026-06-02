@@ -349,9 +349,9 @@ pub enum CacheCommands {
 pub struct CacheCleanArgs {
     #[arg(
         long,
-        short = 'V',
+        short = 'v',
         help_heading = "Output options",
-        help = "Print each deleted cache file"
+        help = "Print each deleted cache file unless --quiet is set"
     )]
     pub verbose: bool,
 }
@@ -786,7 +786,7 @@ mod tests {
 
     #[test]
     fn cache_clean_parses() {
-        for verbose_flag in [None, Some("--verbose"), Some("-V")] {
+        for verbose_flag in [None, Some("--verbose"), Some("-v")] {
             let mut command = vec!["pocker", "cache", "clean"];
             if let Some(flag) = verbose_flag {
                 command.push(flag);

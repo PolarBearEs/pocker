@@ -62,7 +62,7 @@ fn cache_clean_verbose_prints_deleted_file_list() {
         .arg(dir.path())
         .arg("cache")
         .arg("clean")
-        .arg("-V")
+        .arg("-v")
         .assert()
         .success()
         .stdout(contains("Deleted:"))
