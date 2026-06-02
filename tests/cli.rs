@@ -58,6 +58,12 @@ fn cache_clean_summarizes_deleted_files_by_default() {
 fn cache_clean_verbose_prints_deleted_file_list() {
     let dir = tempfile::tempdir().expect("tempdir should create");
     seed_cache_clean_files(dir.path());
+    let blob = std::path::PathBuf::from("blobs")
+        .join("sha256")
+        .join("4444444444444444444444444444444444444444444444444444444444444444");
+    let lock = std::path::PathBuf::from("locks")
+        .join("images")
+        .join("stale.lock");
 
     pocker()
         .arg("--cache-dir")
@@ -68,10 +74,8 @@ fn cache_clean_verbose_prints_deleted_file_list() {
         .assert()
         .success()
         .stdout(contains("Deleted:"))
-        .stdout(contains(
-            "blobs/sha256/4444444444444444444444444444444444444444444444444444444444444444 (4 B)",
-        ))
-        .stdout(contains("locks/images/stale.lock (4 B)"));
+        .stdout(contains(format!("{} (4 B)", blob.display())))
+        .stdout(contains(format!("{} (4 B)", lock.display())));
 }
 
 fn seed_cache_clean_files(root: &std::path::Path) {
