@@ -289,14 +289,50 @@ fn print_cleared_cache(
             );
         }
     } else {
-        let file_count = cleared.files.len();
-        let noun = if file_count == 1 { "file" } else { "files" };
-        println!("Deleted: {file_count} {noun}");
+        print_deleted_cache_summary(&cleared.files);
     }
     println!(
         "Reclaimed space: {}",
         format_size(Some(cleared.reclaimed_bytes))
     );
+}
+
+fn print_deleted_cache_summary(files: &[crate::store::ClearedCacheFile]) {
+    println!("Deleted:");
+    let mut cache_files = 0usize;
+    let mut cache_bytes = 0u64;
+    let mut coordination_files = 0usize;
+    let mut coordination_bytes = 0u64;
+
+    for file in files {
+        if file.path.starts_with("locks") {
+            coordination_files += 1;
+            coordination_bytes = coordination_bytes.saturating_add(file.size);
+        } else {
+            cache_files += 1;
+            cache_bytes = cache_bytes.saturating_add(file.size);
+        }
+    }
+
+    if cache_files > 0 {
+        println!(
+            "  Cached files/layers: {} ({})",
+            format_file_count(cache_files),
+            format_size(Some(cache_bytes))
+        );
+    }
+    if coordination_files > 0 {
+        println!(
+            "  Coordination files: {} ({})",
+            format_file_count(coordination_files),
+            format_size(Some(coordination_bytes))
+        );
+    }
+}
+
+fn format_file_count(count: usize) -> String {
+    let noun = if count == 1 { "file" } else { "files" };
+    format!("{count} {noun}")
 }
 
 fn print_version() {

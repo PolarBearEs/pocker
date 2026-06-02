@@ -47,7 +47,9 @@ fn cache_clean_summarizes_deleted_files_by_default() {
         .arg("clean")
         .assert()
         .success()
-        .stdout(contains("Deleted: 2 files"))
+        .stdout(contains("Deleted:"))
+        .stdout(contains("Cached files/layers: 1 file (4 B)"))
+        .stdout(contains("Coordination files: 1 file (4 B)"))
         .stdout(contains("Reclaimed space: 8 B"))
         .stdout(contains("locks/images/stale.lock").not());
 }
