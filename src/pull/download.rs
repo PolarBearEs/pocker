@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
@@ -57,6 +58,11 @@ pub async fn download_blob(
         .ui
         .start_layer_download(&descriptor.digest, expected_size, progress.offset);
     let mut retries = 0_u32;
+    let retry_status_sink: Arc<dyn Fn(String) + Send + Sync> = {
+        let digest = descriptor.digest.clone();
+        let ui = Arc::clone(&context.ui);
+        Arc::new(move |status| ui.set_layer_status(&digest, &status))
+    };
 
     loop {
         if context.stop.is_cancelled() {
@@ -67,7 +73,12 @@ pub async fn download_blob(
         }
 
         let response = tokio::select! {
-            result = context.registry.get_blob(reference, &descriptor.digest, progress.offset) => result?,
+            result = context.registry.get_blob_with_retry_status(
+                reference,
+                &descriptor.digest,
+                progress.offset,
+                Some(Arc::clone(&retry_status_sink)),
+            ) => result?,
             _ = context.stop.cancelled() => return Err(DockerPullError::Interrupted),
         };
         let status = response.status();
@@ -352,18 +363,15 @@ fn register_retry(
     delay: Duration,
 ) -> Result<u32> {
     let mut retries = retries;
-    let detail = detail.into();
     let retry_budget = record_retry_attempt(
         &mut retries,
         context.blob_retry_limit,
         format!("blob download {digest}"),
-        detail.clone(),
+        detail.into(),
     )?;
-    let warning = format!(
-        "{detail} for {digest}; retrying in {:?} ({retry_budget})",
-        delay
-    );
-    context.ui.warn(&warning);
+    context
+        .ui
+        .set_layer_status(digest, &format!("Retrying in {delay:?} ({retry_budget})"));
     Ok(retries)
 }
 

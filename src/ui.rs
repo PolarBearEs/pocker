@@ -14,6 +14,7 @@ use crate::units::format_units;
 
 pub(crate) const GREEN: Style = AnsiColor::Green.on_default();
 pub(crate) const YELLOW: Style = AnsiColor::Yellow.on_default();
+pub(crate) const WARNING: Style = AnsiColor::Yellow.on_default().bold();
 pub(crate) const CYAN: Style = AnsiColor::Cyan.on_default();
 pub(crate) const DIM: Style = Style::new().dimmed();
 
@@ -25,10 +26,14 @@ const AGGREGATE_RENDER_INTERVAL: Duration = Duration::from_millis(100);
 const DETAIL_RENDER_INTERVAL: Duration = Duration::from_millis(100);
 pub(crate) fn paint(value: &str, style: Style) -> String {
     if should_color_stderr() {
-        format!("{style}{value}{style:#}")
+        format!("{}{value}{}", style.render(), style.render_reset())
     } else {
         value.to_string()
     }
+}
+
+fn warning_message(message: &str) -> String {
+    format!("{} {message}", paint("warning:", WARNING))
 }
 
 #[derive(Clone)]
@@ -449,9 +454,11 @@ impl ProgressSink for Ui {
     }
 
     fn warn(&self, message: &str) {
-        let message = format!("warning: {message}");
+        let message = warning_message(message);
         match &self.mode {
-            UiMode::Progress(inner) => inner.image.println(message),
+            UiMode::Progress(inner) => {
+                inner.multi.suspend(|| eprintln!("{message}"));
+            }
             UiMode::Plain { .. } => self.plain_line(message),
             UiMode::Quiet => {}
         }
@@ -518,6 +525,20 @@ impl UiGroup {
                         _echo_guard: _echo_guard.clone(),
                     })),
                 }
+            }
+        }
+    }
+
+    pub(crate) fn warning_sink(&self) -> Arc<dyn Fn(String) + Send + Sync> {
+        match &self.mode {
+            UiGroupMode::Quiet => Arc::new(|_| {}),
+            UiGroupMode::Plain => Arc::new(|message| eprintln!("{}", warning_message(&message))),
+            UiGroupMode::Progress { multi, .. } => {
+                let multi = multi.clone();
+                Arc::new(move |message| {
+                    let message = warning_message(&message);
+                    multi.suspend(|| eprintln!("{message}"));
+                })
             }
         }
     }

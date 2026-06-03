@@ -48,7 +48,8 @@ pub(crate) async fn execute(cli: Cli) -> Result<()> {
                     || pull_args.common.output.quiet)
                 {
                     eprintln!(
-                        "warning: skipping build-only compose services without image: {}",
+                        "{} skipping build-only compose services without image: {}",
+                        ui::paint("warning:", ui::WARNING),
                         resolved.skipped_build_only.join(", ")
                     );
                 }

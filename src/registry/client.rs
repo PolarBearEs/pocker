@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -34,7 +35,10 @@ pub const DEFAULT_REQUEST_RETRIES: u32 = 5;
 const MAX_AUTH_RETRIES: u32 = 2;
 const DOCKER_CONTENT_DIGEST: HeaderName = HeaderName::from_static("docker-content-digest");
 
-#[derive(Debug, Clone)]
+type RetryWarningSink = Arc<dyn Fn(String) + Send + Sync>;
+pub(crate) type RetryStatusSink = Arc<dyn Fn(String) + Send + Sync>;
+
+#[derive(Clone)]
 pub struct RegistryClient {
     client: Client,
     auth: Arc<AuthResolver>,
@@ -43,6 +47,7 @@ pub struct RegistryClient {
     request_retry_limit: Option<u32>,
     cache_from: Option<Url>,
     cache_only: bool,
+    retry_warning_sink: Option<RetryWarningSink>,
 }
 
 struct RegistryRequest<'a> {
@@ -52,6 +57,7 @@ struct RegistryRequest<'a> {
     accept: Option<&'a str>,
     range: Option<&'a str>,
     allow_retry: bool,
+    retry_status_sink: Option<RetryStatusSink>,
 }
 
 struct RegistryAuthContext {
@@ -103,7 +109,13 @@ impl RegistryClient {
             request_retry_limit,
             cache_from,
             cache_only,
+            retry_warning_sink: None,
         }
+    }
+
+    pub(crate) fn with_retry_warning_sink(mut self, sink: RetryWarningSink) -> Self {
+        self.retry_warning_sink = Some(sink);
+        self
     }
 
     pub async fn get_manifest_raw(
@@ -120,6 +132,7 @@ impl RegistryClient {
                     accept,
                     range: None,
                     allow_retry: true,
+                    retry_status_sink: None,
                 },
                 reference,
             )
@@ -142,6 +155,7 @@ impl RegistryClient {
                     accept,
                     range: None,
                     allow_retry: true,
+                    retry_status_sink: None,
                 },
                 reference,
             )
@@ -164,6 +178,7 @@ impl RegistryClient {
                     accept: Some(MANIFEST_ACCEPT),
                     range: None,
                     allow_retry: true,
+                    retry_status_sink: None,
                 },
                 reference,
             )
@@ -229,6 +244,7 @@ impl RegistryClient {
                         accept: Some(MANIFEST_ACCEPT),
                         range: None,
                         allow_retry: true,
+                        retry_status_sink: None,
                     },
                     reference,
                 )
@@ -281,6 +297,7 @@ impl RegistryClient {
                     accept: None,
                     range: None,
                     allow_retry: true,
+                    retry_status_sink: None,
                 },
                 reference,
             )
@@ -308,6 +325,17 @@ impl RegistryClient {
         digest: &str,
         offset: u64,
     ) -> Result<Response> {
+        self.get_blob_with_retry_status(reference, digest, offset, None)
+            .await
+    }
+
+    pub(crate) async fn get_blob_with_retry_status(
+        &self,
+        reference: &ImageReference,
+        digest: &str,
+        offset: u64,
+        retry_status_sink: Option<RetryStatusSink>,
+    ) -> Result<Response> {
         let range = (offset > 0).then(|| format!("bytes={offset}-"));
         self.send(
             RegistryRequest {
@@ -317,6 +345,7 @@ impl RegistryClient {
                 accept: None,
                 range: range.as_deref(),
                 allow_retry: true,
+                retry_status_sink,
             },
             reference,
         )
@@ -464,6 +493,8 @@ impl RegistryClient {
                 Err(error) if request.allow_retry && is_retryable_http_error(&error) => {
                     let delay = jittered_backoff_delay(retries);
                     self.retry_request(
+                        reference,
+                        request.retry_status_sink.as_ref(),
                         &mut retries,
                         error.to_string(),
                         delay,
@@ -494,6 +525,8 @@ impl RegistryClient {
                 let delay = retry_after_delay(response.headers().get(RETRY_AFTER))
                     .unwrap_or_else(|| jittered_backoff_delay(retries));
                 self.retry_request(
+                    reference,
+                    request.retry_status_sink.as_ref(),
                     &mut retries,
                     format!("registry returned {status}"),
                     delay,
@@ -590,6 +623,8 @@ impl RegistryClient {
 
     async fn retry_request(
         &self,
+        reference: &ImageReference,
+        retry_status_sink: Option<&RetryStatusSink>,
         retries: &mut u32,
         detail: String,
         delay: Duration,
@@ -601,18 +636,41 @@ impl RegistryClient {
             "registry request",
             detail,
         )?;
-        match reason {
-            RetryReason::SendError => warn!(
-                "request failed before response, retrying in {:?} ({})",
-                delay, retry_budget
+        let inline_status = match reason {
+            RetryReason::SendError => {
+                format!("Retrying request in {delay:?} ({retry_budget})")
+            }
+            RetryReason::Status(status) => {
+                format!("Retrying after {status} in {delay:?} ({retry_budget})")
+            }
+        };
+        let warning = match reason {
+            RetryReason::SendError => format!(
+                "registry request for {} failed before response; retrying in {delay:?} ({retry_budget})",
+                reference.display_name()
             ),
-            RetryReason::Status(status) => warn!(
-                "registry returned {}, retrying in {:?} ({})",
-                status, delay, retry_budget
-            ),
+            RetryReason::Status(status) => {
+                format!(
+                    "registry request for {} returned {status}; retrying in {delay:?} ({retry_budget})",
+                    reference.display_name()
+                )
+            }
+        };
+        if let Some(sink) = retry_status_sink {
+            sink(inline_status);
+        } else {
+            self.warn_retry(warning);
         }
         sleep(delay).await;
         Ok(())
+    }
+
+    fn warn_retry(&self, warning: String) {
+        if let Some(sink) = &self.retry_warning_sink {
+            sink(warning);
+        } else {
+            warn!("{warning}");
+        }
     }
 
     async fn refresh_token(
@@ -648,6 +706,19 @@ impl RegistryClient {
 
     fn uses_cache_from(&self) -> bool {
         self.cache_from.is_some()
+    }
+}
+
+impl fmt::Debug for RegistryClient {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RegistryClient")
+            .field("plain_http", &self.plain_http)
+            .field("request_retry_limit", &self.request_retry_limit)
+            .field("cache_from", &self.cache_from)
+            .field("cache_only", &self.cache_only)
+            .field("retry_warning_sink", &self.retry_warning_sink.is_some())
+            .finish_non_exhaustive()
     }
 }
 
@@ -818,7 +889,7 @@ fn response_content_media_type(response: &Response) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex as StdMutex};
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -852,6 +923,8 @@ mod tests {
             }
         });
 
+        let warnings = Arc::new(StdMutex::new(Vec::new()));
+        let warning_sink = Arc::clone(&warnings);
         let client = RegistryClient::new(
             reqwest::Client::builder()
                 .https_only(false)
@@ -860,7 +933,13 @@ mod tests {
             Arc::new(AuthResolver::new(None).expect("auth resolver should build")),
             true,
             Some(DEFAULT_REQUEST_RETRIES),
-        );
+        )
+        .with_retry_warning_sink(Arc::new(move |warning| {
+            warning_sink
+                .lock()
+                .expect("warning sink should not be poisoned")
+                .push(warning);
+        }));
         let reference = ImageReference::parse(&format!("{address}/sample:latest"))
             .expect("reference should parse");
 
@@ -879,6 +958,16 @@ mod tests {
                 assert!(detail.contains("503"));
             }
             other => panic!("unexpected error: {other}"),
+        }
+
+        {
+            let warnings = warnings
+                .lock()
+                .expect("warning sink should not be poisoned");
+            assert_eq!(warnings.len(), DEFAULT_REQUEST_RETRIES as usize);
+            assert!(warnings[0].contains("registry request for"));
+            assert!(warnings[0].contains("returned 503 Service Unavailable"));
+            assert!(warnings[0].contains("(1/5)"));
         }
 
         server.await.expect("server task should finish");

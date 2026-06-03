@@ -259,26 +259,30 @@ pub(crate) async fn pull_references(
         .map(Platform::parse)
         .transpose()?
         .unwrap_or_else(Platform::host);
+    let ui_group = UiGroup::new(quiet, !request.no_animations);
     let credentials = read_credentials(request.auth.username, request.auth.password_stdin)?;
     let auth = Arc::new(AuthResolver::new_async(credentials).await?);
-    let client = Arc::new(RegistryClient::new_with_cache_from(
-        build_http_client_with_external_connect_timeout(
-            request.registry.plain_http
-                || request
-                    .cache
-                    .cache_from
-                    .as_ref()
-                    .is_some_and(|url| url.scheme() == "http"),
-            request.registry.insecure_skip_tls_verify,
-            request.registry.ca_file.as_deref(),
-            external_registry_connect_timeout,
-        )?,
-        auth,
-        request.registry.plain_http,
-        request.retry.request_retry_limit,
-        request.cache.cache_from,
-        request.cache.cache_only,
-    ));
+    let client = Arc::new(
+        RegistryClient::new_with_cache_from(
+            build_http_client_with_external_connect_timeout(
+                request.registry.plain_http
+                    || request
+                        .cache
+                        .cache_from
+                        .as_ref()
+                        .is_some_and(|url| url.scheme() == "http"),
+                request.registry.insecure_skip_tls_verify,
+                request.registry.ca_file.as_deref(),
+                external_registry_connect_timeout,
+            )?,
+            auth,
+            request.registry.plain_http,
+            request.retry.request_retry_limit,
+            request.cache.cache_from,
+            request.cache.cache_only,
+        )
+        .with_retry_warning_sink(ui_group.warning_sink()),
+    );
     let image_concurrency = request.image_concurrency.max(1);
     let pull_plan = plan_pull_references(
         &references,
@@ -308,7 +312,7 @@ pub(crate) async fn pull_references(
         layer_usage,
         daemon_layer_cache,
         options,
-        ui_group: UiGroup::new(quiet, !request.no_animations),
+        ui_group,
     };
 
     if image_concurrency <= 1 {
