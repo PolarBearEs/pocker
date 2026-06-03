@@ -859,6 +859,7 @@ impl Drop for TerminalEchoGuard {
     }
 }
 
+#[cfg(unix)]
 fn acquire_terminal_echo_guard(animated: bool) -> Option<Arc<TerminalEchoGuard>> {
     animated
         .then(TerminalEchoGuard::acquire)
