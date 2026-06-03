@@ -2,6 +2,8 @@ use std::collections::HashMap;
 #[cfg(target_os = "linux")]
 use std::fs;
 use std::io::IsTerminal;
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -67,6 +69,7 @@ enum UiGroupMode {
     Progress {
         animated: bool,
         multi: MultiProgress,
+        _echo_guard: Option<Arc<TerminalEchoGuard>>,
     },
     Plain,
 }
@@ -80,6 +83,7 @@ struct ProgressUiInner {
     layer_renders: Mutex<HashMap<String, LayerRender>>,
     aggregate: Mutex<AggregateProgress>,
     image_name: Mutex<String>,
+    _echo_guard: Option<Arc<TerminalEchoGuard>>,
 }
 
 struct LayerRender {
@@ -180,6 +184,7 @@ impl Ui {
                 layer_renders: Mutex::new(HashMap::new()),
                 aggregate: Mutex::new(AggregateProgress::default()),
                 image_name: Mutex::new(String::new()),
+                _echo_guard: TerminalEchoGuard::acquire().map(Arc::new),
             })),
         }
     }
@@ -472,7 +477,11 @@ impl UiGroup {
         ));
 
         Self {
-            mode: UiGroupMode::Progress { animated, multi },
+            mode: UiGroupMode::Progress {
+                animated,
+                multi,
+                _echo_guard: TerminalEchoGuard::acquire().map(Arc::new),
+            },
         }
     }
 
@@ -486,7 +495,11 @@ impl UiGroup {
                     prefix: Some(plain_prefix.into()),
                 },
             },
-            UiGroupMode::Progress { animated, multi } => {
+            UiGroupMode::Progress {
+                animated,
+                multi,
+                _echo_guard,
+            } => {
                 let image = multi.add(ProgressBar::new_spinner());
                 image.set_style(compose_image_style(*animated));
                 if *animated {
@@ -502,6 +515,7 @@ impl UiGroup {
                         layer_renders: Mutex::new(HashMap::new()),
                         aggregate: Mutex::new(AggregateProgress::default()),
                         image_name: Mutex::new(String::new()),
+                        _echo_guard: _echo_guard.clone(),
                     })),
                 }
             }
@@ -781,6 +795,56 @@ fn aggregate_status(aggregate: &AggregateProgress) -> String {
         "Pulling".to_string()
     } else {
         complete_status.unwrap_or("Pulling").to_string()
+    }
+}
+
+#[cfg(unix)]
+struct TerminalEchoGuard {
+    fd: libc::c_int,
+    original: libc::termios,
+}
+
+#[cfg(unix)]
+impl TerminalEchoGuard {
+    fn acquire() -> Option<Self> {
+        let stdin = std::io::stdin();
+        if !stdin.is_terminal() {
+            return None;
+        }
+
+        let fd = stdin.as_raw_fd();
+        // SAFETY: `tcgetattr` initializes this plain C struct before use.
+        let mut original = unsafe { std::mem::zeroed::<libc::termios>() };
+        // SAFETY: `original` is writable and `fd` is live stdin.
+        if unsafe { libc::tcgetattr(fd, &mut original) } != 0 {
+            return None;
+        }
+        let mut without_echo = original;
+        without_echo.c_lflag &= !libc::ECHO;
+        // TCSANOW preserves typed-ahead input for the shell after pocker exits.
+        // SAFETY: `without_echo` is derived from current settings.
+        if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &without_echo) } != 0 {
+            return None;
+        }
+        Some(Self { fd, original })
+    }
+}
+
+#[cfg(unix)]
+impl Drop for TerminalEchoGuard {
+    fn drop(&mut self) {
+        // SAFETY: `original` came from `tcgetattr` for this terminal.
+        let _ = unsafe { libc::tcsetattr(self.fd, libc::TCSANOW, &self.original) };
+    }
+}
+
+#[cfg(not(unix))]
+struct TerminalEchoGuard;
+
+#[cfg(not(unix))]
+impl TerminalEchoGuard {
+    fn acquire() -> Option<Self> {
+        None
     }
 }
 
@@ -1140,6 +1204,7 @@ mod tests {
                 layer_renders: Mutex::new(HashMap::new()),
                 aggregate: Mutex::new(AggregateProgress::default()),
                 image_name: Mutex::new("example:latest".to_string()),
+                _echo_guard: None,
             })),
         }
     }
