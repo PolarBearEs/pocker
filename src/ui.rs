@@ -189,7 +189,7 @@ impl Ui {
                 layer_renders: Mutex::new(HashMap::new()),
                 aggregate: Mutex::new(AggregateProgress::default()),
                 image_name: Mutex::new(String::new()),
-                _echo_guard: TerminalEchoGuard::acquire().map(Arc::new),
+                _echo_guard: acquire_terminal_echo_guard(animated),
             })),
         }
     }
@@ -487,7 +487,7 @@ impl UiGroup {
             mode: UiGroupMode::Progress {
                 animated,
                 multi,
-                _echo_guard: TerminalEchoGuard::acquire().map(Arc::new),
+                _echo_guard: acquire_terminal_echo_guard(animated),
             },
         }
     }
@@ -859,6 +859,13 @@ impl Drop for TerminalEchoGuard {
     }
 }
 
+fn acquire_terminal_echo_guard(animated: bool) -> Option<Arc<TerminalEchoGuard>> {
+    animated
+        .then(TerminalEchoGuard::acquire)
+        .flatten()
+        .map(Arc::new)
+}
+
 #[cfg(not(unix))]
 struct TerminalEchoGuard;
 
@@ -867,6 +874,11 @@ impl TerminalEchoGuard {
     fn acquire() -> Option<Self> {
         None
     }
+}
+
+#[cfg(not(unix))]
+fn acquire_terminal_echo_guard(_animated: bool) -> Option<Arc<TerminalEchoGuard>> {
+    None
 }
 
 fn should_render_progress() -> bool {
@@ -1016,8 +1028,8 @@ mod tests {
     use super::linux_process_is_foreground_tty_job_from_stat;
     use super::{
         AggregateLayer, AggregateLayerState, AggregateProgress, LayerRenderAdvance,
-        ProgressUiInner, Ui, UiMode, aggregate_render, compose_image_style,
-        plain_layer_download_message,
+        ProgressUiInner, Ui, UiMode, acquire_terminal_echo_guard, aggregate_render,
+        compose_image_style, plain_layer_download_message,
     };
     use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget};
 
@@ -1039,6 +1051,11 @@ mod tests {
             linux_process_is_foreground_tty_job_from_stat(stat),
             Some(false)
         );
+    }
+
+    #[test]
+    fn non_animated_progress_does_not_acquire_echo_guard() {
+        assert!(acquire_terminal_echo_guard(false).is_none());
     }
 
     #[test]
