@@ -942,6 +942,7 @@ dependencies = [
  "httparse",
  "httpdate",
  "indicatif",
+ "libc",
  "percent-encoding",
  "pocker-compose",
  "predicates",

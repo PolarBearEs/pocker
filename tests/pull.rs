@@ -1,5 +1,5 @@
 use std::net::SocketAddr;
-use std::process::Command as StdCommand;
+use std::process::{Command as StdCommand, Output, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -157,28 +157,34 @@ async fn concurrent_pocker_processes_share_layer_download() {
     let reference = format!("{}/library/test:latest", server.address());
     let bin = assert_cmd::cargo::cargo_bin("pocker");
 
-    let mut first = pocker_pull_command(&bin, cache_dir.path(), &reference)
+    let first = pocker_pull_command(&bin, cache_dir.path(), &reference)
         .spawn()
         .expect("first pocker process should start");
-    let mut second = pocker_pull_command(&bin, cache_dir.path(), &reference)
+    let second = pocker_pull_command(&bin, cache_dir.path(), &reference)
         .spawn()
         .expect("second pocker process should start");
 
-    let (first_status, second_status) = tokio::task::spawn_blocking(move || {
-        let first_status = first.wait().expect("first pocker process should exit");
-        let second_status = second.wait().expect("second pocker process should exit");
-        (first_status, second_status)
+    let (first_output, second_output) = tokio::task::spawn_blocking(move || {
+        let first_output = first
+            .wait_with_output()
+            .expect("first pocker process should exit");
+        let second_output = second
+            .wait_with_output()
+            .expect("second pocker process should exit");
+        (first_output, second_output)
     })
     .await
     .expect("pocker wait task should run");
 
     assert!(
-        first_status.success(),
-        "first pocker process should succeed"
+        first_output.status.success(),
+        "first pocker process should succeed\n{}",
+        process_output("first", &first_output)
     );
     assert!(
-        second_status.success(),
-        "second pocker process should succeed"
+        second_output.status.success(),
+        "second pocker process should succeed\n{}",
+        process_output("second", &second_output)
     );
 
     let layer_path = cache_dir
@@ -506,6 +512,8 @@ fn pocker_pull_command(
     command
         .arg("--cache-dir")
         .arg(cache_dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .args([
             "pull",
             "--plain-http",
@@ -518,6 +526,15 @@ fn pocker_pull_command(
         ])
         .arg(reference);
     command
+}
+
+fn process_output(name: &str, output: &Output) -> String {
+    format!(
+        "{name} status: {}\n{name} stdout:\n{}\n{name} stderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
 }
 
 async fn wait_for_layer_get(layer_gets: &AtomicUsize) {

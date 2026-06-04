@@ -48,7 +48,8 @@ pub(crate) async fn execute(cli: Cli) -> Result<()> {
                     || pull_args.common.output.quiet)
                 {
                     eprintln!(
-                        "warning: skipping build-only compose services without image: {}",
+                        "{} skipping build-only compose services without image: {}",
+                        ui::paint("warning:", ui::WARNING),
                         resolved.skipped_build_only.join(", ")
                     );
                 }
@@ -76,21 +77,28 @@ pub(crate) async fn execute(cli: Cli) -> Result<()> {
             );
             let credentials = read_credentials(args.auth.username, args.auth.password_stdin)?;
             let auth = Arc::new(AuthResolver::new_async(credentials).await?);
-            let client = Arc::new(RegistryClient::new(
-                build_http_client(
-                    args.registry.plain_http,
-                    args.registry.insecure_skip_tls_verify,
-                    args.registry.ca_file.as_deref(),
-                )?,
-                auth,
-                args.registry.plain_http,
-                retry_limit(
-                    args.retry.request_retries,
-                    args.retry.retry_forever,
-                    DEFAULT_REQUEST_RETRIES,
-                ),
-            ));
             let quiet = cli.global.quiet || args.quiet;
+            let client = Arc::new(
+                RegistryClient::new(
+                    build_http_client(
+                        args.registry.plain_http,
+                        args.registry.insecure_skip_tls_verify,
+                        args.registry.ca_file.as_deref(),
+                    )?,
+                    auth,
+                    args.registry.plain_http,
+                    retry_limit(
+                        args.retry.request_retries,
+                        args.retry.retry_forever,
+                        DEFAULT_REQUEST_RETRIES,
+                    ),
+                )
+                .with_retry_warning_sink(Arc::new(move |warning| {
+                    if !quiet {
+                        eprintln!("{} {warning}", ui::paint("warning:", ui::WARNING));
+                    }
+                })),
+            );
             if !quiet {
                 eprintln!(
                     "Serving pocker cache on {} ({})",

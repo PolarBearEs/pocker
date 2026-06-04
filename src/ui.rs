@@ -2,6 +2,8 @@ use std::collections::HashMap;
 #[cfg(target_os = "linux")]
 use std::fs;
 use std::io::IsTerminal;
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -12,6 +14,7 @@ use crate::units::format_units;
 
 pub(crate) const GREEN: Style = AnsiColor::Green.on_default();
 pub(crate) const YELLOW: Style = AnsiColor::Yellow.on_default();
+pub(crate) const WARNING: Style = AnsiColor::Yellow.on_default().bold();
 pub(crate) const CYAN: Style = AnsiColor::Cyan.on_default();
 pub(crate) const DIM: Style = Style::new().dimmed();
 
@@ -21,13 +24,16 @@ const PROGRESS_REFRESH_HZ: u8 = 12;
 // sub-second progress during long pulls.
 const AGGREGATE_RENDER_INTERVAL: Duration = Duration::from_millis(100);
 const DETAIL_RENDER_INTERVAL: Duration = Duration::from_millis(100);
-
 pub(crate) fn paint(value: &str, style: Style) -> String {
     if should_color_stderr() {
-        format!("{style}{value}{style:#}")
+        format!("{}{value}{}", style.render(), style.render_reset())
     } else {
         value.to_string()
     }
+}
+
+fn warning_message(message: &str) -> String {
+    format!("{} {message}", paint("warning:", WARNING))
 }
 
 #[derive(Clone)]
@@ -68,6 +74,7 @@ enum UiGroupMode {
     Progress {
         animated: bool,
         multi: MultiProgress,
+        _echo_guard: Option<Arc<TerminalEchoGuard>>,
     },
     Plain,
 }
@@ -81,6 +88,7 @@ struct ProgressUiInner {
     layer_renders: Mutex<HashMap<String, LayerRender>>,
     aggregate: Mutex<AggregateProgress>,
     image_name: Mutex<String>,
+    _echo_guard: Option<Arc<TerminalEchoGuard>>,
 }
 
 struct LayerRender {
@@ -112,7 +120,7 @@ struct AggregateLayer {
     status: Option<String>,
 }
 
-#[derive(Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 enum AggregateLayerState {
     #[default]
     Waiting,
@@ -123,6 +131,7 @@ enum AggregateLayerState {
 #[derive(Clone, PartialEq, Eq)]
 struct AggregateRender {
     strip: String,
+    strip_states: Vec<AggregateLayerState>,
     total_bytes: u64,
     position: u64,
     hide_bytes: bool,
@@ -180,6 +189,7 @@ impl Ui {
                 layer_renders: Mutex::new(HashMap::new()),
                 aggregate: Mutex::new(AggregateProgress::default()),
                 image_name: Mutex::new(String::new()),
+                _echo_guard: acquire_terminal_echo_guard(animated),
             })),
         }
     }
@@ -190,7 +200,7 @@ impl Ui {
                 inner.reset_for_image();
                 *inner.image_name.lock().expect("ui state poisoned") = image.to_string();
                 if inner.aggregate_layers {
-                    inner.image.set_style(compose_image_style());
+                    inner.image.set_style(compose_image_style(inner.animated));
                 }
                 inner.image.set_message(format!("{image} Pulling"));
             },
@@ -444,9 +454,11 @@ impl ProgressSink for Ui {
     }
 
     fn warn(&self, message: &str) {
-        let message = format!("warning: {message}");
+        let message = warning_message(message);
         match &self.mode {
-            UiMode::Progress(inner) => inner.image.println(message),
+            UiMode::Progress(inner) => {
+                inner.multi.suspend(|| eprintln!("{message}"));
+            }
             UiMode::Plain { .. } => self.plain_line(message),
             UiMode::Quiet => {}
         }
@@ -472,7 +484,11 @@ impl UiGroup {
         ));
 
         Self {
-            mode: UiGroupMode::Progress { animated, multi },
+            mode: UiGroupMode::Progress {
+                animated,
+                multi,
+                _echo_guard: acquire_terminal_echo_guard(animated),
+            },
         }
     }
 
@@ -486,9 +502,13 @@ impl UiGroup {
                     prefix: Some(plain_prefix.into()),
                 },
             },
-            UiGroupMode::Progress { animated, multi } => {
+            UiGroupMode::Progress {
+                animated,
+                multi,
+                _echo_guard,
+            } => {
                 let image = multi.add(ProgressBar::new_spinner());
-                image.set_style(compose_image_style());
+                image.set_style(compose_image_style(*animated));
                 if *animated {
                     image.enable_steady_tick(Duration::from_millis(100));
                 }
@@ -502,8 +522,23 @@ impl UiGroup {
                         layer_renders: Mutex::new(HashMap::new()),
                         aggregate: Mutex::new(AggregateProgress::default()),
                         image_name: Mutex::new(String::new()),
+                        _echo_guard: _echo_guard.clone(),
                     })),
                 }
+            }
+        }
+    }
+
+    pub(crate) fn warning_sink(&self) -> Arc<dyn Fn(String) + Send + Sync> {
+        match &self.mode {
+            UiGroupMode::Quiet => Arc::new(|_| {}),
+            UiGroupMode::Plain => Arc::new(|message| eprintln!("{}", warning_message(&message))),
+            UiGroupMode::Progress { multi, .. } => {
+                let multi = multi.clone();
+                Arc::new(move |message| {
+                    let message = warning_message(&message);
+                    multi.suspend(|| eprintln!("{message}"));
+                })
             }
         }
     }
@@ -679,8 +714,9 @@ impl ProgressUiInner {
         aggregate.last_rendered_at = Some(Instant::now());
         drop(aggregate);
 
-        self.image.set_style(compose_image_style());
+        self.image.set_style(compose_image_style(self.animated));
         let image = self.image_name.lock().expect("ui state poisoned").clone();
+        let strip = paint_aggregate_strip(&render.strip, &render.strip_states);
         let bytes = if render.total_bytes > 0 && !render.hide_bytes {
             format!(
                 " {} / {}",
@@ -696,14 +732,14 @@ impl ProgressUiInner {
         );
         self.image.set_message(format!(
             "{image} [{}]{layers}{bytes} {}",
-            paint(&render.strip, GREEN),
-            render.status
+            strip, render.status
         ));
     }
 }
 
 fn aggregate_render(aggregate: &AggregateProgress) -> AggregateRender {
     let mut strip = String::new();
+    let mut strip_states = Vec::new();
     let mut total_bytes = 0;
     let mut position = 0;
     let mut hide_bytes = false;
@@ -721,10 +757,12 @@ fn aggregate_render(aggregate: &AggregateProgress) -> AggregateRender {
             completed_layers += 1;
         }
         strip.push(layer_progress_char(layer));
+        strip_states.push(layer.state);
     }
 
     AggregateRender {
         strip,
+        strip_states,
         total_bytes,
         position,
         hide_bytes,
@@ -732,6 +770,20 @@ fn aggregate_render(aggregate: &AggregateProgress) -> AggregateRender {
         total_layers: aggregate.order.len(),
         status: aggregate_status(aggregate),
     }
+}
+
+fn paint_aggregate_strip(strip: &str, states: &[AggregateLayerState]) -> String {
+    strip
+        .chars()
+        .zip(states)
+        .map(|(cell, state)| {
+            let style = match state {
+                AggregateLayerState::Waiting => DIM,
+                AggregateLayerState::Downloading | AggregateLayerState::Complete => GREEN,
+            };
+            paint(&cell.to_string(), style)
+        })
+        .collect()
 }
 
 fn aggregate_status(aggregate: &AggregateProgress) -> String {
@@ -765,6 +817,62 @@ fn aggregate_status(aggregate: &AggregateProgress) -> String {
     } else {
         complete_status.unwrap_or("Pulling").to_string()
     }
+}
+
+#[cfg(unix)]
+struct TerminalEchoGuard {
+    fd: libc::c_int,
+    original: libc::termios,
+}
+
+#[cfg(unix)]
+impl TerminalEchoGuard {
+    fn acquire() -> Option<Self> {
+        let stdin = std::io::stdin();
+        if !stdin.is_terminal() {
+            return None;
+        }
+
+        let fd = stdin.as_raw_fd();
+        // SAFETY: `tcgetattr` initializes this plain C struct before use.
+        let mut original = unsafe { std::mem::zeroed::<libc::termios>() };
+        // SAFETY: `original` is writable and `fd` is live stdin.
+        if unsafe { libc::tcgetattr(fd, &mut original) } != 0 {
+            return None;
+        }
+        let mut without_echo = original;
+        without_echo.c_lflag &= !libc::ECHO;
+        // TCSANOW preserves typed-ahead input for the shell after pocker exits.
+        // SAFETY: `without_echo` is derived from current settings.
+        if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &without_echo) } != 0 {
+            return None;
+        }
+        Some(Self { fd, original })
+    }
+}
+
+#[cfg(unix)]
+impl Drop for TerminalEchoGuard {
+    fn drop(&mut self) {
+        // SAFETY: `original` came from `tcgetattr` for this terminal.
+        let _ = unsafe { libc::tcsetattr(self.fd, libc::TCSANOW, &self.original) };
+    }
+}
+
+#[cfg(unix)]
+fn acquire_terminal_echo_guard(animated: bool) -> Option<Arc<TerminalEchoGuard>> {
+    animated
+        .then(TerminalEchoGuard::acquire)
+        .flatten()
+        .map(Arc::new)
+}
+
+#[cfg(not(unix))]
+struct TerminalEchoGuard;
+
+#[cfg(not(unix))]
+fn acquire_terminal_echo_guard(_animated: bool) -> Option<Arc<TerminalEchoGuard>> {
+    None
 }
 
 fn should_render_progress() -> bool {
@@ -862,14 +970,20 @@ fn layer_download_style() -> ProgressStyle {
     .progress_chars("=> ")
 }
 
-fn compose_image_style() -> ProgressStyle {
-    ProgressStyle::with_template("{msg}").expect("valid compose image template")
+fn compose_image_style(animated: bool) -> ProgressStyle {
+    if animated {
+        ProgressStyle::with_template("{spinner:.cyan} {msg}")
+            .expect("valid compose image template")
+            .tick_strings(&["-", "\\", "|", "/"])
+    } else {
+        ProgressStyle::with_template("{msg}").expect("valid compose image template")
+    }
 }
 
 fn layer_progress_char(layer: &AggregateLayer) -> char {
     const PERCENT_CHARS: [char; 9] = ['⠀', '⡀', '⣀', '⣄', '⣤', '⣦', '⣶', '⣷', '⣿'];
     if layer.state == AggregateLayerState::Waiting {
-        return '⠂';
+        return ' ';
     }
     if layer.state == AggregateLayerState::Complete {
         return PERCENT_CHARS[PERCENT_CHARS.len() - 1];
@@ -908,8 +1022,8 @@ mod tests {
     use super::linux_process_is_foreground_tty_job_from_stat;
     use super::{
         AggregateLayer, AggregateLayerState, AggregateProgress, LayerRenderAdvance,
-        ProgressUiInner, Ui, UiMode, aggregate_render, compose_image_style,
-        plain_layer_download_message,
+        ProgressUiInner, Ui, UiMode, acquire_terminal_echo_guard, aggregate_render,
+        compose_image_style, plain_layer_download_message,
     };
     use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget};
 
@@ -931,6 +1045,11 @@ mod tests {
             linux_process_is_foreground_tty_job_from_stat(stat),
             Some(false)
         );
+    }
+
+    #[test]
+    fn non_animated_progress_does_not_acquire_echo_guard() {
+        assert!(acquire_terminal_echo_guard(false).is_none());
     }
 
     #[test]
@@ -1029,7 +1148,8 @@ mod tests {
 
         let render = aggregate_render(&aggregate);
 
-        assert_eq!(render.strip, "⠂");
+        assert_eq!(render.strip, " ");
+        assert_eq!(render.strip_states, vec![AggregateLayerState::Waiting]);
         assert_eq!(render.status, "Waiting for another pocker process");
     }
 
@@ -1105,7 +1225,7 @@ mod tests {
     fn aggregate_test_ui() -> Ui {
         let multi = MultiProgress::with_draw_target(ProgressDrawTarget::hidden());
         let image = multi.add(ProgressBar::new_spinner());
-        image.set_style(compose_image_style());
+        image.set_style(compose_image_style(false));
         Ui {
             mode: UiMode::Progress(Arc::new(ProgressUiInner {
                 animated: false,
@@ -1116,6 +1236,7 @@ mod tests {
                 layer_renders: Mutex::new(HashMap::new()),
                 aggregate: Mutex::new(AggregateProgress::default()),
                 image_name: Mutex::new("example:latest".to_string()),
+                _echo_guard: None,
             })),
         }
     }
