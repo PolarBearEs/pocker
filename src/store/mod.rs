@@ -39,7 +39,7 @@ pub struct MaintenanceStore {
     store: Store,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredReference {
     pub reference: String,
     pub manifest: Descriptor,
@@ -457,7 +457,7 @@ impl Store {
     pub async fn save_reference(&self, record: &StoredReference) -> Result<()> {
         let path = self.reference_path(&record.reference);
         let record = record.clone();
-        tokio::task::spawn_blocking(move || atomic_write_json(&path, &record))
+        tokio::task::spawn_blocking(move || save_reference_blocking(&path, &record))
             .await
             .map_err(|e| {
                 DockerPullError::InvalidInput(format!("reference save task panicked: {e}"))
@@ -837,6 +837,28 @@ fn is_concurrent_blob_save_race(error: &DockerPullError) -> bool {
             // Windows can report PermissionDenied when an atomic persist races
             // with another writer. Callers still verify the final blob before
             // treating this as success, so genuine permission failures surface.
+            if matches!(error.kind(), ErrorKind::AlreadyExists | ErrorKind::PermissionDenied)
+    )
+}
+
+fn save_reference_blocking(path: &Path, record: &StoredReference) -> Result<()> {
+    match atomic_write_json(path, record) {
+        Ok(()) => Ok(()),
+        Err(error) if is_concurrent_reference_save_race(&error) => {
+            if read_json_if_exists::<StoredReference>(path)?.as_ref() == Some(record) {
+                Ok(())
+            } else {
+                Err(error)
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn is_concurrent_reference_save_race(error: &DockerPullError) -> bool {
+    matches!(
+        error,
+        DockerPullError::Io(error)
             if matches!(error.kind(), ErrorKind::AlreadyExists | ErrorKind::PermissionDenied)
     )
 }
@@ -1918,6 +1940,36 @@ mod tests {
 
         assert_eq!(loaded.reference, record.reference);
         assert_eq!(loaded.manifest.digest, record.manifest.digest);
+    }
+
+    #[tokio::test]
+    async fn save_reference_metadata_is_idempotent() {
+        let dir = tempdir().expect("tempdir should create");
+        let store = Store::open(dir.path().to_path_buf())
+            .await
+            .expect("store should open");
+        let record = StoredReference {
+            reference: "registry-1.docker.io/library/alpine:latest".into(),
+            manifest: Descriptor {
+                media_type: "application/vnd.oci.image.manifest.v1+json".into(),
+                digest: "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+                    .into(),
+                size: 2,
+                platform: None,
+                annotations: None,
+            },
+            config_digest:
+                "sha256:2222222222222222222222222222222222222222222222222222222222222222".into(),
+        };
+
+        store
+            .save_reference(&record)
+            .await
+            .expect("first reference metadata save should succeed");
+        store
+            .save_reference(&record)
+            .await
+            .expect("second equivalent reference metadata save should succeed");
     }
 
     #[tokio::test]

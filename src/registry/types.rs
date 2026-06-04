@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::{DockerPullError, Result};
 use crate::platform::Platform;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Descriptor {
     #[serde(rename = "mediaType", default)]
     pub media_type: String,
