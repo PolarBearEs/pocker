@@ -871,13 +871,6 @@ fn acquire_terminal_echo_guard(animated: bool) -> Option<Arc<TerminalEchoGuard>>
 struct TerminalEchoGuard;
 
 #[cfg(not(unix))]
-impl TerminalEchoGuard {
-    fn acquire() -> Option<Self> {
-        None
-    }
-}
-
-#[cfg(not(unix))]
 fn acquire_terminal_echo_guard(_animated: bool) -> Option<Arc<TerminalEchoGuard>> {
     None
 }
