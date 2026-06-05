@@ -1,5 +1,6 @@
 use crate::error::DockerPullError;
-use std::time::Duration;
+use std::future::Future;
+use std::time::{Duration, Instant};
 
 // Keep retry timing predictable for interactive pulls on unreliable links,
 // while adding a small spread so concurrent layers do not retry in lockstep.
@@ -7,6 +8,7 @@ const MIN_RETRY_DELAY: Duration = Duration::from_secs(1);
 const INITIAL_RETRY_DELAY: Duration = Duration::from_secs(1);
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
 const RETRY_JITTER: Duration = Duration::from_millis(250);
+pub(crate) const RETRY_COUNTDOWN_INTERVAL: Duration = Duration::from_secs(1);
 
 pub(crate) fn retry_limit_exhausted(retries: u32, retry_limit: Option<u32>) -> bool {
     retry_limit.is_some_and(|limit| retries >= limit)
@@ -69,13 +71,45 @@ pub(crate) fn format_retry_delay(delay: Duration) -> String {
     format!("{seconds}s")
 }
 
+pub(crate) async fn countdown_sleep<SleepFn, SleepFuture, OnTick>(
+    delay: Duration,
+    mut sleep_for: SleepFn,
+    mut on_tick: OnTick,
+) -> Result<(), DockerPullError>
+where
+    SleepFn: FnMut(Duration) -> SleepFuture,
+    SleepFuture: Future<Output = Result<(), DockerPullError>>,
+    OnTick: FnMut(Duration),
+{
+    let started = Instant::now();
+    let mut last_status = None;
+    loop {
+        let elapsed = started.elapsed();
+        if elapsed >= delay {
+            return Ok(());
+        }
+        let remaining = delay.saturating_sub(elapsed);
+        sleep_for(remaining.min(RETRY_COUNTDOWN_INTERVAL)).await?;
+
+        let remaining = delay.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return Ok(());
+        }
+        let status = format_retry_delay(remaining);
+        if last_status.as_deref() != Some(status.as_str()) {
+            on_tick(remaining);
+            last_status = Some(status);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
 
     use super::{
-        MAX_RETRY_DELAY, MIN_RETRY_DELAY, RETRY_JITTER, format_retry_delay, jittered_backoff_delay,
-        record_retry_attempt,
+        MAX_RETRY_DELAY, MIN_RETRY_DELAY, RETRY_JITTER, countdown_sleep, format_retry_delay,
+        jittered_backoff_delay, record_retry_attempt,
     };
     use crate::error::DockerPullError;
 
@@ -125,6 +159,24 @@ mod tests {
         assert_eq!(format_retry_delay(Duration::from_millis(750)), "0s");
         assert_eq!(format_retry_delay(Duration::from_secs(3)), "3s");
         assert_eq!(format_retry_delay(Duration::from_millis(3200)), "3s");
+    }
+
+    #[tokio::test]
+    async fn countdown_sleep_does_not_emit_zero_remaining_tick() {
+        let mut ticks = Vec::new();
+
+        countdown_sleep(
+            Duration::from_millis(1),
+            |delay| async move {
+                tokio::time::sleep(delay).await;
+                Ok(())
+            },
+            |remaining| ticks.push(format_retry_delay(remaining)),
+        )
+        .await
+        .expect("countdown sleep should complete");
+
+        assert!(ticks.is_empty());
     }
 
     #[test]

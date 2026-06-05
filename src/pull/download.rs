@@ -12,7 +12,9 @@ use crate::error::{DockerPullError, Result};
 use crate::pull::PullContext;
 use crate::reference::ImageReference;
 use crate::registry::Descriptor;
-use crate::retry::{format_retry_delay, jittered_backoff_delay, record_retry_attempt};
+use crate::retry::{
+    countdown_sleep, format_retry_delay, jittered_backoff_delay, record_retry_attempt,
+};
 use crate::store::DownloadPlan;
 
 // Persist partial-download progress often enough that cancellation or flaky
@@ -21,7 +23,6 @@ const CHECKPOINT_BYTES: u64 = 8 * 1024 * 1024;
 // Time-based checkpointing protects very slow links that may take a long time
 // to reach the byte threshold while still making legitimate progress.
 const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(2);
-const RETRY_COUNTDOWN_INTERVAL: Duration = Duration::from_secs(1);
 
 pub async fn download_blob(
     context: &PullContext,
@@ -233,27 +234,20 @@ async fn sleep_or_interrupt(
     retry_budget: &str,
     delay: Duration,
 ) -> Result<()> {
-    let started = Instant::now();
-    let mut last_status = None;
-    loop {
-        let elapsed = started.elapsed();
-        if elapsed >= delay {
-            return Ok(());
-        }
-        let remaining = delay.saturating_sub(elapsed);
-        let sleep_for = remaining.min(RETRY_COUNTDOWN_INTERVAL);
-        sleep_or_interrupt_on_token(&context.stop, sleep_for).await?;
-
-        let remaining = delay.saturating_sub(started.elapsed());
-        let status = format!(
-            "Retrying in {} ({retry_budget})",
-            format_retry_delay(remaining)
-        );
-        if last_status.as_deref() != Some(status.as_str()) {
-            context.ui.set_layer_status(digest, &status);
-            last_status = Some(status);
-        }
-    }
+    countdown_sleep(
+        delay,
+        |sleep_for| sleep_or_interrupt_on_token(&context.stop, sleep_for),
+        |remaining| {
+            context.ui.set_layer_status(
+                digest,
+                &format!(
+                    "Retrying in {} ({retry_budget})",
+                    format_retry_delay(remaining)
+                ),
+            );
+        },
+    )
+    .await
 }
 
 async fn sleep_or_interrupt_on_token(

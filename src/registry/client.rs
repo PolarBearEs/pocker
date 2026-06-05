@@ -25,7 +25,9 @@ use crate::digest::canonical_digest_bytes;
 use crate::error::{DockerPullError, Result};
 use crate::platform::Platform;
 use crate::reference::ImageReference;
-use crate::retry::{format_retry_delay, jittered_backoff_delay, record_retry_attempt};
+use crate::retry::{
+    countdown_sleep, format_retry_delay, jittered_backoff_delay, record_retry_attempt,
+};
 
 // Metadata requests are small and should fail fast enough to surface bad
 // registries, while still tolerating transient DNS/TLS/5xx failures.
@@ -881,26 +883,17 @@ fn inline_retry_status(reason: RetryReason, delay: Duration, retry_budget: &str)
     }
 }
 
-async fn retry_countdown_sleep(delay: Duration, mut on_tick: impl FnMut(Duration)) {
-    const COUNTDOWN_INTERVAL: Duration = Duration::from_secs(1);
-
-    let started = std::time::Instant::now();
-    let mut last_status = None;
-    loop {
-        let elapsed = started.elapsed();
-        if elapsed >= delay {
-            return;
-        }
-        let remaining = delay.saturating_sub(elapsed);
-        sleep(remaining.min(COUNTDOWN_INTERVAL)).await;
-
-        let remaining = delay.saturating_sub(started.elapsed());
-        let status = format_retry_delay(remaining);
-        if last_status.as_deref() != Some(status.as_str()) {
-            on_tick(remaining);
-            last_status = Some(status);
-        }
-    }
+async fn retry_countdown_sleep(delay: Duration, on_tick: impl FnMut(Duration)) {
+    countdown_sleep(
+        delay,
+        |sleep_for| async move {
+            sleep(sleep_for).await;
+            Ok(())
+        },
+        on_tick,
+    )
+    .await
+    .expect("registry retry countdown sleep should not fail");
 }
 
 fn retry_after_delay(value: Option<&HeaderValue>) -> Option<Duration> {
