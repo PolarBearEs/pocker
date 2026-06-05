@@ -292,7 +292,6 @@ impl Ui {
                 let Some(bar) = inner.layer_bar(digest) else {
                     return;
                 };
-                bar.disable_steady_tick();
                 bar.set_style(layer_download_style());
                 bar.set_length(total_bytes);
                 bar.set_position(starting_offset);
@@ -347,11 +346,7 @@ impl Ui {
                     return;
                 };
                 if let Some(position) = inner.flush_layer_render(digest) {
-                    bar.disable_steady_tick();
-                    bar.set_style(layer_retry_download_style());
                     bar.set_position(position);
-                    bar.set_message(format!("{} {status}", short_digest(digest)));
-                    return;
                 }
                 bar.set_style(layer_status_style(inner.animated));
                 if inner.animated {
@@ -975,12 +970,6 @@ fn layer_download_style() -> ProgressStyle {
     .progress_chars("=> ")
 }
 
-fn layer_retry_download_style() -> ProgressStyle {
-    ProgressStyle::with_template(" {msg} [{bar:24.cyan/blue}] {bytes}/{total_bytes}")
-        .expect("valid layer retry download template")
-        .progress_chars("=> ")
-}
-
 fn compose_image_style(animated: bool) -> ProgressStyle {
     if animated {
         ProgressStyle::with_template("{spinner:.cyan} {msg}")
@@ -1231,18 +1220,6 @@ mod tests {
         assert_eq!(render, Some(10));
         assert_eq!(inner.flush_layer_render("sha256:first"), Some(10));
         assert_eq!(inner.finish_layer_render("sha256:first"), Some(100));
-    }
-
-    #[test]
-    fn retry_status_preserves_detailed_layer_progress_state() {
-        let ui = aggregate_test_ui();
-        ui.prepare_layers(&["sha256:first".to_string()]);
-        ui.start_layer_download("sha256:first", 100, 20);
-
-        ui.set_layer_status("sha256:first", "Retrying in 3s (1/8)");
-
-        let inner = ui.progress().expect("test ui should be progress");
-        assert_eq!(inner.flush_layer_render("sha256:first"), Some(20));
     }
 
     fn aggregate_test_ui() -> Ui {

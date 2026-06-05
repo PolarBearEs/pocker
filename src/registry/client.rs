@@ -657,14 +657,10 @@ impl RegistryClient {
         };
         if let Some(sink) = retry_status_sink {
             sink(inline_status);
-            retry_countdown_sleep(delay, |remaining| {
-                sink(inline_retry_status(reason, remaining, &retry_budget));
-            })
-            .await;
         } else {
             self.warn_retry(warning);
-            sleep(delay).await;
         }
+        sleep(delay).await;
         Ok(())
     }
 
@@ -877,30 +873,6 @@ fn inline_retry_status(reason: RetryReason, delay: Duration, retry_budget: &str)
                 "Retrying after {status} in {} ({retry_budget})",
                 format_retry_delay(delay)
             )
-        }
-    }
-}
-
-async fn retry_countdown_sleep(delay: Duration, mut on_tick: impl FnMut(Duration)) {
-    const COUNTDOWN_INTERVAL: Duration = Duration::from_secs(1);
-    const COUNTDOWN_THRESHOLD: Duration = Duration::from_secs(3);
-
-    if delay < COUNTDOWN_THRESHOLD {
-        sleep(delay).await;
-        return;
-    }
-
-    let started = std::time::Instant::now();
-    loop {
-        let elapsed = started.elapsed();
-        if elapsed >= delay {
-            return;
-        }
-        let remaining = delay.saturating_sub(elapsed);
-        sleep(remaining.min(COUNTDOWN_INTERVAL)).await;
-        let remaining = delay.saturating_sub(started.elapsed());
-        if !remaining.is_zero() {
-            on_tick(remaining);
         }
     }
 }
