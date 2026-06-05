@@ -65,7 +65,7 @@ fn exponential_delay(attempt: u32) -> Duration {
 }
 
 pub(crate) fn format_retry_delay(delay: Duration) -> String {
-    let seconds = delay.as_millis().saturating_add(999) / 1_000;
+    let seconds = delay.as_secs();
     format!("{seconds}s")
 }
 
@@ -122,9 +122,9 @@ mod tests {
     #[test]
     fn retry_delay_format_uses_whole_seconds() {
         assert_eq!(format_retry_delay(Duration::ZERO), "0s");
-        assert_eq!(format_retry_delay(Duration::from_millis(750)), "1s");
+        assert_eq!(format_retry_delay(Duration::from_millis(750)), "0s");
         assert_eq!(format_retry_delay(Duration::from_secs(3)), "3s");
-        assert_eq!(format_retry_delay(Duration::from_millis(3200)), "4s");
+        assert_eq!(format_retry_delay(Duration::from_millis(3200)), "3s");
     }
 
     #[test]
