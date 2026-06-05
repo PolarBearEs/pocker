@@ -22,7 +22,6 @@ const CHECKPOINT_BYTES: u64 = 8 * 1024 * 1024;
 // to reach the byte threshold while still making legitimate progress.
 const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(2);
 const RETRY_COUNTDOWN_INTERVAL: Duration = Duration::from_secs(1);
-const RETRY_COUNTDOWN_THRESHOLD: Duration = Duration::from_secs(3);
 
 pub async fn download_blob(
     context: &PullContext,
@@ -234,10 +233,6 @@ async fn sleep_or_interrupt(
     retry_budget: &str,
     delay: Duration,
 ) -> Result<()> {
-    if delay < RETRY_COUNTDOWN_THRESHOLD {
-        return sleep_or_interrupt_on_token(&context.stop, delay).await;
-    }
-
     let started = Instant::now();
     let mut last_status = None;
     loop {

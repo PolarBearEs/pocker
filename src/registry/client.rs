@@ -883,12 +883,6 @@ fn inline_retry_status(reason: RetryReason, delay: Duration, retry_budget: &str)
 
 async fn retry_countdown_sleep(delay: Duration, mut on_tick: impl FnMut(Duration)) {
     const COUNTDOWN_INTERVAL: Duration = Duration::from_secs(1);
-    const COUNTDOWN_THRESHOLD: Duration = Duration::from_secs(3);
-
-    if delay < COUNTDOWN_THRESHOLD {
-        sleep(delay).await;
-        return;
-    }
 
     let started = std::time::Instant::now();
     let mut last_status = None;
