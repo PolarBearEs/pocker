@@ -12,7 +12,9 @@ use crate::error::{DockerPullError, Result};
 use crate::pull::PullContext;
 use crate::reference::ImageReference;
 use crate::registry::Descriptor;
-use crate::retry::{jittered_backoff_delay, record_retry_attempt};
+use crate::retry::{
+    countdown_sleep, format_retry_delay, jittered_backoff_delay, record_retry_attempt,
+};
 use crate::store::DownloadPlan;
 
 // Persist partial-download progress often enough that cancellation or flaky
@@ -84,13 +86,14 @@ pub async fn download_blob(
         let status = response.status();
         if status == StatusCode::OK && progress.offset > 0 {
             let delay = jittered_backoff_delay(retries);
-            retries = register_retry(
+            let retry_budget = register_retry(
                 context,
                 &descriptor.digest,
                 retries,
                 "registry ignored ranged resume",
                 delay,
             )?;
+            retries = retry_budget.retries;
             warn!(
                 "registry ignored range request for {}, restarting blob",
                 descriptor.digest
@@ -103,24 +106,25 @@ pub async fn download_blob(
                 &mut progress,
             )
             .await?;
-            sleep_or_interrupt(context, delay).await?;
+            sleep_or_interrupt(context, &descriptor.digest, &retry_budget.budget, delay).await?;
             continue;
         }
         if status == StatusCode::RANGE_NOT_SATISFIABLE {
             let delay = jittered_backoff_delay(retries);
-            retries = register_retry(
+            let retry_budget = register_retry(
                 context,
                 &descriptor.digest,
                 retries,
                 "registry rejected the resumable range",
                 delay,
             )?;
+            retries = retry_budget.retries;
             context
                 .store
                 .reset_partial(&descriptor.digest, expected_size)
                 .await?;
             progress.reset(context, &descriptor.digest, expected_size);
-            sleep_or_interrupt(context, delay).await?;
+            sleep_or_interrupt(context, &descriptor.digest, &retry_budget.budget, delay).await?;
             continue;
         }
         validate_blob_response_status(
@@ -165,13 +169,14 @@ pub async fn download_blob(
                 }
                 Err(error) => {
                     let delay = jittered_backoff_delay(retries);
-                    retries = register_retry(
+                    let retry_budget = register_retry(
                         context,
                         &descriptor.digest,
                         retries,
                         format!("download interrupted: {error}"),
                         delay,
                     )?;
+                    retries = retry_budget.retries;
                     warn!("stream error for {}: {}", descriptor.digest, error);
                     file.flush().await?;
                     file.sync_data().await?;
@@ -179,7 +184,8 @@ pub async fn download_blob(
                         .store
                         .checkpoint_download(&descriptor.digest, progress.offset, expected_size)
                         .await?;
-                    sleep_or_interrupt(context, delay).await?;
+                    sleep_or_interrupt(context, &descriptor.digest, &retry_budget.budget, delay)
+                        .await?;
                     stream_failed = true;
                     break;
                 }
@@ -197,12 +203,13 @@ pub async fn download_blob(
             .await?;
         if let Some(detail) = premature_eof_detail(progress.offset, expected_size) {
             let delay = jittered_backoff_delay(retries);
-            retries = register_retry(context, &descriptor.digest, retries, detail, delay)?;
+            let retry_budget = register_retry(context, &descriptor.digest, retries, detail, delay)?;
+            retries = retry_budget.retries;
             warn!(
                 "stream ended early for {} at byte {} of {}",
                 descriptor.digest, progress.offset, expected_size
             );
-            sleep_or_interrupt(context, delay).await?;
+            sleep_or_interrupt(context, &descriptor.digest, &retry_budget.budget, delay).await?;
         }
     }
 
@@ -221,8 +228,26 @@ pub async fn download_blob(
     Ok(())
 }
 
-async fn sleep_or_interrupt(context: &PullContext, delay: Duration) -> Result<()> {
-    sleep_or_interrupt_on_token(&context.stop, delay).await
+async fn sleep_or_interrupt(
+    context: &PullContext,
+    digest: &str,
+    retry_budget: &str,
+    delay: Duration,
+) -> Result<()> {
+    countdown_sleep(
+        delay,
+        |sleep_for| sleep_or_interrupt_on_token(&context.stop, sleep_for),
+        |remaining| {
+            context.ui.set_layer_status(
+                digest,
+                &format!(
+                    "Retrying in {} ({retry_budget})",
+                    format_retry_delay(remaining)
+                ),
+            );
+        },
+    )
+    .await
 }
 
 async fn sleep_or_interrupt_on_token(
@@ -355,13 +380,18 @@ async fn reset_download_state(
     Ok(())
 }
 
+struct RegisteredRetry {
+    retries: u32,
+    budget: String,
+}
+
 fn register_retry(
     context: &PullContext,
     digest: &str,
     retries: u32,
     detail: impl Into<String>,
     delay: Duration,
-) -> Result<u32> {
+) -> Result<RegisteredRetry> {
     let mut retries = retries;
     let retry_budget = record_retry_attempt(
         &mut retries,
@@ -369,10 +399,14 @@ fn register_retry(
         format!("blob download {digest}"),
         detail.into(),
     )?;
-    context
-        .ui
-        .set_layer_status(digest, &format!("Retrying in {delay:?} ({retry_budget})"));
-    Ok(retries)
+    context.ui.set_layer_status(
+        digest,
+        &format!("Retrying in {} ({retry_budget})", format_retry_delay(delay)),
+    );
+    Ok(RegisteredRetry {
+        retries,
+        budget: retry_budget,
+    })
 }
 
 #[cfg(test)]

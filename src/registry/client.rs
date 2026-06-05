@@ -25,7 +25,9 @@ use crate::digest::canonical_digest_bytes;
 use crate::error::{DockerPullError, Result};
 use crate::platform::Platform;
 use crate::reference::ImageReference;
-use crate::retry::{jittered_backoff_delay, record_retry_attempt};
+use crate::retry::{
+    countdown_sleep, format_retry_delay, jittered_backoff_delay, record_retry_attempt,
+};
 
 // Metadata requests are small and should fail fast enough to surface bad
 // registries, while still tolerating transient DNS/TLS/5xx failures.
@@ -33,6 +35,10 @@ pub const DEFAULT_REQUEST_RETRIES: u32 = 5;
 // Auth retries are intentionally tighter than network retries so bad or stale
 // credentials do not spin indefinitely.
 const MAX_AUTH_RETRIES: u32 = 2;
+// Server-directed throttling can legitimately exceed normal backoff, but keep
+// it bounded so a stale or hostile Retry-After header cannot stall the CLI for
+// hours, especially when retrying forever.
+const MAX_RETRY_AFTER_DELAY: Duration = Duration::from_secs(5 * 60);
 const DOCKER_CONTENT_DIGEST: HeaderName = HeaderName::from_static("docker-content-digest");
 
 type RetryWarningSink = Arc<dyn Fn(String) + Send + Sync>;
@@ -636,32 +642,31 @@ impl RegistryClient {
             "registry request",
             detail,
         )?;
-        let inline_status = match reason {
-            RetryReason::SendError => {
-                format!("Retrying request in {delay:?} ({retry_budget})")
-            }
-            RetryReason::Status(status) => {
-                format!("Retrying after {status} in {delay:?} ({retry_budget})")
-            }
-        };
+        let inline_status = inline_retry_status(reason, delay, &retry_budget);
         let warning = match reason {
             RetryReason::SendError => format!(
-                "registry request for {} failed before response; retrying in {delay:?} ({retry_budget})",
-                reference.display_name()
+                "registry request for {} failed before response; retrying in {} ({retry_budget})",
+                reference.display_name(),
+                format_retry_delay(delay)
             ),
             RetryReason::Status(status) => {
                 format!(
-                    "registry request for {} returned {status}; retrying in {delay:?} ({retry_budget})",
-                    reference.display_name()
+                    "registry request for {} returned {status}; retrying in {} ({retry_budget})",
+                    reference.display_name(),
+                    format_retry_delay(delay)
                 )
             }
         };
         if let Some(sink) = retry_status_sink {
             sink(inline_status);
+            retry_countdown_sleep(delay, |remaining| {
+                sink(inline_retry_status(reason, remaining, &retry_budget));
+            })
+            .await;
         } else {
             self.warn_retry(warning);
+            sleep(delay).await;
         }
-        sleep(delay).await;
         Ok(())
     }
 
@@ -861,13 +866,46 @@ fn is_retryable_http_error(error: &reqwest::Error) -> bool {
     error.is_timeout() || error.is_connect() || error.is_request() || error.is_body()
 }
 
+fn inline_retry_status(reason: RetryReason, delay: Duration, retry_budget: &str) -> String {
+    match reason {
+        RetryReason::SendError => {
+            format!(
+                "Retrying request in {} ({retry_budget})",
+                format_retry_delay(delay)
+            )
+        }
+        RetryReason::Status(status) => {
+            format!(
+                "Retrying after {status} in {} ({retry_budget})",
+                format_retry_delay(delay)
+            )
+        }
+    }
+}
+
+async fn retry_countdown_sleep(delay: Duration, on_tick: impl FnMut(Duration)) {
+    countdown_sleep(
+        delay,
+        |sleep_for| async move {
+            sleep(sleep_for).await;
+            Ok(())
+        },
+        on_tick,
+    )
+    .await
+    .expect("registry retry countdown sleep should not fail");
+}
+
 fn retry_after_delay(value: Option<&HeaderValue>) -> Option<Duration> {
     let raw = value?.to_str().ok()?;
     if let Ok(seconds) = raw.parse::<u64>() {
-        return Some(Duration::from_secs(seconds));
+        return Some(Duration::from_secs(seconds).min(MAX_RETRY_AFTER_DELAY));
     }
     let retry_at = httpdate::parse_http_date(raw).ok()?;
-    retry_at.duration_since(std::time::SystemTime::now()).ok()
+    retry_at
+        .duration_since(std::time::SystemTime::now())
+        .ok()
+        .map(|delay| delay.min(MAX_RETRY_AFTER_DELAY))
 }
 
 fn header_string(response: &Response, name: &HeaderName) -> Result<Option<String>> {
@@ -890,17 +928,49 @@ fn response_content_media_type(response: &Response) -> String {
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex as StdMutex};
+    use std::time::{Duration, SystemTime};
 
+    use reqwest::header::HeaderValue;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
     use url::Url;
 
     use super::super::cache::{cache_repository, decode_cache_repository, resource_url};
-    use super::{DEFAULT_REQUEST_RETRIES, RegistryClient, parse_www_authenticate, token_cache_key};
+    use super::{
+        DEFAULT_REQUEST_RETRIES, MAX_RETRY_AFTER_DELAY, RegistryClient, parse_www_authenticate,
+        retry_after_delay, token_cache_key,
+    };
     use crate::auth::AuthResolver;
     use crate::error::DockerPullError;
     use crate::platform::Platform;
     use crate::reference::ImageReference;
+
+    #[test]
+    fn retry_after_delay_caps_numeric_seconds() {
+        let value = HeaderValue::from_static("999999");
+
+        assert_eq!(retry_after_delay(Some(&value)), Some(MAX_RETRY_AFTER_DELAY));
+    }
+
+    #[test]
+    fn retry_after_delay_caps_http_date() {
+        let value = HeaderValue::from_str(&httpdate::fmt_http_date(
+            SystemTime::now() + MAX_RETRY_AFTER_DELAY + Duration::from_secs(60),
+        ))
+        .expect("http date should be valid header value");
+
+        assert_eq!(retry_after_delay(Some(&value)), Some(MAX_RETRY_AFTER_DELAY));
+    }
+
+    #[test]
+    fn retry_after_delay_keeps_short_numeric_seconds() {
+        let value = HeaderValue::from_static("7");
+
+        assert_eq!(
+            retry_after_delay(Some(&value)),
+            Some(Duration::from_secs(7))
+        );
+    }
 
     #[tokio::test]
     async fn resolve_image_stops_after_retry_budget_exhaustion() {
