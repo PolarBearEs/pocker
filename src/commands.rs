@@ -87,11 +87,7 @@ pub(crate) async fn execute(cli: Cli) -> Result<()> {
                     )?,
                     auth,
                     args.registry.plain_http,
-                    retry_limit(
-                        args.retry.request_retries,
-                        args.retry.retry_forever,
-                        DEFAULT_REQUEST_RETRIES,
-                    ),
+                    retry_limit(args.retry.request_retries, DEFAULT_REQUEST_RETRIES),
                 )
                 .with_retry_warning_sink(Arc::new(move |warning| {
                     if !quiet {
@@ -120,11 +116,7 @@ pub(crate) async fn execute(cli: Cli) -> Result<()> {
                 store,
                 registry: client,
                 pull_missing: args.pull_missing,
-                blob_retry_limit: retry_limit(
-                    args.retry.blob_retries,
-                    args.retry.retry_forever,
-                    pull::DEFAULT_BLOB_RETRIES,
-                ),
+                blob_retry_limit: retry_limit(args.retry.blob_retries, pull::DEFAULT_BLOB_RETRIES),
                 concurrency: args.concurrency.max(1),
                 quiet,
                 shutdown: Some(shutdown_rx),
