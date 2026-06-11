@@ -94,14 +94,9 @@ impl PullRequestOptions {
             },
             image_concurrency: args.image_parallel.image_concurrency,
             retry: RetryConfig {
-                blob_retry_limit: retry_limit(
-                    args.retry.blob_retries,
-                    args.retry.retry_forever,
-                    DEFAULT_BLOB_RETRIES,
-                ),
+                blob_retry_limit: retry_limit(args.retry.blob_retries, DEFAULT_BLOB_RETRIES),
                 request_retry_limit: retry_limit(
                     args.retry.request_retries,
-                    args.retry.retry_forever,
                     DEFAULT_REQUEST_RETRIES,
                 ),
             },
@@ -132,15 +127,20 @@ impl PullRequestOptions {
     }
 }
 
-pub(crate) fn retry_limit(
-    retries: Option<u32>,
-    retry_forever: bool,
-    default_retries: u32,
-) -> Option<u32> {
-    match (retries, retry_forever) {
-        (Some(retries), _) => Some(retries),
-        (None, true) => None,
-        (None, false) => Some(default_retries),
+pub(crate) fn retry_limit(retries: Option<i64>, default_retries: u32) -> Option<u32> {
+    match retries {
+        Some(-1) => None,
+        Some(retry_limit) => {
+            debug_assert!(
+                retry_limit >= 0 && retry_limit <= u32::MAX as i64,
+                "retry limit must be -1 or within the range [0, u32::MAX]"
+            );
+            Some(
+                u32::try_from(retry_limit)
+                    .expect("retry limit must be within the range [0, u32::MAX] or -1"),
+            )
+        }
+        None => Some(default_retries),
     }
 }
 

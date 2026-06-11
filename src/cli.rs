@@ -157,7 +157,7 @@ pub struct PullDownloadArgs {
 pub struct ImageParallelArgs {
     #[arg(
         long = "max-parallel-images",
-        default_value_t = 2,
+        default_value_t = 4,
         help_heading = "Download options",
         help = "Maximum concurrent image pulls"
     )]
@@ -169,23 +169,21 @@ pub struct RetryArgs {
     #[arg(
         long = "blob-retries",
         value_name = "N",
+        allow_hyphen_values = true,
+        value_parser = parse_retry_count,
         help_heading = "Retry options",
-        help = "Maximum retries for interrupted blob downloads; use 0 to disable [default: 8]"
+        help = "Maximum retries for interrupted blob downloads; use -1 for unlimited or 0 to disable [default: 8]"
     )]
-    pub blob_retries: Option<u32>,
+    pub blob_retries: Option<i64>,
     #[arg(
         long = "request-retries",
         value_name = "N",
+        allow_hyphen_values = true,
+        value_parser = parse_retry_count,
         help_heading = "Retry options",
-        help = "Maximum retries for registry requests before any response or on retryable HTTP status; use 0 to disable [default: 5]"
+        help = "Maximum retries for registry requests before any response or on retryable HTTP status; use -1 for unlimited or 0 to disable [default: 5]"
     )]
-    pub request_retries: Option<u32>,
-    #[arg(
-        long,
-        help_heading = "Retry options",
-        help = "Retry retryable blob downloads and registry requests forever"
-    )]
-    pub retry_forever: bool,
+    pub request_retries: Option<i64>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -444,6 +442,19 @@ fn platform_help() -> String {
     )
 }
 
+fn parse_retry_count(value: &str) -> std::result::Result<i64, String> {
+    let retries = value
+        .parse::<i64>()
+        .map_err(|error| format!("invalid retry count: {error}"))?;
+    if retries < -1 {
+        return Err("retry count must be -1 or a non-negative integer".into());
+    }
+    if retries > u32::MAX as i64 {
+        return Err(format!("retry count must be no greater than {}", u32::MAX));
+    }
+    Ok(retries)
+}
+
 #[cfg(test)]
 mod tests {
     use clap::{CommandFactory, Parser};
@@ -545,6 +556,7 @@ mod tests {
         };
 
         assert_eq!(args.references, vec!["alpine:latest", "busybox:latest"]);
+        assert_eq!(args.common.image_parallel.image_concurrency, 4);
     }
 
     #[test]
@@ -617,31 +629,29 @@ mod tests {
     }
 
     #[test]
-    fn pull_accepts_retry_forever_flag() {
-        let cli = Cli::parse_from(["pocker", "pull", "--retry-forever", "alpine:latest"]);
+    fn pull_accepts_unlimited_blob_retries() {
+        let cli = Cli::parse_from(["pocker", "pull", "--blob-retries", "-1", "alpine:latest"]);
         let Commands::Pull(args) = cli.command else {
             panic!("expected pull command");
         };
 
-        assert!(args.common.retry.retry_forever);
+        assert_eq!(args.common.retry.blob_retries, Some(-1));
     }
 
     #[test]
-    fn pull_accepts_retry_forever_with_explicit_retry_count_override() {
-        let cli = Cli::parse_from([
-            "pocker",
-            "pull",
-            "--blob-retries",
-            "1",
-            "--retry-forever",
-            "alpine:latest",
-        ]);
-        let Commands::Pull(args) = cli.command else {
-            panic!("expected pull command");
-        };
+    fn pull_rejects_retry_values_below_minus_one() {
+        let error = Cli::try_parse_from(["pocker", "pull", "--blob-retries=-2", "alpine:latest"])
+            .expect_err("retry count should only accept -1 or non-negative values");
 
-        assert_eq!(args.common.retry.blob_retries, Some(1));
-        assert!(args.common.retry.retry_forever);
+        assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+    }
+
+    #[test]
+    fn pull_rejects_removed_retry_forever_flag() {
+        let error = Cli::try_parse_from(["pocker", "pull", "--retry-forever", "alpine:latest"])
+            .expect_err("retry-forever should be removed");
+
+        assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
     }
 
     #[test]
@@ -758,20 +768,13 @@ mod tests {
     }
 
     #[test]
-    fn serve_accepts_retry_forever_with_explicit_retry_count_override() {
-        let cli = Cli::parse_from([
-            "pocker",
-            "serve",
-            "--request-retries",
-            "1",
-            "--retry-forever",
-        ]);
+    fn serve_accepts_unlimited_request_retries() {
+        let cli = Cli::parse_from(["pocker", "serve", "--request-retries", "-1"]);
         let Commands::Serve(args) = cli.command else {
             panic!("expected serve command");
         };
 
-        assert_eq!(args.retry.request_retries, Some(1));
-        assert!(args.retry.retry_forever);
+        assert_eq!(args.retry.request_retries, Some(-1));
     }
 
     #[test]
@@ -839,15 +842,8 @@ mod tests {
     }
 
     #[test]
-    fn compose_pull_accepts_retry_forever_with_explicit_retry_count_override() {
-        let cli = Cli::parse_from([
-            "pocker",
-            "compose",
-            "pull",
-            "--blob-retries",
-            "1",
-            "--retry-forever",
-        ]);
+    fn compose_pull_accepts_unlimited_blob_retries() {
+        let cli = Cli::parse_from(["pocker", "compose", "pull", "--blob-retries", "-1"]);
         let Commands::Compose(args) = cli.command else {
             panic!("expected compose command");
         };
@@ -855,8 +851,7 @@ mod tests {
             panic!("expected compose pull command");
         };
 
-        assert_eq!(pull.common.retry.blob_retries, Some(1));
-        assert!(pull.common.retry.retry_forever);
+        assert_eq!(pull.common.retry.blob_retries, Some(-1));
     }
 
     #[test]
@@ -950,6 +945,7 @@ mod tests {
         assert!(help.contains(&platform_help()));
         assert!(help.contains("Download options"));
         assert!(help.contains("Retry options"));
-        assert!(help.contains("--retry-forever"));
+        assert!(help.contains("use -1 for unlimited"));
+        assert!(!help.contains("--retry-forever"));
     }
 }
