@@ -43,6 +43,42 @@ pub(super) struct DockerResponse {
     pub(super) body: Vec<u8>,
 }
 
+pub(super) struct AtomicOutputFile {
+    path: tempfile::TempPath,
+    file: tokio::fs::File,
+}
+
+impl AtomicOutputFile {
+    pub(super) fn create(output: &Path) -> Result<Self> {
+        let parent = output
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let temporary = tempfile::Builder::new()
+            .prefix(".pocker-export-")
+            .tempfile_in(parent)?;
+        let (file, path) = temporary.into_parts();
+        Ok(Self {
+            path,
+            file: tokio::fs::File::from_std(file),
+        })
+    }
+
+    pub(super) fn file_mut(&mut self) -> &mut tokio::fs::File {
+        &mut self.file
+    }
+
+    pub(super) async fn persist(mut self, output: &Path) -> Result<()> {
+        use tokio::io::AsyncWriteExt;
+
+        self.file.flush().await?;
+        self.file.sync_all().await?;
+        drop(self.file);
+        self.path.persist(output).map_err(|error| error.error)?;
+        Ok(())
+    }
+}
+
 impl DockerTransport {
     pub(super) fn connect() -> Result<Self> {
         let endpoint = docker_endpoint()?;

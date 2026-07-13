@@ -18,7 +18,7 @@ use crate::error::{DockerPullError, Result};
 use crate::http::USER_AGENT;
 
 #[cfg(windows)]
-use super::{DockerResponse, ensure_success_status};
+use super::{AtomicOutputFile, DockerResponse, ensure_success_status};
 #[cfg(windows)]
 use tokio::io::DuplexStream;
 
@@ -136,10 +136,9 @@ pub(super) async fn request_to_file(
         return ensure_success_status(status, body, action);
     }
 
-    let mut file = tokio::fs::File::create(output).await?;
-    write_body_to_file(&mut pipe, &headers, body_start, &mut file).await?;
-    file.flush().await?;
-    Ok(())
+    let mut file = AtomicOutputFile::create(output)?;
+    write_body_to_file(&mut pipe, &headers, body_start, file.file_mut()).await?;
+    file.persist(output).await
 }
 
 #[cfg(windows)]

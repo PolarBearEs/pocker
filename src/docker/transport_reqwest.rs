@@ -11,7 +11,7 @@ use tokio_util::io::ReaderStream;
 use crate::error::{DockerPullError, Result};
 use crate::http::USER_AGENT;
 
-use super::{DockerResponse, build_failure_error};
+use super::{AtomicOutputFile, DockerResponse, build_failure_error};
 
 #[derive(Debug, Clone)]
 pub(in crate::docker) struct ReqwestTransport {
@@ -74,13 +74,12 @@ impl ReqwestTransport {
     ) -> Result<()> {
         let response = self.client.get(self.url(path)).send().await?;
         let response = ensure_success(response, action).await?;
-        let mut file = tokio::fs::File::create(output).await?;
+        let mut file = AtomicOutputFile::create(output)?;
         let mut stream = response.bytes_stream();
         while let Some(chunk) = stream.next().await {
-            file.write_all(&chunk?).await?;
+            file.file_mut().write_all(&chunk?).await?;
         }
-        file.flush().await?;
-        Ok(())
+        file.persist(output).await
     }
 
     pub(super) async fn request_bytes(
@@ -176,6 +175,56 @@ mod tests {
         .expect("load should not hang")
         .expect("load should tolerate delayed daemon response");
         server.await.expect("server task");
+    }
+
+    #[tokio::test]
+    async fn failed_image_save_preserves_existing_destination() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let address = listener.local_addr().expect("listener address");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("connection should arrive");
+            let mut request = [0_u8; 2048];
+            let _ = stream.read(&mut request).await;
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 12\r\nConnection: close\r\n\r\npartial",
+                )
+                .await
+                .expect("partial response should be written");
+        });
+        let dir = tempfile::tempdir().expect("tempdir");
+        let output = dir.path().join("image.tar");
+        tokio::fs::write(&output, b"existing archive")
+            .await
+            .expect("existing destination should be written");
+        let transport = ReqwestTransport {
+            client: builder().build().expect("client"),
+            base_url: format!("http://{address}"),
+        };
+
+        transport
+            .save_response_to_file("/images/get?names=test", &output, "docker image save")
+            .await
+            .expect_err("truncated response should fail");
+        server.await.expect("server task");
+
+        assert_eq!(
+            tokio::fs::read(&output)
+                .await
+                .expect("existing destination should remain readable"),
+            b"existing archive"
+        );
+        let entries = std::fs::read_dir(dir.path())
+            .expect("output directory should be readable")
+            .collect::<std::io::Result<Vec<_>>>()
+            .expect("directory entries should be readable");
+        assert_eq!(
+            entries.len(),
+            1,
+            "failed export should clean up its temp file"
+        );
     }
 
     fn request_body_complete(request: &[u8]) -> bool {
