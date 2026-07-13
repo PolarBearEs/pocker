@@ -75,7 +75,39 @@ pub async fn download_blob(
             return Err(DockerPullError::Interrupted);
         }
         if progress.offset >= expected_size {
-            break;
+            context
+                .ui
+                .set_layer_status(&descriptor.digest, "Verifying checksum");
+            match context.store.finalize_download(&descriptor).await {
+                Ok(()) => break,
+                Err(error @ DockerPullError::DigestMismatch { .. }) => {
+                    let delay = jittered_backoff_delay(retries);
+                    let retry_budget = register_retry(
+                        context,
+                        &descriptor.digest,
+                        retries,
+                        format!("checksum verification failed: {error}"),
+                        delay,
+                    )?;
+                    retries = retry_budget.retries;
+                    warn!(
+                        "checksum verification failed for {}, restarting blob: {}",
+                        descriptor.digest, error
+                    );
+                    reset_download_state(
+                        context,
+                        &descriptor,
+                        expected_size,
+                        &mut plan,
+                        &mut progress,
+                    )
+                    .await?;
+                    sleep_or_interrupt(context, &descriptor.digest, &retry_budget.budget, delay)
+                        .await?;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
         }
 
         let response = tokio::select! {
@@ -259,10 +291,6 @@ pub async fn download_blob(
         }
     }
 
-    context
-        .ui
-        .set_layer_status(&descriptor.digest, "Verifying checksum");
-    context.store.finalize_download(&descriptor).await?;
     if let Ok(partial) = context.store.partial_path(&descriptor.digest) {
         match fs::remove_file(partial).await {
             Ok(()) => {}
@@ -458,7 +486,7 @@ fn register_retry(
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
 
     use reqwest::StatusCode;
@@ -764,6 +792,92 @@ mod tests {
                 .ensure_blob_complete(&descriptor.digest, bytes.len() as u64)
                 .await
                 .expect("completed blob should verify")
+        );
+    }
+
+    #[tokio::test]
+    async fn download_blob_resets_and_retries_after_checksum_mismatch() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let address = listener.local_addr().expect("listener address");
+        let requests = Arc::new(AtomicUsize::new(0));
+        let server_requests = Arc::clone(&requests);
+        let server = tokio::spawn(async move {
+            for body in [b"bad! layer".as_slice(), b"good layer".as_slice()] {
+                let (mut stream, _) = listener.accept().await.expect("request should arrive");
+                let mut request = [0_u8; 4096];
+                let _ = stream.read(&mut request).await;
+                server_requests.fetch_add(1, Ordering::SeqCst);
+                let headers = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                stream
+                    .write_all(headers.as_bytes())
+                    .await
+                    .expect("headers should be written");
+                stream
+                    .write_all(body)
+                    .await
+                    .expect("body should be written");
+            }
+        });
+
+        let dir = tempdir().expect("tempdir should create");
+        let store = Arc::new(
+            Store::open(dir.path().to_path_buf())
+                .await
+                .expect("store should open"),
+        );
+        let bytes = b"good layer";
+        let descriptor = Descriptor {
+            media_type: "application/octet-stream".into(),
+            digest: crate::digest::canonical_digest_bytes(bytes),
+            size: bytes.len() as i64,
+            platform: None,
+            annotations: None,
+        };
+        let context = PullContext {
+            store: Arc::clone(&store),
+            registry: Arc::new(RegistryClient::new(
+                reqwest::Client::builder()
+                    .https_only(false)
+                    .build()
+                    .expect("client should build"),
+                Arc::new(AuthResolver::new(None).expect("auth resolver should create")),
+                true,
+                Some(0),
+            )),
+            stop: tokio_util::sync::CancellationToken::new(),
+            ui: Arc::new(RecordingProgress::default()),
+            blob_retry_limit: Some(1),
+            blob_idle_timeout: Some(Duration::from_secs(1)),
+            blob_locks: Arc::new(BlobDownloadLocks::default()),
+            layer_usage: Arc::new(CurrentPullLayers::default()),
+            daemon_layer_cache: None,
+        };
+        let reference = ImageReference::parse(&format!("{address}/library/test:latest"))
+            .expect("reference should parse");
+
+        download_blob(&context, &reference, descriptor.clone())
+            .await
+            .expect("checksum mismatch should be retried");
+        server.await.expect("server should finish");
+
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        assert!(
+            store
+                .ensure_blob_complete(&descriptor.digest, bytes.len() as u64)
+                .await
+                .expect("completed blob should verify")
+        );
+        assert!(
+            !store
+                .partial_path(&descriptor.digest)
+                .expect("partial path")
+                .exists(),
+            "corrupt partial should be replaced by the successful retry"
         );
     }
 
