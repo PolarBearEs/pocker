@@ -49,15 +49,22 @@ pub(super) struct AtomicOutputFile {
 }
 
 impl AtomicOutputFile {
-    pub(super) fn create(output: &Path) -> Result<Self> {
-        let parent = output
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
-        let temporary = tempfile::Builder::new()
-            .prefix(".pocker-export-")
-            .tempfile_in(parent)?;
-        let (file, path) = temporary.into_parts();
+    pub(super) async fn create(output: &Path) -> Result<Self> {
+        let output = output.to_path_buf();
+        let (file, path) = tokio::task::spawn_blocking(move || {
+            let parent = output
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            let temporary = tempfile::Builder::new()
+                .prefix(".pocker-export-")
+                .tempfile_in(parent)?;
+            Ok::<_, std::io::Error>(temporary.into_parts())
+        })
+        .await
+        .map_err(|error| {
+            DockerPullError::InvalidInput(format!("temporary export task panicked: {error}"))
+        })??;
         Ok(Self {
             path,
             file: tokio::fs::File::from_std(file),
@@ -74,7 +81,13 @@ impl AtomicOutputFile {
         self.file.flush().await?;
         self.file.sync_all().await?;
         drop(self.file);
-        self.path.persist(output).map_err(|error| error.error)?;
+        let path = self.path;
+        let output = output.to_path_buf();
+        tokio::task::spawn_blocking(move || path.persist(output).map_err(|error| error.error))
+            .await
+            .map_err(|error| {
+                DockerPullError::InvalidInput(format!("export persist task panicked: {error}"))
+            })??;
         Ok(())
     }
 }

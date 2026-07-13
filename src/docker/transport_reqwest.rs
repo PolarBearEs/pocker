@@ -74,7 +74,7 @@ impl ReqwestTransport {
     ) -> Result<()> {
         let response = self.client.get(self.url(path)).send().await?;
         let response = ensure_success(response, action).await?;
-        let mut file = AtomicOutputFile::create(output)?;
+        let mut file = AtomicOutputFile::create(output).await?;
         let mut stream = response.bytes_stream();
         while let Some(chunk) = stream.next().await {
             file.file_mut().write_all(&chunk?).await?;
@@ -216,10 +216,17 @@ mod tests {
                 .expect("existing destination should remain readable"),
             b"existing archive"
         );
-        let entries = std::fs::read_dir(dir.path())
-            .expect("output directory should be readable")
-            .collect::<std::io::Result<Vec<_>>>()
-            .expect("directory entries should be readable");
+        let mut read_dir = tokio::fs::read_dir(dir.path())
+            .await
+            .expect("output directory should be readable");
+        let mut entries = Vec::new();
+        while let Some(entry) = read_dir
+            .next_entry()
+            .await
+            .expect("directory entry should be readable")
+        {
+            entries.push(entry);
+        }
         assert_eq!(
             entries.len(),
             1,

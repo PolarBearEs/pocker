@@ -136,7 +136,7 @@ pub(super) async fn request_to_file(
         return ensure_success_status(status, body, action);
     }
 
-    let mut file = AtomicOutputFile::create(output)?;
+    let mut file = AtomicOutputFile::create(output).await?;
     write_body_to_file(&mut pipe, &headers, body_start, file.file_mut()).await?;
     file.persist(output).await
 }
