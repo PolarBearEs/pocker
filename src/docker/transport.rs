@@ -44,8 +44,8 @@ pub(super) struct DockerResponse {
 }
 
 pub(super) struct AtomicOutputFile {
-    path: tempfile::TempPath,
     file: tokio::fs::File,
+    path: tempfile::TempPath,
 }
 
 impl AtomicOutputFile {
