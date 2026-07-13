@@ -146,8 +146,47 @@ pub async fn download_blob(
 
         loop {
             let chunk = tokio::select! {
-                chunk = stream.next() => chunk,
+                chunk = async {
+                    match context.blob_idle_timeout {
+                        Some(idle_timeout) => tokio::time::timeout(idle_timeout, stream.next()).await,
+                        None => Ok(stream.next().await),
+                    }
+                } => chunk,
                 _ = context.stop.cancelled() => return Err(DockerPullError::Interrupted),
+            };
+            let chunk = match chunk {
+                Ok(chunk) => chunk,
+                Err(_) => {
+                    let idle_timeout = context
+                        .blob_idle_timeout
+                        .expect("timeout can only elapse when configured");
+                    let delay = jittered_backoff_delay(retries);
+                    let retry_budget = register_retry(
+                        context,
+                        &descriptor.digest,
+                        retries,
+                        format!(
+                            "blob stream made no progress for {} seconds",
+                            idle_timeout.as_secs()
+                        ),
+                        delay,
+                    )?;
+                    retries = retry_budget.retries;
+                    warn!(
+                        "blob stream for {} made no progress for {:?}",
+                        descriptor.digest, idle_timeout
+                    );
+                    file.flush().await?;
+                    file.sync_data().await?;
+                    context
+                        .store
+                        .checkpoint_download(&descriptor.digest, progress.offset, expected_size)
+                        .await?;
+                    sleep_or_interrupt(context, &descriptor.digest, &retry_budget.budget, delay)
+                        .await?;
+                    stream_failed = true;
+                    break;
+                }
             };
             let Some(chunk) = chunk else {
                 break;
@@ -418,6 +457,8 @@ mod tests {
     use reqwest::StatusCode;
     use reqwest::header::{CONTENT_RANGE, HeaderMap, HeaderValue};
     use tempfile::tempdir;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
     use super::{
         DownloadProgress, download_blob, premature_eof_detail, sleep_or_interrupt_on_token,
@@ -571,6 +612,7 @@ mod tests {
             stop,
             ui: ui.clone(),
             blob_retry_limit: Some(0),
+            blob_idle_timeout: None,
             blob_locks: Arc::new(BlobDownloadLocks::default()),
             layer_usage: Arc::new(CurrentPullLayers::default()),
             daemon_layer_cache: None,
@@ -604,6 +646,94 @@ mod tests {
         assert!(
             ui.cached.load(Ordering::SeqCst),
             "layer should be marked cached after waiting for another process"
+        );
+    }
+
+    #[tokio::test]
+    async fn stalled_blob_chunk_is_retried_from_last_progress() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let address = listener.local_addr().expect("listener address");
+        let server = tokio::spawn(async move {
+            let (mut first, _) = listener
+                .accept()
+                .await
+                .expect("first request should arrive");
+            let mut request = [0_u8; 4096];
+            let _ = first.read(&mut request).await;
+            first
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: close\r\n\r\ngood",
+                )
+                .await
+                .expect("first partial response should be written");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            drop(first);
+
+            let (mut second, _) = listener.accept().await.expect("retry should arrive");
+            let count = second
+                .read(&mut request)
+                .await
+                .expect("retry request should be readable");
+            let request = String::from_utf8_lossy(&request[..count]);
+            assert!(
+                request.contains("range: bytes=4-"),
+                "retry should resume after the last received chunk: {request}"
+            );
+            second
+                .write_all(
+                    b"HTTP/1.1 206 Partial Content\r\nContent-Length: 6\r\nContent-Range: bytes 4-9/10\r\nConnection: close\r\n\r\n layer",
+                )
+                .await
+                .expect("resumed response should be written");
+        });
+
+        let dir = tempdir().expect("tempdir should create");
+        let store = Arc::new(
+            Store::open(dir.path().to_path_buf())
+                .await
+                .expect("store should open"),
+        );
+        let bytes = b"good layer";
+        let descriptor = Descriptor {
+            media_type: "application/octet-stream".into(),
+            digest: crate::digest::canonical_digest_bytes(bytes),
+            size: bytes.len() as i64,
+            platform: None,
+            annotations: None,
+        };
+        let context = PullContext {
+            store: Arc::clone(&store),
+            registry: Arc::new(RegistryClient::new(
+                reqwest::Client::builder()
+                    .https_only(false)
+                    .build()
+                    .expect("client should build"),
+                Arc::new(AuthResolver::new(None).expect("auth resolver should create")),
+                true,
+                Some(0),
+            )),
+            stop: tokio_util::sync::CancellationToken::new(),
+            ui: Arc::new(RecordingProgress::default()),
+            blob_retry_limit: Some(1),
+            blob_idle_timeout: Some(Duration::from_millis(50)),
+            blob_locks: Arc::new(BlobDownloadLocks::default()),
+            layer_usage: Arc::new(CurrentPullLayers::default()),
+            daemon_layer_cache: None,
+        };
+        let reference = ImageReference::parse(&format!("{address}/library/test:latest"))
+            .expect("reference should parse");
+
+        download_blob(&context, &reference, descriptor.clone())
+            .await
+            .expect("stalled stream should resume and finish");
+        server.await.expect("server should finish");
+        assert!(
+            store
+                .ensure_blob_complete(&descriptor.digest, bytes.len() as u64)
+                .await
+                .expect("completed blob should verify")
         );
     }
 

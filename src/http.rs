@@ -7,19 +7,11 @@ use crate::error::Result;
 
 pub(crate) const USER_AGENT: &str = concat!("pocker/", env!("CARGO_PKG_VERSION"));
 pub(crate) const DEFAULT_EXTERNAL_CONNECT_TIMEOUT_SECONDS: i64 = 20;
-
-pub fn build_http_client(
-    plain_http: bool,
-    insecure_skip_tls_verify: bool,
-    ca_file: Option<&Path>,
-) -> Result<Client> {
-    build_http_client_with_external_connect_timeout(
-        plain_http,
-        insecure_skip_tls_verify,
-        ca_file,
-        default_external_connect_timeout(),
-    )
-}
+// Blob bodies can legitimately transfer for hours on constrained links. This
+// only bounds time without a body chunk, and five minutes leaves substantial
+// room for slow registries and cache misses while releasing permanently stalled
+// download locks.
+pub(crate) const DEFAULT_BLOB_IDLE_TIMEOUT_SECONDS: i64 = 5 * 60;
 
 pub(crate) fn build_http_client_with_external_connect_timeout(
     plain_http: bool,
@@ -86,12 +78,6 @@ pub(crate) fn external_connect_timeout_from_seconds(seconds: i64) -> Result<Opti
     }
 }
 
-pub(crate) fn default_external_connect_timeout() -> Option<Duration> {
-    Some(Duration::from_secs(
-        DEFAULT_EXTERNAL_CONNECT_TIMEOUT_SECONDS as u64,
-    ))
-}
-
 pub(crate) fn parse_external_connect_timeout_seconds(
     value: &str,
 ) -> std::result::Result<i64, String> {
@@ -102,6 +88,26 @@ pub(crate) fn parse_external_connect_timeout_seconds(
         return Err(
             "external connect timeout must be -1 or a non-negative number of seconds".into(),
         );
+    }
+    Ok(seconds)
+}
+
+pub(crate) fn blob_idle_timeout_from_seconds(seconds: i64) -> Result<Option<Duration>> {
+    match seconds {
+        -1 => Ok(None),
+        seconds if seconds >= 0 => Ok(Some(Duration::from_secs(seconds as u64))),
+        _ => Err(crate::error::DockerPullError::InvalidInput(
+            "blob idle timeout must be -1 or a non-negative number of seconds".into(),
+        )),
+    }
+}
+
+pub(crate) fn parse_blob_idle_timeout_seconds(value: &str) -> std::result::Result<i64, String> {
+    let seconds = value
+        .parse::<i64>()
+        .map_err(|error| format!("invalid blob idle timeout: {error}"))?;
+    if seconds < -1 {
+        return Err("blob idle timeout must be -1 or a non-negative number of seconds".into());
     }
     Ok(seconds)
 }

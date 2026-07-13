@@ -5,6 +5,7 @@ pub(crate) mod orchestrator;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::time::Duration;
 
 use futures_util::stream::{self, FuturesUnordered, StreamExt};
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
@@ -31,6 +32,7 @@ pub struct PullContext {
     pub stop: CancellationToken,
     pub ui: Arc<dyn ProgressSink>,
     pub blob_retry_limit: Option<u32>,
+    pub blob_idle_timeout: Option<Duration>,
     pub blob_locks: Arc<BlobDownloadLocks>,
     pub layer_usage: Arc<CurrentPullLayers>,
     pub daemon_layer_cache: Option<Arc<docker::DaemonLayerCache>>,
