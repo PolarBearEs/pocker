@@ -628,18 +628,23 @@ impl RegistryClient {
                 )));
             }
 
-            debug!("registry {} {}", request.method, url);
             return match response_mode {
-                ResponseMode::Streaming => Ok(RegistryResponse::Streaming(response)),
+                ResponseMode::Streaming => {
+                    debug!("registry {} {}", request.method, url);
+                    Ok(RegistryResponse::Streaming(response))
+                }
                 ResponseMode::Buffered => {
                     let status = response.status();
                     let headers = response.headers().clone();
                     match response.bytes().await {
-                        Ok(body) => Ok(RegistryResponse::Buffered(BufferedResponse {
-                            status,
-                            headers,
-                            body: body.to_vec(),
-                        })),
+                        Ok(body) => {
+                            debug!("registry {} {}", request.method, url);
+                            Ok(RegistryResponse::Buffered(BufferedResponse {
+                                status,
+                                headers,
+                                body: body.to_vec(),
+                            }))
+                        }
                         Err(error)
                             if request.allow_retry && is_retryable_response_body_error(&error) =>
                         {
@@ -1510,10 +1515,13 @@ mod tests {
         let reference =
             ImageReference::parse(&format!("{registry}/sample:latest")).expect("reference parse");
 
-        let response = client
-            .get_manifest_raw(&reference, Some(MANIFEST_ACCEPT))
-            .await
-            .expect("manifest body should be retried");
+        let response = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.get_manifest_raw(&reference, Some(MANIFEST_ACCEPT)),
+        )
+        .await
+        .expect("manifest retry should not hang")
+        .expect("manifest body should be retried");
 
         assert_eq!(response.bytes, manifest);
     }
@@ -1534,13 +1542,16 @@ mod tests {
         let reference =
             ImageReference::parse(&format!("{registry}/sample:latest")).expect("reference parse");
 
-        let response = client
-            .get_blob_bytes(
+        let response = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.get_blob_bytes(
                 &reference,
                 "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            )
-            .await
-            .expect("config body should be retried");
+            ),
+        )
+        .await
+        .expect("config retry should not hang")
+        .expect("config body should be retried");
 
         assert_eq!(response, config);
     }
@@ -1555,7 +1566,11 @@ mod tests {
         let address = listener.local_addr().expect("listener address");
         tokio::spawn(async move {
             for attempt in 0..2 {
-                let (mut stream, _) = listener.accept().await.expect("connection should arrive");
+                let (mut stream, _) =
+                    tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                        .await
+                        .expect("connection should arrive before timeout")
+                        .expect("connection should arrive");
                 let mut request = [0_u8; 4096];
                 let _ = stream.read(&mut request).await;
                 let content_type = content_type
