@@ -3,7 +3,9 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
-use reqwest::header::{ACCEPT, HeaderName, HeaderValue, RANGE, RETRY_AFTER, WWW_AUTHENTICATE};
+use reqwest::header::{
+    ACCEPT, HeaderMap, HeaderName, HeaderValue, RANGE, RETRY_AFTER, WWW_AUTHENTICATE,
+};
 use reqwest::{Client, Method, Response, StatusCode};
 use serde::Deserialize;
 use tokio::sync::Mutex;
@@ -86,7 +88,44 @@ impl RequestMode {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RetryReason {
     SendError,
+    BodyError,
     Status(StatusCode),
+}
+
+#[derive(Clone, Copy)]
+enum ResponseMode {
+    Streaming,
+    Buffered,
+}
+
+struct BufferedResponse {
+    status: StatusCode,
+    headers: HeaderMap,
+    body: Vec<u8>,
+}
+
+impl BufferedResponse {
+    fn status(&self) -> StatusCode {
+        self.status
+    }
+
+    fn headers(&self) -> &HeaderMap {
+        &self.headers
+    }
+}
+
+enum RegistryResponse {
+    Streaming(Response),
+    Buffered(BufferedResponse),
+}
+
+impl RegistryResponse {
+    fn status(&self) -> StatusCode {
+        match self {
+            Self::Streaming(response) => response.status(),
+            Self::Buffered(response) => response.status,
+        }
+    }
 }
 
 impl RegistryClient {
@@ -130,7 +169,7 @@ impl RegistryClient {
         accept: Option<&str>,
     ) -> Result<RawManifest> {
         let response = self
-            .send(
+            .send_buffered(
                 RegistryRequest {
                     method: Method::GET,
                     url: self.manifest_url(reference)?,
@@ -153,7 +192,7 @@ impl RegistryClient {
         accept: Option<&str>,
     ) -> Result<RawManifest> {
         let response = self
-            .send(
+            .send_buffered(
                 RegistryRequest {
                     method: Method::GET,
                     url: self.manifest_digest_url(reference, digest)?,
@@ -176,7 +215,7 @@ impl RegistryClient {
     ) -> Result<ResolvedImage> {
         let url = self.manifest_url(reference)?;
         let response = self
-            .send(
+            .send_buffered(
                 RegistryRequest {
                     method: Method::GET,
                     url,
@@ -193,9 +232,9 @@ impl RegistryClient {
             return Err(DockerPullError::ManifestNotFound);
         }
         ensure_success_status(response.status(), "manifest")?;
-        let digest = header_string(&response, &DOCKER_CONTENT_DIGEST)?;
-        let media_type = response_content_media_type(&response);
-        let body = response.bytes().await?.to_vec();
+        let digest = header_string(response.headers(), &DOCKER_CONTENT_DIGEST)?;
+        let media_type = response_content_media_type(response.headers());
+        let body = response.body;
         let envelope: ManifestEnvelope = serde_json::from_slice(&body)?;
         if envelope.schema_version != 2 {
             return Err(DockerPullError::BadResponse(format!(
@@ -241,7 +280,7 @@ impl RegistryClient {
                 .ok_or_else(|| DockerPullError::PlatformNotFound(platform.as_string()))?;
             let manifest_url = self.manifest_digest_url(reference, &descriptor.digest)?;
             let response = self
-                .send(
+                .send_buffered(
                     RegistryRequest {
                         method: Method::GET,
                         url: manifest_url,
@@ -262,7 +301,7 @@ impl RegistryClient {
                 response.status(),
                 &format!("manifest {}", descriptor.digest),
             )?;
-            let body = response.bytes().await?.to_vec();
+            let body = response.body;
             let manifest: ImageManifest = serde_json::from_slice(&body)?;
             return Ok(ResolvedImage {
                 manifest: Descriptor {
@@ -325,16 +364,6 @@ impl RegistryClient {
         Ok(BlobMetadata { size })
     }
 
-    pub async fn get_blob(
-        &self,
-        reference: &ImageReference,
-        digest: &str,
-        offset: u64,
-    ) -> Result<Response> {
-        self.get_blob_with_retry_status(reference, digest, offset, None)
-            .await
-    }
-
     pub(crate) async fn get_blob_with_retry_status(
         &self,
         reference: &ImageReference,
@@ -363,7 +392,20 @@ impl RegistryClient {
         reference: &ImageReference,
         digest: &str,
     ) -> Result<Vec<u8>> {
-        let response = self.get_blob(reference, digest, 0).await?;
+        let response = self
+            .send_buffered(
+                RegistryRequest {
+                    method: Method::GET,
+                    url: self.blob_url(reference, digest)?,
+                    fallback_url: self.fallback_blob_url(reference, digest)?,
+                    accept: None,
+                    range: None,
+                    allow_retry: true,
+                    retry_status_sink: None,
+                },
+                reference,
+            )
+            .await?;
         if response.status() == StatusCode::NOT_FOUND {
             return Err(DockerPullError::BlobNotFound(digest.to_string()));
         }
@@ -373,7 +415,7 @@ impl RegistryClient {
                 response.status()
             )));
         }
-        Ok(response.bytes().await?.to_vec())
+        Ok(response.body)
     }
 
     fn manifest_url(&self, reference: &ImageReference) -> Result<Url> {
@@ -458,6 +500,35 @@ impl RegistryClient {
         request: RegistryRequest<'_>,
         reference: &ImageReference,
     ) -> Result<Response> {
+        match self
+            .send_with_mode(request, reference, ResponseMode::Streaming)
+            .await?
+        {
+            RegistryResponse::Streaming(response) => Ok(response),
+            RegistryResponse::Buffered(_) => unreachable!("streaming request returned body bytes"),
+        }
+    }
+
+    async fn send_buffered(
+        &self,
+        request: RegistryRequest<'_>,
+        reference: &ImageReference,
+    ) -> Result<BufferedResponse> {
+        match self
+            .send_with_mode(request, reference, ResponseMode::Buffered)
+            .await?
+        {
+            RegistryResponse::Buffered(response) => Ok(response),
+            RegistryResponse::Streaming(_) => unreachable!("buffered request returned a stream"),
+        }
+    }
+
+    async fn send_with_mode(
+        &self,
+        request: RegistryRequest<'_>,
+        reference: &ImageReference,
+        response_mode: ResponseMode,
+    ) -> Result<RegistryResponse> {
         let response = self
             .send_to_url(
                 &request,
@@ -468,13 +539,20 @@ impl RegistryClient {
                 } else {
                     RequestMode::Direct
                 },
+                response_mode,
             )
             .await?;
         if response.status() == StatusCode::NOT_FOUND
             && let Some(fallback_url) = request.fallback_url.clone()
         {
             return self
-                .send_to_url(&request, fallback_url, reference, RequestMode::Direct)
+                .send_to_url(
+                    &request,
+                    fallback_url,
+                    reference,
+                    RequestMode::Direct,
+                    response_mode,
+                )
                 .await;
         }
         Ok(response)
@@ -486,7 +564,8 @@ impl RegistryClient {
         url: Url,
         reference: &ImageReference,
         mode: RequestMode,
-    ) -> Result<Response> {
+        response_mode: ResponseMode,
+    ) -> Result<RegistryResponse> {
         let cache_key = token_cache_key(reference);
         let mut retries = 0_u32;
         let mut auth_retries = 0_u32;
@@ -550,7 +629,36 @@ impl RegistryClient {
             }
 
             debug!("registry {} {}", request.method, url);
-            return Ok(response);
+            return match response_mode {
+                ResponseMode::Streaming => Ok(RegistryResponse::Streaming(response)),
+                ResponseMode::Buffered => {
+                    let status = response.status();
+                    let headers = response.headers().clone();
+                    match response.bytes().await {
+                        Ok(body) => Ok(RegistryResponse::Buffered(BufferedResponse {
+                            status,
+                            headers,
+                            body: body.to_vec(),
+                        })),
+                        Err(error)
+                            if request.allow_retry && is_retryable_response_body_error(&error) =>
+                        {
+                            let delay = jittered_backoff_delay(retries);
+                            self.retry_request(
+                                reference,
+                                request.retry_status_sink.as_ref(),
+                                &mut retries,
+                                error.to_string(),
+                                delay,
+                                RetryReason::BodyError,
+                            )
+                            .await?;
+                            continue;
+                        }
+                        Err(error) => Err(error.into()),
+                    }
+                }
+            };
         }
     }
 
@@ -649,6 +757,11 @@ impl RegistryClient {
                 reference.display_name(),
                 format_retry_delay(delay)
             ),
+            RetryReason::BodyError => format!(
+                "registry response body for {} was interrupted; retrying request in {} ({retry_budget})",
+                reference.display_name(),
+                format_retry_delay(delay)
+            ),
             RetryReason::Status(status) => {
                 format!(
                     "registry request for {} returned {status}; retrying in {} ({retry_budget})",
@@ -727,14 +840,14 @@ impl fmt::Debug for RegistryClient {
     }
 }
 
-async fn raw_manifest_from_response(response: Response) -> Result<RawManifest> {
+async fn raw_manifest_from_response(response: BufferedResponse) -> Result<RawManifest> {
     if response.status() == StatusCode::NOT_FOUND {
         return Err(DockerPullError::ManifestNotFound);
     }
     ensure_success_status(response.status(), "manifest")?;
-    let digest = header_string(&response, &DOCKER_CONTENT_DIGEST)?;
-    let media_type = response_content_media_type(&response);
-    let bytes = response.bytes().await?.to_vec();
+    let digest = header_string(response.headers(), &DOCKER_CONTENT_DIGEST)?;
+    let media_type = response_content_media_type(response.headers());
+    let bytes = response.body;
     let envelope: ManifestEnvelope = serde_json::from_slice(&bytes)?;
     Ok(RawManifest {
         descriptor: Descriptor {
@@ -866,11 +979,23 @@ fn is_retryable_http_error(error: &reqwest::Error) -> bool {
     error.is_timeout() || error.is_connect() || error.is_request() || error.is_body()
 }
 
+fn is_retryable_response_body_error(error: &reqwest::Error) -> bool {
+    // reqwest reports an incomplete Content-Length body as a decode error even
+    // without content encoding, so body retries must include that category.
+    is_retryable_http_error(error) || error.is_decode()
+}
+
 fn inline_retry_status(reason: RetryReason, delay: Duration, retry_budget: &str) -> String {
     match reason {
         RetryReason::SendError => {
             format!(
                 "Retrying request in {} ({retry_budget})",
+                format_retry_delay(delay)
+            )
+        }
+        RetryReason::BodyError => {
+            format!(
+                "Retrying interrupted response body in {} ({retry_budget})",
                 format_retry_delay(delay)
             )
         }
@@ -908,17 +1033,15 @@ fn retry_after_delay(value: Option<&HeaderValue>) -> Option<Duration> {
         .map(|delay| delay.min(MAX_RETRY_AFTER_DELAY))
 }
 
-fn header_string(response: &Response, name: &HeaderName) -> Result<Option<String>> {
-    Ok(response
-        .headers()
+fn header_string(headers: &HeaderMap, name: &HeaderName) -> Result<Option<String>> {
+    Ok(headers
         .get(name)
         .map(|value| value.to_str().map(ToString::to_string))
         .transpose()?)
 }
 
-fn response_content_media_type(response: &Response) -> String {
-    response
-        .headers()
+fn response_content_media_type(headers: &HeaderMap) -> String {
+    headers
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .map(|value| value.split(';').next().unwrap_or(value).trim().to_string())
@@ -937,8 +1060,8 @@ mod tests {
 
     use super::super::cache::{cache_repository, decode_cache_repository, resource_url};
     use super::{
-        DEFAULT_REQUEST_RETRIES, MAX_RETRY_AFTER_DELAY, RegistryClient, parse_www_authenticate,
-        retry_after_delay, token_cache_key,
+        DEFAULT_REQUEST_RETRIES, MANIFEST_ACCEPT, MAX_RETRY_AFTER_DELAY, RegistryClient,
+        parse_www_authenticate, retry_after_delay, token_cache_key,
     };
     use crate::auth::AuthResolver;
     use crate::error::DockerPullError;
@@ -1365,6 +1488,99 @@ mod tests {
             .expect_err("non-success blob byte responses should fail");
 
         assert!(matches!(error, DockerPullError::BadResponse(message) if message.contains("403")));
+    }
+
+    #[tokio::test]
+    async fn manifest_body_disconnect_is_retried() {
+        let manifest = sample_manifest_bytes();
+        let registry = spawn_interrupted_then_complete_response(
+            manifest.clone(),
+            Some("application/vnd.oci.image.manifest.v1+json"),
+        )
+        .await;
+        let client = RegistryClient::new(
+            reqwest::Client::builder()
+                .https_only(false)
+                .build()
+                .expect("client should build"),
+            Arc::new(AuthResolver::new(None).expect("auth resolver should build")),
+            true,
+            Some(1),
+        );
+        let reference =
+            ImageReference::parse(&format!("{registry}/sample:latest")).expect("reference parse");
+
+        let response = client
+            .get_manifest_raw(&reference, Some(MANIFEST_ACCEPT))
+            .await
+            .expect("manifest body should be retried");
+
+        assert_eq!(response.bytes, manifest);
+    }
+
+    #[tokio::test]
+    async fn config_body_disconnect_is_retried() {
+        let config = br#"{"architecture":"amd64","os":"linux"}"#.to_vec();
+        let registry = spawn_interrupted_then_complete_response(config.clone(), None).await;
+        let client = RegistryClient::new(
+            reqwest::Client::builder()
+                .https_only(false)
+                .build()
+                .expect("client should build"),
+            Arc::new(AuthResolver::new(None).expect("auth resolver should build")),
+            true,
+            Some(1),
+        );
+        let reference =
+            ImageReference::parse(&format!("{registry}/sample:latest")).expect("reference parse");
+
+        let response = client
+            .get_blob_bytes(
+                &reference,
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )
+            .await
+            .expect("config body should be retried");
+
+        assert_eq!(response, config);
+    }
+
+    async fn spawn_interrupted_then_complete_response(
+        body: Vec<u8>,
+        content_type: Option<&'static str>,
+    ) -> std::net::SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let address = listener.local_addr().expect("listener address");
+        tokio::spawn(async move {
+            for attempt in 0..2 {
+                let (mut stream, _) = listener.accept().await.expect("connection should arrive");
+                let mut request = [0_u8; 4096];
+                let _ = stream.read(&mut request).await;
+                let content_type = content_type
+                    .map(|value| format!("Content-Type: {value}\r\n"))
+                    .unwrap_or_default();
+                let headers = format!(
+                    "HTTP/1.1 200 OK\r\n{content_type}Content-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                stream
+                    .write_all(headers.as_bytes())
+                    .await
+                    .expect("headers should be written");
+                let bytes = if attempt == 0 {
+                    &body[..body.len() / 2]
+                } else {
+                    body.as_slice()
+                };
+                stream
+                    .write_all(bytes)
+                    .await
+                    .expect("body should be written");
+            }
+        });
+        address
     }
 
     async fn spawn_single_response(response: Vec<u8>) -> std::net::SocketAddr {
