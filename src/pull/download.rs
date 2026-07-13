@@ -60,6 +60,10 @@ pub async fn download_blob(
         .ui
         .start_layer_download(&descriptor.digest, expected_size, progress.offset);
     let mut retries = 0_u32;
+    // Idle stalls use the same configured limit as other blob failures, but
+    // count consecutive no-progress retries separately. Receiving another
+    // chunk proves the transfer is moving again and replenishes this budget.
+    let mut idle_retries = 0_u32;
     let retry_status_sink: Arc<dyn Fn(String) + Send + Sync> = {
         let digest = descriptor.digest.clone();
         let ui = Arc::clone(&context.ui);
@@ -160,18 +164,18 @@ pub async fn download_blob(
                     let idle_timeout = context
                         .blob_idle_timeout
                         .expect("timeout can only elapse when configured");
-                    let delay = jittered_backoff_delay(retries);
+                    let delay = jittered_backoff_delay(idle_retries);
                     let retry_budget = register_retry(
                         context,
                         &descriptor.digest,
-                        retries,
+                        idle_retries,
                         format!(
-                            "blob stream made no progress for {} seconds",
-                            idle_timeout.as_secs()
+                            "blob stream made no progress for {:.1} seconds",
+                            idle_timeout.as_secs_f64()
                         ),
                         delay,
                     )?;
-                    retries = retry_budget.retries;
+                    idle_retries = retry_budget.retries;
                     warn!(
                         "blob stream for {} made no progress for {:?}",
                         descriptor.digest, idle_timeout
@@ -194,6 +198,9 @@ pub async fn download_blob(
             match chunk {
                 Ok(chunk) => {
                     file.write_all(&chunk).await?;
+                    if !chunk.is_empty() {
+                        idle_retries = 0;
+                    }
                     progress.advance(chunk.len() as u64);
                     context
                         .ui
@@ -671,22 +678,41 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
             drop(first);
 
-            let (mut second, _) = listener.accept().await.expect("retry should arrive");
+            let (mut second, _) = listener.accept().await.expect("first retry should arrive");
             let count = second
                 .read(&mut request)
                 .await
                 .expect("retry request should be readable");
-            let request = String::from_utf8_lossy(&request[..count]);
+            let second_request = String::from_utf8_lossy(&request[..count]);
             assert!(
-                request.contains("range: bytes=4-"),
-                "retry should resume after the last received chunk: {request}"
+                second_request.contains("range: bytes=4-"),
+                "retry should resume after the last received chunk: {second_request}"
             );
             second
                 .write_all(
-                    b"HTTP/1.1 206 Partial Content\r\nContent-Length: 6\r\nContent-Range: bytes 4-9/10\r\nConnection: close\r\n\r\n layer",
+                    b"HTTP/1.1 206 Partial Content\r\nContent-Length: 6\r\nContent-Range: bytes 4-9/10\r\nConnection: close\r\n\r\n l",
                 )
                 .await
-                .expect("resumed response should be written");
+                .expect("second partial response should be written");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            drop(second);
+
+            let (mut third, _) = listener.accept().await.expect("second retry should arrive");
+            let count = third
+                .read(&mut request)
+                .await
+                .expect("second retry request should be readable");
+            let third_request = String::from_utf8_lossy(&request[..count]);
+            assert!(
+                third_request.contains("range: bytes=6-"),
+                "second retry should resume after new progress: {third_request}"
+            );
+            third
+                .write_all(
+                    b"HTTP/1.1 206 Partial Content\r\nContent-Length: 4\r\nContent-Range: bytes 6-9/10\r\nConnection: close\r\n\r\nayer",
+                )
+                .await
+                .expect("final resumed response should be written");
         });
 
         let dir = tempdir().expect("tempdir should create");
@@ -725,9 +751,13 @@ mod tests {
         let reference = ImageReference::parse(&format!("{address}/library/test:latest"))
             .expect("reference should parse");
 
-        download_blob(&context, &reference, descriptor.clone())
-            .await
-            .expect("stalled stream should resume and finish");
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            download_blob(&context, &reference, descriptor.clone()),
+        )
+        .await
+        .expect("stalled stream retry should not hang")
+        .expect("stalled stream should resume and finish");
         server.await.expect("server should finish");
         assert!(
             store
