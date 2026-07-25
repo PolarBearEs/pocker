@@ -2,6 +2,7 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::fs as tokio_fs;
 use tokio::net::{TcpListener, TcpStream};
@@ -33,6 +34,7 @@ pub struct ServeConfig {
     pub registry: Arc<RegistryClient>,
     pub pull_missing: bool,
     pub blob_retry_limit: Option<u32>,
+    pub blob_idle_timeout: Option<Duration>,
     pub concurrency: usize,
     pub quiet: bool,
     pub shutdown: Option<oneshot::Receiver<()>>,
@@ -47,6 +49,7 @@ pub async fn serve(config: ServeConfig) -> Result<()> {
             registry: config.registry,
             pull_missing: config.pull_missing,
             blob_retry_limit: config.blob_retry_limit,
+            blob_idle_timeout: config.blob_idle_timeout,
             concurrency: config.concurrency,
             quiet: config.quiet,
         },
@@ -60,6 +63,7 @@ pub(crate) struct ServeListenerConfig {
     pub registry: Arc<RegistryClient>,
     pub pull_missing: bool,
     pub blob_retry_limit: Option<u32>,
+    pub blob_idle_timeout: Option<Duration>,
     pub concurrency: usize,
     pub quiet: bool,
 }
@@ -80,6 +84,7 @@ pub(crate) async fn serve_listener(
             stop: CancellationToken::new(),
             ui: Arc::new(Ui::new(config.quiet, false)),
             blob_retry_limit: config.blob_retry_limit,
+            blob_idle_timeout: config.blob_idle_timeout,
             blob_locks: Arc::new(BlobDownloadLocks::default()),
             layer_usage: Arc::new(CurrentPullLayers::default()),
             daemon_layer_cache: None,
@@ -846,6 +851,7 @@ mod tests {
             stop: CancellationToken::new(),
             ui: Arc::new(Ui::new(true, false)),
             blob_retry_limit: Some(1),
+            blob_idle_timeout: None,
             blob_locks: Arc::new(BlobDownloadLocks::default()),
             layer_usage: Arc::new(CurrentPullLayers::default()),
             daemon_layer_cache: None,
@@ -906,6 +912,7 @@ mod tests {
                 stop: CancellationToken::new(),
                 ui: Arc::new(Ui::new(true, false)),
                 blob_retry_limit: Some(1),
+                blob_idle_timeout: None,
                 blob_locks: Arc::new(BlobDownloadLocks::default()),
                 layer_usage: Arc::new(CurrentPullLayers::default()),
                 daemon_layer_cache: None,

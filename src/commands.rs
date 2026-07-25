@@ -8,7 +8,10 @@ use crate::cli::{
     CacheCommands, Cli, Commands, ComposeCommands, ComposeConfigFormat, ImageCommands,
 };
 use crate::error::{DockerPullError, Result};
-use crate::http::build_http_client;
+use crate::http::{
+    blob_idle_timeout_from_seconds, build_http_client_with_external_connect_timeout,
+    external_connect_timeout_from_seconds,
+};
 use crate::image_view::{format_size, print_image_inspect, print_image_list};
 use crate::pull::orchestrator::{PullRequestOptions, pull_references, retry_limit};
 use crate::registry::{DEFAULT_REQUEST_RETRIES, RegistryClient};
@@ -80,10 +83,13 @@ pub(crate) async fn execute(cli: Cli) -> Result<()> {
             let quiet = cli.global.quiet || args.quiet;
             let client = Arc::new(
                 RegistryClient::new(
-                    build_http_client(
+                    build_http_client_with_external_connect_timeout(
                         args.registry.plain_http,
                         args.registry.insecure_skip_tls_verify,
                         args.registry.ca_file.as_deref(),
+                        external_connect_timeout_from_seconds(
+                            args.external_registry_connection.connect_timeout_seconds,
+                        )?,
                     )?,
                     auth,
                     args.registry.plain_http,
@@ -117,6 +123,9 @@ pub(crate) async fn execute(cli: Cli) -> Result<()> {
                 registry: client,
                 pull_missing: args.pull_missing,
                 blob_retry_limit: retry_limit(args.retry.blob_retries, pull::DEFAULT_BLOB_RETRIES),
+                blob_idle_timeout: blob_idle_timeout_from_seconds(
+                    args.external_registry_connection.blob_idle_timeout_seconds,
+                )?,
                 concurrency: args.concurrency.max(1),
                 quiet,
                 shutdown: Some(shutdown_rx),

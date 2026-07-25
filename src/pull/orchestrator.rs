@@ -10,7 +10,8 @@ use crate::auth::{AuthResolver, read_credentials};
 use crate::cli::{ComposePullArgs, PullArgs, PullCommonArgs};
 use crate::error::{DockerPullError, Result};
 use crate::http::{
-    build_http_client_with_external_connect_timeout, external_connect_timeout_from_seconds,
+    blob_idle_timeout_from_seconds, build_http_client_with_external_connect_timeout,
+    external_connect_timeout_from_seconds,
 };
 use crate::platform::Platform;
 use crate::pull::{
@@ -72,6 +73,7 @@ struct CacheSourceConfig {
 // socket/API calls are local load paths and intentionally do not use this.
 struct ExternalRegistryConnectionConfig {
     connect_timeout_seconds: i64,
+    blob_idle_timeout_seconds: i64,
 }
 
 impl PullRequestOptions {
@@ -122,6 +124,9 @@ impl PullRequestOptions {
             },
             external_registry_connection: ExternalRegistryConnectionConfig {
                 connect_timeout_seconds: args.external_registry_connection.connect_timeout_seconds,
+                blob_idle_timeout_seconds: args
+                    .external_registry_connection
+                    .blob_idle_timeout_seconds,
             },
         }
     }
@@ -228,6 +233,7 @@ struct SharedPullState {
     registry: Arc<RegistryClient>,
     stop: CancellationToken,
     blob_retry_limit: Option<u32>,
+    blob_idle_timeout: Option<std::time::Duration>,
     blob_locks: Arc<BlobDownloadLocks>,
     layer_usage: Arc<CurrentPullLayers>,
     daemon_layer_cache: Option<Arc<crate::docker::DaemonLayerCache>>,
@@ -244,6 +250,11 @@ pub(crate) async fn pull_references(
 ) -> Result<()> {
     let external_registry_connect_timeout = external_connect_timeout_from_seconds(
         request.external_registry_connection.connect_timeout_seconds,
+    )?;
+    let blob_idle_timeout = blob_idle_timeout_from_seconds(
+        request
+            .external_registry_connection
+            .blob_idle_timeout_seconds,
     )?;
     let references = pocker_compose::unique_images(&references);
     let store = Arc::new(
@@ -308,6 +319,7 @@ pub(crate) async fn pull_references(
         registry: client,
         stop,
         blob_retry_limit: request.retry.blob_retry_limit,
+        blob_idle_timeout,
         blob_locks: Arc::new(BlobDownloadLocks::default()),
         layer_usage,
         daemon_layer_cache,
@@ -398,6 +410,7 @@ async fn pull_reference_with_group(
         stop: state.stop,
         ui: Arc::new(state.ui_group.image_ui(label)),
         blob_retry_limit: state.blob_retry_limit,
+        blob_idle_timeout: state.blob_idle_timeout,
         blob_locks: state.blob_locks,
         layer_usage: state.layer_usage,
         daemon_layer_cache: state.daemon_layer_cache,

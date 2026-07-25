@@ -5,7 +5,8 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use url::Url;
 
 use crate::http::{
-    DEFAULT_EXTERNAL_CONNECT_TIMEOUT_SECONDS, parse_external_connect_timeout_seconds,
+    DEFAULT_BLOB_IDLE_TIMEOUT_SECONDS, DEFAULT_EXTERNAL_CONNECT_TIMEOUT_SECONDS,
+    parse_blob_idle_timeout_seconds, parse_external_connect_timeout_seconds,
 };
 use crate::platform::Platform;
 use crate::pull::LoadMode;
@@ -289,6 +290,16 @@ pub struct ExternalRegistryConnectionArgs {
         help = "Timeout for opening retryable registry/cache HTTP connections; use -1 to disable"
     )]
     pub connect_timeout_seconds: i64,
+    #[arg(
+        long = "blob-idle-timeout-seconds",
+        value_name = "SECONDS",
+        default_value_t = DEFAULT_BLOB_IDLE_TIMEOUT_SECONDS,
+        allow_hyphen_values = true,
+        value_parser = parse_blob_idle_timeout_seconds,
+        help_heading = "External connection options",
+        help = "Retry a blob when no body chunk arrives for this long; resets after progress, use -1 to disable"
+    )]
+    pub blob_idle_timeout_seconds: i64,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -320,6 +331,8 @@ pub struct ServeArgs {
     pub registry: RegistryArgs,
     #[command(flatten)]
     pub auth: AuthArgs,
+    #[command(flatten)]
+    pub external_registry_connection: ExternalRegistryConnectionArgs,
     #[arg(
         long,
         short = 'q',
@@ -462,7 +475,9 @@ mod tests {
     use super::{
         CacheCommands, Cli, Commands, ComposeCommands, ComposeConfigFormat, LoadMode, platform_help,
     };
-    use crate::http::DEFAULT_EXTERNAL_CONNECT_TIMEOUT_SECONDS;
+    use crate::http::{
+        DEFAULT_BLOB_IDLE_TIMEOUT_SECONDS, DEFAULT_EXTERNAL_CONNECT_TIMEOUT_SECONDS,
+    };
 
     #[test]
     fn pull_external_connect_timeout_defaults_to_20_seconds() {
@@ -476,6 +491,12 @@ mod tests {
                 .external_registry_connection
                 .connect_timeout_seconds,
             DEFAULT_EXTERNAL_CONNECT_TIMEOUT_SECONDS
+        );
+        assert_eq!(
+            args.common
+                .external_registry_connection
+                .blob_idle_timeout_seconds,
+            DEFAULT_BLOB_IDLE_TIMEOUT_SECONDS
         );
     }
 
@@ -509,6 +530,40 @@ mod tests {
             "alpine:latest",
         ])
         .expect_err("external connect timeout should only accept -1 or non-negative values");
+
+        assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+    }
+
+    #[test]
+    fn pull_blob_idle_timeout_accepts_minus_one_to_disable() {
+        let cli = Cli::parse_from([
+            "pocker",
+            "pull",
+            "--blob-idle-timeout-seconds",
+            "-1",
+            "alpine:latest",
+        ]);
+        let Commands::Pull(args) = cli.command else {
+            panic!("expected pull command");
+        };
+
+        assert_eq!(
+            args.common
+                .external_registry_connection
+                .blob_idle_timeout_seconds,
+            -1
+        );
+    }
+
+    #[test]
+    fn pull_blob_idle_timeout_rejects_lower_negative_values() {
+        let error = Cli::try_parse_from([
+            "pocker",
+            "pull",
+            "--blob-idle-timeout-seconds=-2",
+            "alpine:latest",
+        ])
+        .expect_err("blob idle timeout should only accept -1 or non-negative values");
 
         assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
     }

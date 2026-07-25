@@ -213,6 +213,7 @@ impl TemporaryCacheRegistry {
                     registry,
                     pull_missing: false,
                     blob_retry_limit: Some(1),
+                    blob_idle_timeout: None,
                     concurrency: 1,
                     quiet: true,
                 },
