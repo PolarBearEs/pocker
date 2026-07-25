@@ -30,7 +30,9 @@ pub(crate) async fn execute(cli: Cli) -> Result<()> {
         }
         Commands::Compose(args) => match args.command {
             ComposeCommands::Config(config_args) => {
-                let resolved = resolve_compose_images(args.file).await?;
+                let resolved =
+                    resolve_compose_images(args.file, args.profile, config_args.services.clone())
+                        .await?;
                 let resolved = compose::select_services(&resolved, &config_args.services)?;
                 print_compose_config(
                     &resolved,
@@ -41,7 +43,9 @@ pub(crate) async fn execute(cli: Cli) -> Result<()> {
                 )?;
             }
             ComposeCommands::Pull(pull_args) => {
-                let resolved = resolve_compose_images(args.file).await?;
+                let resolved =
+                    resolve_compose_images(args.file, args.profile, pull_args.services.clone())
+                        .await?;
                 let resolved = compose::select_services(&resolved, &pull_args.services)?;
                 if !(resolved.skipped_build_only.is_empty()
                     || cli.global.quiet
@@ -250,14 +254,20 @@ fn write_compose_pull_plan(
     Ok(())
 }
 
-async fn resolve_compose_images(files: Vec<std::path::PathBuf>) -> Result<compose::ComposeImages> {
+async fn resolve_compose_images(
+    files: Vec<std::path::PathBuf>,
+    profiles: Vec<String>,
+    services: Vec<String>,
+) -> Result<compose::ComposeImages> {
     let working_dir = std::env::current_dir()?;
-    tokio::task::spawn_blocking(move || compose::resolve_images(&files, &working_dir))
-        .await
-        .map_err(|error| {
-            DockerPullError::InvalidInput(format!("compose resolver task panicked: {error}"))
-        })?
-        .map_err(Into::into)
+    tokio::task::spawn_blocking(move || {
+        compose::resolve_images_with_profiles(&files, &working_dir, &profiles, &services)
+    })
+    .await
+    .map_err(|error| {
+        DockerPullError::InvalidInput(format!("compose resolver task panicked: {error}"))
+    })?
+    .map_err(Into::into)
 }
 
 async fn clean_cache(store: &MaintenanceStore, quiet: bool, verbose: bool) -> Result<()> {

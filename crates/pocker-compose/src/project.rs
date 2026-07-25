@@ -48,6 +48,15 @@ struct ServiceKey {
 }
 
 pub fn resolve_images(files: &[PathBuf], working_dir: &Path) -> Result<ComposeImages> {
+    resolve_images_with_profiles(files, working_dir, &[], &[])
+}
+
+pub fn resolve_images_with_profiles(
+    files: &[PathBuf],
+    working_dir: &Path,
+    profiles: &[String],
+    services: &[String],
+) -> Result<ComposeImages> {
     let entry_files = if files.is_empty() {
         find_default_compose_files(working_dir)?
     } else {
@@ -62,6 +71,8 @@ pub fn resolve_images(files: &[PathBuf], working_dir: &Path) -> Result<ComposeIm
         .and_then(|file| file.parent())
         .unwrap_or(working_dir);
     let env = load_compose_env(project_dir)?;
+    let profiles = active_profiles(profiles, &env);
+    let selected_services = services.iter().map(String::as_str).collect::<HashSet<_>>();
     let mut project = ComposeProject {
         env,
         documents: HashMap::new(),
@@ -120,6 +131,13 @@ pub fn resolve_images(files: &[PathBuf], working_dir: &Path) -> Result<ComposeIm
             name: service.name.clone(),
         };
         let resolved = project.resolve_service(&key, &mut Vec::new())?;
+        if !service_is_active(
+            &resolved,
+            &profiles,
+            selected_services.contains(service.name.as_str()),
+        ) {
+            continue;
+        }
         let labels = service_labels(&resolved);
         if let Some(image) = mapping_get_string(value_mapping(&resolved), "image") {
             images.push(image.clone());
@@ -145,6 +163,38 @@ pub fn resolve_images(files: &[PathBuf], working_dir: &Path) -> Result<ComposeIm
         skipped_build_only,
         services: service_images,
     })
+}
+
+fn active_profiles(explicit: &[String], env: &HashMap<String, String>) -> Vec<String> {
+    if !explicit.is_empty() {
+        return explicit.to_vec();
+    }
+
+    env.get("COMPOSE_PROFILES")
+        .into_iter()
+        .flat_map(|profiles| profiles.split(','))
+        .map(str::trim)
+        .filter(|profile| !profile.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn service_is_active(service: &Value, active_profiles: &[String], selected: bool) -> bool {
+    if selected {
+        return true;
+    }
+
+    let profiles = mapping_get(value_mapping(service), "profiles")
+        .and_then(Value::as_sequence)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>();
+
+    profiles.is_empty()
+        || active_profiles
+            .iter()
+            .any(|active| active == "*" || profiles.iter().any(|profile| profile == active))
 }
 
 impl ComposeProject {

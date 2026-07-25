@@ -51,6 +51,12 @@ Pull the images referenced by a Compose project:
 pocker compose pull
 ```
 
+Enable optional Compose services with the same profile behavior as Docker Compose:
+
+```bash
+pocker compose --profile tools pull
+```
+
 ## Documentation
 
 - [Usage guide](https://github.com/PolarBearEs/pocker/wiki/Usage)

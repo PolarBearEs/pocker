@@ -7,7 +7,7 @@ mod interpolate;
 mod project;
 mod yaml;
 
-pub use project::resolve_images;
+pub use project::{resolve_images, resolve_images_with_profiles};
 
 pub type Result<T> = std::result::Result<T, ComposeError>;
 
@@ -102,7 +102,9 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::{ComposeError, resolve_images, select_services, unique_images};
+    use super::{
+        ComposeError, resolve_images, resolve_images_with_profiles, select_services, unique_images,
+    };
     use crate::interpolate::interpolate;
 
     #[test]
@@ -602,7 +604,7 @@ services:
     }
 
     #[test]
-    fn profiled_services_are_still_discovered_by_config_parser() {
+    fn compose_profiles_match_reference_activation_behavior() {
         let dir = tempdir().expect("tempdir should be created");
         fs::write(
             dir.path().join("compose.yml"),
@@ -614,6 +616,77 @@ services:
     profiles:
       - tools
     image: example/optional:latest
+  debug:
+    profiles:
+      - debug
+      - tools
+    image: example/debug:latest
+"#,
+        )
+        .expect("compose should be written");
+
+        let resolved = resolve_images(&[], dir.path()).expect("compose file should resolve");
+        assert_eq!(resolved.images, vec!["example/default:latest".to_string()]);
+
+        let resolved = resolve_images_with_profiles(&[], dir.path(), &["tools".to_string()], &[])
+            .expect("compose file should resolve with a profile");
+
+        assert_eq!(
+            resolved.images,
+            vec![
+                "example/default:latest".to_string(),
+                "example/optional:latest".to_string(),
+                "example/debug:latest".to_string(),
+            ]
+        );
+
+        let resolved = resolve_images_with_profiles(&[], dir.path(), &["*".to_string()], &[])
+            .expect("compose file should resolve with all profiles");
+        assert_eq!(resolved.services.len(), 3);
+    }
+
+    #[test]
+    fn explicitly_selected_service_activates_its_profiles() {
+        let dir = tempdir().expect("tempdir should be created");
+        fs::write(
+            dir.path().join("compose.yml"),
+            r#"
+services:
+  default:
+    image: example/default:latest
+  optional:
+    profiles: [tools]
+    image: example/optional:latest
+"#,
+        )
+        .expect("compose should be written");
+
+        let resolved =
+            resolve_images_with_profiles(&[], dir.path(), &[], &["optional".to_string()])
+                .expect("selected compose service should resolve");
+        let selected =
+            select_services(&resolved, &["optional".to_string()]).expect("service should select");
+
+        assert_eq!(selected.images, vec!["example/optional:latest".to_string()]);
+    }
+
+    #[test]
+    fn compose_profiles_fall_back_to_dotenv() {
+        let dir = tempdir().expect("tempdir should be created");
+        fs::write(dir.path().join(".env"), "COMPOSE_PROFILES=tools, debug\n")
+            .expect("env should be written");
+        fs::write(
+            dir.path().join("compose.yml"),
+            r#"
+services:
+  default:
+    image: example/default:latest
+  tools:
+    profiles: [tools]
+    image: example/tools:latest
+  debug:
+    profiles: [debug]
+    image: example/debug:latest
 "#,
         )
         .expect("compose should be written");
@@ -624,8 +697,13 @@ services:
             resolved.images,
             vec![
                 "example/default:latest".to_string(),
-                "example/optional:latest".to_string(),
+                "example/tools:latest".to_string(),
+                "example/debug:latest".to_string(),
             ]
         );
+
+        let resolved = resolve_images_with_profiles(&[], dir.path(), &["other".to_string()], &[])
+            .expect("explicit profiles should override the environment");
+        assert_eq!(resolved.images, vec!["example/default:latest".to_string()]);
     }
 }
