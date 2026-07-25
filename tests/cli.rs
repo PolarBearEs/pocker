@@ -155,6 +155,7 @@ fn compose_config_profiles_match_docker_compose_behavior() {
         .arg("compose")
         .arg("-f")
         .arg(&compose_path)
+        .args(["--profile", "other"])
         .arg("config")
         .arg("--images")
         .arg("tools")

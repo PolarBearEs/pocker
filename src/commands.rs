@@ -261,7 +261,7 @@ async fn resolve_compose_images(
 ) -> Result<compose::ComposeImages> {
     let working_dir = std::env::current_dir()?;
     tokio::task::spawn_blocking(move || {
-        compose::resolve_images_with_profiles(&files, &working_dir, &profiles, &services)
+        compose::resolve_images(&files, &working_dir, &profiles, &services)
     })
     .await
     .map_err(|error| {

@@ -47,11 +47,7 @@ struct ServiceKey {
     name: String,
 }
 
-pub fn resolve_images(files: &[PathBuf], working_dir: &Path) -> Result<ComposeImages> {
-    resolve_images_with_profiles(files, working_dir, &[], &[])
-}
-
-pub fn resolve_images_with_profiles(
+pub fn resolve_images(
     files: &[PathBuf],
     working_dir: &Path,
     profiles: &[String],

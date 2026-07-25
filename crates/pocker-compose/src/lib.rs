@@ -7,7 +7,7 @@ mod interpolate;
 mod project;
 mod yaml;
 
-pub use project::{resolve_images, resolve_images_with_profiles};
+pub use project::resolve_images;
 
 pub type Result<T> = std::result::Result<T, ComposeError>;
 
@@ -102,9 +102,7 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::{
-        ComposeError, resolve_images, resolve_images_with_profiles, select_services, unique_images,
-    };
+    use super::{ComposeError, resolve_images, select_services, unique_images};
     use crate::interpolate::interpolate;
 
     #[test]
@@ -151,7 +149,7 @@ services:
         )
         .expect("root compose should be written");
 
-        let resolved = resolve_images(&[], dir.path()).expect("images should resolve");
+        let resolved = resolve_images(&[], dir.path(), &[], &[]).expect("images should resolve");
 
         assert_eq!(
             resolved.images,
@@ -193,7 +191,7 @@ services:
         )
         .expect("override compose should be written");
 
-        let resolved = resolve_images(&[], dir.path()).expect("images should resolve");
+        let resolved = resolve_images(&[], dir.path(), &[], &[]).expect("images should resolve");
 
         assert_eq!(
             resolved.images,
@@ -232,7 +230,7 @@ services:
         )
         .expect("lower-priority override should be written");
 
-        let resolved = resolve_images(&[], dir.path()).expect("images should resolve");
+        let resolved = resolve_images(&[], dir.path(), &[], &[]).expect("images should resolve");
 
         assert_eq!(resolved.images, vec!["example/app:yml"]);
     }
@@ -261,7 +259,7 @@ services:
         )
         .expect("override compose should be written");
 
-        let resolved = resolve_images(&[], &child).expect("images should resolve");
+        let resolved = resolve_images(&[], &child, &[], &[]).expect("images should resolve");
 
         assert_eq!(resolved.images, vec!["example/app:parent-override"]);
     }
@@ -281,7 +279,7 @@ services:
         )
         .expect("compose should be written");
 
-        let resolved = resolve_images(&[], dir.path()).expect("images should resolve");
+        let resolved = resolve_images(&[], dir.path(), &[], &[]).expect("images should resolve");
 
         assert_eq!(resolved.images, Vec::<String>::new());
         assert_eq!(resolved.skipped_build_only, vec!["builder"]);
@@ -459,7 +457,7 @@ services:
         )
         .expect("override compose should be written");
 
-        let resolved = resolve_images(&[base, override_file], dir.path())
+        let resolved = resolve_images(&[base, override_file], dir.path(), &[], &[])
             .expect("compose files should resolve");
 
         assert_eq!(
@@ -494,7 +492,8 @@ services:
         )
         .expect("compose should be written");
 
-        let resolved = resolve_images(&[], dir.path()).expect("compose file should resolve");
+        let resolved =
+            resolve_images(&[], dir.path(), &[], &[]).expect("compose file should resolve");
 
         assert_eq!(resolved.images, vec!["example.com/app:1.2.3".to_string()]);
     }
@@ -562,7 +561,7 @@ services:
         )
         .expect("override compose should be written");
 
-        let resolved = resolve_images(&[base, override_file], dir.path())
+        let resolved = resolve_images(&[base, override_file], dir.path(), &[], &[])
             .expect("compose files should resolve");
 
         assert_eq!(
@@ -597,14 +596,15 @@ services:
         )
         .expect("compose should be written");
 
-        let resolved = resolve_images(&[], dir.path()).expect("compose file should resolve");
+        let resolved =
+            resolve_images(&[], dir.path(), &[], &[]).expect("compose file should resolve");
 
         assert_eq!(resolved.images, vec!["example/app:3.1".to_string()]);
         assert_eq!(resolved.services[0].service, "app");
     }
 
     #[test]
-    fn compose_profiles_match_reference_activation_behavior() {
+    fn compose_profile_filter_matches_reference_activation_behavior() {
         let dir = tempdir().expect("tempdir should be created");
         fs::write(
             dir.path().join("compose.yml"),
@@ -625,10 +625,11 @@ services:
         )
         .expect("compose should be written");
 
-        let resolved = resolve_images(&[], dir.path()).expect("compose file should resolve");
+        let resolved = resolve_images(&[], dir.path(), &[], &[])
+            .expect("compose file should resolve without an active profile");
         assert_eq!(resolved.images, vec!["example/default:latest".to_string()]);
 
-        let resolved = resolve_images_with_profiles(&[], dir.path(), &["tools".to_string()], &[])
+        let resolved = resolve_images(&[], dir.path(), &["tools".into()], &[])
             .expect("compose file should resolve with a profile");
 
         assert_eq!(
@@ -640,7 +641,7 @@ services:
             ]
         );
 
-        let resolved = resolve_images_with_profiles(&[], dir.path(), &["*".to_string()], &[])
+        let resolved = resolve_images(&[], dir.path(), &["*".into()], &[])
             .expect("compose file should resolve with all profiles");
         assert_eq!(resolved.services.len(), 3);
     }
@@ -661,9 +662,13 @@ services:
         )
         .expect("compose should be written");
 
-        let resolved =
-            resolve_images_with_profiles(&[], dir.path(), &[], &["optional".to_string()])
-                .expect("selected compose service should resolve");
+        let resolved = resolve_images(
+            &[],
+            dir.path(),
+            &["other".to_string()],
+            &["optional".to_string()],
+        )
+        .expect("selected compose service should resolve despite a different active profile");
         let selected =
             select_services(&resolved, &["optional".to_string()]).expect("service should select");
 
@@ -691,8 +696,8 @@ services:
         )
         .expect("compose should be written");
 
-        let resolved = resolve_images(&[], dir.path()).expect("compose file should resolve");
-
+        let resolved = resolve_images(&[], dir.path(), &[], &[])
+            .expect("compose profiles should resolve from the environment");
         assert_eq!(
             resolved.images,
             vec![
@@ -702,7 +707,7 @@ services:
             ]
         );
 
-        let resolved = resolve_images_with_profiles(&[], dir.path(), &["other".to_string()], &[])
+        let resolved = resolve_images(&[], dir.path(), &["other".into()], &[])
             .expect("explicit profiles should override the environment");
         assert_eq!(resolved.images, vec!["example/default:latest".to_string()]);
     }
