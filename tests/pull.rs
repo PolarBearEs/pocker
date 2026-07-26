@@ -1,23 +1,17 @@
-use std::net::SocketAddr;
 use std::process::{Command as StdCommand, Output, Stdio};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use assert_cmd::Command;
+use pocker_test_registry::{TestImage, TestRegistry};
 use predicates::str::contains;
-use sha2::{Digest, Sha256, Sha384, Sha512};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
-use tokio::task::JoinHandle;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn pulls_oci_image_from_fake_registry_into_cache() {
-    let fixture = Arc::new(Fixture::build());
-    let server = RegistryFixtureServer::spawn(Arc::clone(&fixture)).await;
+async fn pulls_oci_image_from_test_registry_into_cache() {
+    let fixture = TestImage::single_layer();
+    let server = TestRegistry::start(fixture.clone()).await;
 
     let cache_dir = tempfile::tempdir().expect("cache tempdir should create");
-    let reference = format!("{}/library/test:latest", server.address());
+    let reference = server.reference("library/test", "latest");
 
     let pocker_run = tokio::task::spawn_blocking({
         let cache = cache_dir.path().to_path_buf();
@@ -49,17 +43,17 @@ async fn pulls_oci_image_from_fake_registry_into_cache() {
         .path()
         .join("blobs")
         .join("sha256")
-        .join(&fixture.manifest_digest);
+        .join(fixture.manifest_digest());
     let layer_path = cache_dir
         .path()
         .join("blobs")
         .join("sha256")
-        .join(&fixture.layer_digest);
+        .join(fixture.layer_digest());
     let config_path = cache_dir
         .path()
         .join("blobs")
         .join("sha256")
-        .join(&fixture.config_digest);
+        .join(fixture.config_digest());
 
     assert!(
         manifest_path.exists(),
@@ -70,19 +64,17 @@ async fn pulls_oci_image_from_fake_registry_into_cache() {
         "expected config blob at {config_path:?}"
     );
     assert!(layer_path.exists(), "expected layer blob at {layer_path:?}");
+    assert_no_unexpected_requests(&server);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn pulls_multiple_oci_images_from_fake_registry_into_cache() {
-    let fixture = Arc::new(Fixture::build());
-    let layer_gets = Arc::new(AtomicUsize::new(0));
-    let server =
-        RegistryFixtureServer::spawn_with_layer_gets(Arc::clone(&fixture), Arc::clone(&layer_gets))
-            .await;
+async fn pulls_multiple_oci_images_from_test_registry_into_cache() {
+    let fixture = TestImage::single_layer();
+    let server = TestRegistry::start(fixture.clone()).await;
 
     let cache_dir = tempfile::tempdir().expect("cache tempdir should create");
-    let first_reference = format!("{}/library/test:first", server.address());
-    let second_reference = format!("{}/library/test:second", server.address());
+    let first_reference = server.reference("library/test", "first");
+    let second_reference = server.reference("library/test", "second");
 
     let pocker_run = tokio::task::spawn_blocking({
         let cache = cache_dir.path().to_path_buf();
@@ -115,17 +107,17 @@ async fn pulls_multiple_oci_images_from_fake_registry_into_cache() {
         .path()
         .join("blobs")
         .join("sha256")
-        .join(&fixture.manifest_digest);
+        .join(fixture.manifest_digest());
     let layer_path = cache_dir
         .path()
         .join("blobs")
         .join("sha256")
-        .join(&fixture.layer_digest);
+        .join(fixture.layer_digest());
     let config_path = cache_dir
         .path()
         .join("blobs")
         .join("sha256")
-        .join(&fixture.config_digest);
+        .join(fixture.config_digest());
 
     assert!(
         manifest_path.exists(),
@@ -137,32 +129,32 @@ async fn pulls_multiple_oci_images_from_fake_registry_into_cache() {
     );
     assert!(layer_path.exists(), "expected layer blob at {layer_path:?}");
     assert_eq!(
-        layer_gets.load(Ordering::SeqCst),
+        server.layer_get_count(),
         1,
         "shared layer blob should be downloaded once across concurrent image pulls"
     );
+    assert_no_unexpected_requests(&server);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn concurrent_pocker_processes_share_layer_download() {
-    let fixture = Arc::new(Fixture::build());
-    let layer_gets = Arc::new(AtomicUsize::new(0));
-    let server = RegistryFixtureServer::spawn_with_slow_layer_gets(
-        Arc::clone(&fixture),
-        Arc::clone(&layer_gets),
-    )
-    .await;
+    let fixture = TestImage::single_layer();
+    let server = TestRegistry::start_with_blocked_layer(fixture.clone()).await;
 
     let cache_dir = tempfile::tempdir().expect("cache tempdir should create");
-    let reference = format!("{}/library/test:latest", server.address());
+    let reference = server.reference("library/test", "latest");
     let bin = assert_cmd::cargo::cargo_bin("pocker");
 
     let first = pocker_pull_command(&bin, cache_dir.path(), &reference)
         .spawn()
         .expect("first pocker process should start");
+    server.wait_for_layer_gets(1).await;
+
     let second = pocker_pull_command(&bin, cache_dir.path(), &reference)
         .spawn()
         .expect("second pocker process should start");
+    server.wait_for_manifest_gets(2).await;
+    server.release_layer();
 
     let (first_output, second_output) = tokio::task::spawn_blocking(move || {
         let first_output = first
@@ -191,34 +183,29 @@ async fn concurrent_pocker_processes_share_layer_download() {
         .path()
         .join("blobs")
         .join("sha256")
-        .join(&fixture.layer_digest);
+        .join(fixture.layer_digest());
     assert!(layer_path.exists(), "expected layer blob at {layer_path:?}");
     assert_eq!(
-        layer_gets.load(Ordering::SeqCst),
+        server.layer_get_count(),
         1,
         "shared layer blob should be downloaded once across pocker processes"
     );
+    assert_no_unexpected_requests(&server);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn interrupted_pocker_process_releases_cache_and_blob_locks() {
-    let fixture = Arc::new(Fixture::build());
-    let layer_gets = Arc::new(AtomicUsize::new(0));
-    let server = RegistryFixtureServer::spawn_with_delayed_layer_gets(
-        Arc::clone(&fixture),
-        Arc::clone(&layer_gets),
-        Duration::from_secs(3),
-    )
-    .await;
+    let fixture = TestImage::single_layer();
+    let server = TestRegistry::start_with_blocked_layer(fixture.clone()).await;
 
     let cache_dir = tempfile::tempdir().expect("cache tempdir should create");
-    let reference = format!("{}/library/test:latest", server.address());
+    let reference = server.reference("library/test", "latest");
     let bin = assert_cmd::cargo::cargo_bin("pocker");
     let mut interrupted = pocker_pull_command(&bin, cache_dir.path(), &reference)
         .spawn()
         .expect("interrupted pocker process should start");
 
-    wait_for_layer_get(&layer_gets).await;
+    server.wait_for_layer_gets(1).await;
     interrupted
         .kill()
         .expect("interrupted pocker process should be killed");
@@ -233,6 +220,7 @@ async fn interrupted_pocker_process_releases_cache_and_blob_locks() {
         !interrupted_status.success(),
         "interrupted process should not report success"
     );
+    server.release_layer();
 
     Command::cargo_bin("pocker")
         .expect("pocker binary should be built")
@@ -257,8 +245,9 @@ async fn interrupted_pocker_process_releases_cache_and_blob_locks() {
         .path()
         .join("blobs")
         .join("sha256")
-        .join(&fixture.layer_digest);
+        .join(fixture.layer_digest());
     assert!(layer_path.exists(), "expected layer blob at {layer_path:?}");
+    assert_no_unexpected_requests(&server);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -272,11 +261,11 @@ async fn pulls_oci_image_with_sha512_layer_digest_into_cache() {
 }
 
 async fn pulls_oci_image_with_layer_algorithm_into_cache(algorithm: &'static str) {
-    let fixture = Arc::new(Fixture::build_with_layer_algorithm(algorithm));
-    let server = RegistryFixtureServer::spawn(Arc::clone(&fixture)).await;
+    let fixture = TestImage::with_layer_algorithm(algorithm);
+    let server = TestRegistry::start(fixture.clone()).await;
 
     let cache_dir = tempfile::tempdir().expect("cache tempdir should create");
-    let reference = format!("{}/library/test:latest", server.address());
+    let reference = server.reference("library/test", "latest");
 
     let pocker_run = tokio::task::spawn_blocking({
         let cache = cache_dir.path().to_path_buf();
@@ -308,20 +297,19 @@ async fn pulls_oci_image_with_layer_algorithm_into_cache(algorithm: &'static str
         .path()
         .join("blobs")
         .join(algorithm)
-        .join(&fixture.layer_digest);
+        .join(fixture.layer_digest());
 
     assert!(layer_path.exists(), "expected layer blob at {layer_path:?}");
+    assert_no_unexpected_requests(&server);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pull_rejects_malformed_layer_digest_before_cache_path_use() {
-    let fixture = Arc::new(Fixture::build_with_layer_digest(
-        "sha256:../../outside".to_string(),
-    ));
-    let server = RegistryFixtureServer::spawn(Arc::clone(&fixture)).await;
+    let fixture = TestImage::with_layer_descriptor_digest("sha256:../../outside".to_string());
+    let server = TestRegistry::start(fixture).await;
 
     let cache_dir = tempfile::tempdir().expect("cache tempdir should create");
-    let reference = format!("{}/library/test:latest", server.address());
+    let reference = server.reference("library/test", "latest");
 
     let pocker_run = tokio::task::spawn_blocking({
         let cache = cache_dir.path().to_path_buf();
@@ -354,153 +342,38 @@ async fn pull_rejects_malformed_layer_digest_before_cache_path_use() {
         !cache_dir.path().join("outside").exists(),
         "malformed digest must not create paths outside the digest cache"
     );
+    assert_no_unexpected_requests(&server);
 }
 
-struct RegistryFixtureServer {
-    address: SocketAddr,
-    task: JoinHandle<()>,
-}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn registry_retry_exhaustion_is_reported_by_cli() {
+    let server = TestRegistry::start_unavailable().await;
+    let cache_dir = tempfile::tempdir().expect("cache tempdir should create");
+    let reference = server.reference("sample", "latest");
 
-impl RegistryFixtureServer {
-    async fn spawn(fixture: Arc<Fixture>) -> Self {
-        Self::spawn_with_optional_layer_gets(fixture, None, None).await
-    }
-
-    async fn spawn_with_layer_gets(fixture: Arc<Fixture>, layer_gets: Arc<AtomicUsize>) -> Self {
-        Self::spawn_with_optional_layer_gets(fixture, Some(layer_gets), None).await
-    }
-
-    async fn spawn_with_slow_layer_gets(
-        fixture: Arc<Fixture>,
-        layer_gets: Arc<AtomicUsize>,
-    ) -> Self {
-        Self::spawn_with_delayed_layer_gets(fixture, layer_gets, Duration::from_millis(300)).await
-    }
-
-    async fn spawn_with_delayed_layer_gets(
-        fixture: Arc<Fixture>,
-        layer_gets: Arc<AtomicUsize>,
-        delay: Duration,
-    ) -> Self {
-        Self::spawn_with_optional_layer_gets(fixture, Some(layer_gets), Some(delay)).await
-    }
-
-    async fn spawn_with_optional_layer_gets(
-        fixture: Arc<Fixture>,
-        layer_gets: Option<Arc<AtomicUsize>>,
-        layer_body_delay: Option<Duration>,
-    ) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("fake registry should bind");
-        let address = listener
-            .local_addr()
-            .expect("listener should expose address");
-
-        let task = tokio::spawn(async move {
-            loop {
-                let (stream, _peer) = match listener.accept().await {
-                    Ok(pair) => pair,
-                    Err(_) => return,
-                };
-                let request_fixture = Arc::clone(&fixture);
-                let request_layer_gets = layer_gets.clone();
-                let request_layer_body_delay = layer_body_delay;
-                tokio::spawn(async move {
-                    let _ = handle_connection_with_optional_layer_gets(
-                        stream,
-                        request_fixture,
-                        request_layer_gets,
-                        request_layer_body_delay,
-                    )
-                    .await;
-                });
-            }
-        });
-
-        Self { address, task }
-    }
-
-    fn address(&self) -> SocketAddr {
-        self.address
-    }
-}
-
-impl Drop for RegistryFixtureServer {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
-}
-
-struct Fixture {
-    manifest_bytes: Vec<u8>,
-    manifest_digest: String,
-    config_bytes: Vec<u8>,
-    config_digest: String,
-    layer_bytes: Vec<u8>,
-    layer_digest: String,
-}
-
-impl Fixture {
-    fn build() -> Self {
-        Self::build_with_layer_algorithm("sha256")
-    }
-
-    fn build_with_layer_algorithm(algorithm: &str) -> Self {
-        let layer_bytes = b"fake layer payload".to_vec();
-        let layer_digest = digest_hex(algorithm, &layer_bytes);
-        Self::build_with_layer_digest(format!("{algorithm}:{layer_digest}"))
-    }
-
-    fn build_with_layer_digest(layer_descriptor_digest: String) -> Self {
-        let layer_bytes = b"fake layer payload".to_vec();
-        let layer_diff_id = sha256_hex(&layer_bytes);
-        let layer_digest = layer_descriptor_digest
-            .split_once(':')
-            .map(|(_, value)| value.to_string())
-            .unwrap_or_else(|| layer_descriptor_digest.clone());
-        let config_bytes = format!(
-            r#"{{"architecture":"amd64","os":"linux","rootfs":{{"type":"layers","diff_ids":["sha256:{layer_diff_id}"]}}}}"#
-        )
-        .into_bytes();
-        let config_digest = sha256_hex(&config_bytes);
-
-        let manifest_bytes = format!(
-            r#"{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:{config_digest}","size":{config_size}}},"layers":[{{"mediaType":"application/vnd.oci.image.layer.v1.tar","digest":"{layer_descriptor_digest}","size":{layer_size}}}]}}"#,
-            config_size = config_bytes.len(),
-            layer_size = layer_bytes.len(),
-        )
-        .into_bytes();
-        let manifest_digest = sha256_hex(&manifest_bytes);
-
-        Self {
-            manifest_bytes,
-            manifest_digest,
-            config_bytes,
-            config_digest,
-            layer_bytes,
-            layer_digest,
-        }
-    }
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    digest_hex("sha256", bytes)
-}
-
-fn digest_hex(algorithm: &str, bytes: &[u8]) -> String {
-    match algorithm {
-        "sha256" => hash_hex::<Sha256>(bytes),
-        "sha384" => hash_hex::<Sha384>(bytes),
-        "sha512" => hash_hex::<Sha512>(bytes),
-        other => panic!("unsupported test digest algorithm {other}"),
-    }
-}
-
-fn hash_hex<D: Digest>(bytes: &[u8]) -> String {
-    let mut hasher = D::new();
-    hasher.update(bytes);
-    hex::encode(hasher.finalize())
+    tokio::task::spawn_blocking(move || {
+        Command::cargo_bin("pocker")
+            .expect("pocker binary should be built")
+            .arg("--cache-dir")
+            .arg(cache_dir.path())
+            .args([
+                "pull",
+                "--plain-http",
+                "--no-load",
+                "--quiet",
+                "--request-retries",
+                "1",
+                "--blob-retries",
+                "0",
+            ])
+            .arg(reference)
+            .timeout(Duration::from_secs(30))
+            .assert()
+            .failure()
+            .stderr(contains("retry limit exceeded for registry request"));
+    })
+    .await
+    .expect("pocker subprocess should run");
 }
 
 fn pocker_pull_command(
@@ -537,84 +410,10 @@ fn process_output(name: &str, output: &Output) -> String {
     )
 }
 
-async fn wait_for_layer_get(layer_gets: &AtomicUsize) {
-    tokio::time::timeout(Duration::from_secs(2), async {
-        while layer_gets.load(Ordering::SeqCst) == 0 {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("layer download should start");
-}
-
-async fn handle_connection_with_optional_layer_gets(
-    mut stream: TcpStream,
-    fixture: Arc<Fixture>,
-    layer_gets: Option<Arc<AtomicUsize>>,
-    layer_body_delay: Option<Duration>,
-) -> std::io::Result<()> {
-    let mut buffer = Vec::with_capacity(2048);
-    let mut chunk = [0_u8; 1024];
-    loop {
-        let n = stream.read(&mut chunk).await?;
-        if n == 0 {
-            return Ok(());
-        }
-        buffer.extend_from_slice(&chunk[..n]);
-        if buffer.windows(4).any(|window| window == b"\r\n\r\n") {
-            break;
-        }
-        if buffer.len() > 8192 {
-            return Ok(());
-        }
-    }
-
-    let head =
-        std::str::from_utf8(&buffer).map_err(|err| std::io::Error::other(err.to_string()))?;
-    let mut tokens = head
-        .split("\r\n")
-        .next()
-        .unwrap_or_default()
-        .split_whitespace();
-    let method = tokens.next().unwrap_or_default().to_string();
-    let path = tokens.next().unwrap_or_default().to_string();
-
-    let mut delay_body = false;
-    let (status, content_type, body): (&str, &str, &[u8]) = if path.contains("/manifests/") {
-        (
-            "200 OK",
-            "application/vnd.oci.image.manifest.v1+json",
-            &fixture.manifest_bytes,
-        )
-    } else if path.ends_with(&fixture.config_digest) {
-        (
-            "200 OK",
-            "application/vnd.oci.image.config.v1+json",
-            &fixture.config_bytes,
-        )
-    } else if path.ends_with(&fixture.layer_digest) {
-        if method != "HEAD"
-            && let Some(layer_gets) = &layer_gets
-        {
-            layer_gets.fetch_add(1, Ordering::SeqCst);
-        }
-        delay_body = true;
-        ("200 OK", "application/octet-stream", &fixture.layer_bytes)
-    } else {
-        ("404 Not Found", "text/plain", &[][..])
-    };
-
-    let response_head = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n",
-        len = body.len(),
+fn assert_no_unexpected_requests(server: &TestRegistry) {
+    let unexpected = server.unexpected_requests();
+    assert!(
+        unexpected.is_empty(),
+        "test registry received unexpected requests: {unexpected:?}"
     );
-    stream.write_all(response_head.as_bytes()).await?;
-    if method != "HEAD" {
-        if delay_body && let Some(delay) = layer_body_delay {
-            tokio::time::sleep(delay).await;
-        }
-        stream.write_all(body).await?;
-    }
-    stream.shutdown().await.ok();
-    Ok(())
 }
