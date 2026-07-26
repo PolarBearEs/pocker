@@ -57,15 +57,6 @@ Enable optional Compose services with the same profile behavior as Docker Compos
 pocker compose --profile tools pull
 ```
 
-Repeat `--profile` to enable multiple profiles. When no profile flag is given,
-pocker reads the comma-separated `COMPOSE_PROFILES` value from the process
-environment or the Compose project's `.env` file; the process environment takes
-precedence. Use `*` to enable every profile:
-
-```bash
-COMPOSE_PROFILES='*' pocker compose config --images
-```
-
 ## Documentation
 
 - [Usage guide](https://github.com/PolarBearEs/pocker/wiki/Usage)
