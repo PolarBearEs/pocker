@@ -281,11 +281,9 @@ async fn handle_connection(mut stream: TcpStream, state: Arc<ServerState>) -> io
     let (method, path) = read_request(&mut stream).await?;
     let head_only = method == "HEAD";
 
-    if matches!(&state.response, ResponseMode::Unavailable) {
-        return write_unavailable(&mut stream).await;
-    }
-    let ResponseMode::Image(image) = &state.response else {
-        unreachable!("unavailable responses return before image routing")
+    let image = match &state.response {
+        ResponseMode::Unavailable => return write_unavailable(&mut stream).await,
+        ResponseMode::Image(image) => image,
     };
 
     if path == "/v2/" {
