@@ -64,6 +64,7 @@ async fn pulls_oci_image_from_test_registry_into_cache() {
         "expected config blob at {config_path:?}"
     );
     assert!(layer_path.exists(), "expected layer blob at {layer_path:?}");
+    assert_no_unexpected_requests(&server);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -132,6 +133,7 @@ async fn pulls_multiple_oci_images_from_test_registry_into_cache() {
         1,
         "shared layer blob should be downloaded once across concurrent image pulls"
     );
+    assert_no_unexpected_requests(&server);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -146,11 +148,12 @@ async fn concurrent_pocker_processes_share_layer_download() {
     let first = pocker_pull_command(&bin, cache_dir.path(), &reference)
         .spawn()
         .expect("first pocker process should start");
+    server.wait_for_layer_gets(1).await;
+
     let second = pocker_pull_command(&bin, cache_dir.path(), &reference)
         .spawn()
         .expect("second pocker process should start");
-
-    server.wait_for_layer_gets(1).await;
+    server.wait_for_manifest_gets(2).await;
     server.release_layer();
 
     let (first_output, second_output) = tokio::task::spawn_blocking(move || {
@@ -187,6 +190,7 @@ async fn concurrent_pocker_processes_share_layer_download() {
         1,
         "shared layer blob should be downloaded once across pocker processes"
     );
+    assert_no_unexpected_requests(&server);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -243,6 +247,7 @@ async fn interrupted_pocker_process_releases_cache_and_blob_locks() {
         .join("sha256")
         .join(fixture.layer_digest());
     assert!(layer_path.exists(), "expected layer blob at {layer_path:?}");
+    assert_no_unexpected_requests(&server);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -295,6 +300,7 @@ async fn pulls_oci_image_with_layer_algorithm_into_cache(algorithm: &'static str
         .join(fixture.layer_digest());
 
     assert!(layer_path.exists(), "expected layer blob at {layer_path:?}");
+    assert_no_unexpected_requests(&server);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -336,6 +342,38 @@ async fn pull_rejects_malformed_layer_digest_before_cache_path_use() {
         !cache_dir.path().join("outside").exists(),
         "malformed digest must not create paths outside the digest cache"
     );
+    assert_no_unexpected_requests(&server);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn registry_retry_exhaustion_is_reported_by_cli() {
+    let server = TestRegistry::start_unavailable().await;
+    let cache_dir = tempfile::tempdir().expect("cache tempdir should create");
+    let reference = server.reference("sample", "latest");
+
+    tokio::task::spawn_blocking(move || {
+        Command::cargo_bin("pocker")
+            .expect("pocker binary should be built")
+            .arg("--cache-dir")
+            .arg(cache_dir.path())
+            .args([
+                "pull",
+                "--plain-http",
+                "--no-load",
+                "--quiet",
+                "--request-retries",
+                "1",
+                "--blob-retries",
+                "0",
+            ])
+            .arg(reference)
+            .timeout(Duration::from_secs(30))
+            .assert()
+            .failure()
+            .stderr(contains("retry limit exceeded for registry request"));
+    })
+    .await
+    .expect("pocker subprocess should run");
 }
 
 fn pocker_pull_command(
@@ -370,4 +408,12 @@ fn process_output(name: &str, output: &Output) -> String {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     )
+}
+
+fn assert_no_unexpected_requests(server: &TestRegistry) {
+    let unexpected = server.unexpected_requests();
+    assert!(
+        unexpected.is_empty(),
+        "test registry received unexpected requests: {unexpected:?}"
+    );
 }
