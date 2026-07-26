@@ -11,9 +11,9 @@ check:
 
 precommit:
   cargo fmt
-  cargo clippy --all-targets --all-features -- -D warnings
-  cargo test --all-targets --all-features
-  cargo build --locked
+  cargo clippy --workspace --all-targets --all-features -- -D warnings
+  cargo test --workspace --all-targets --all-features
+  cargo build --workspace --locked
 
 test:
   cargo test
@@ -23,10 +23,6 @@ build:
 
 build-release:
   cargo build --release
-
-smoke-registry:
-  cargo build
-  ./ci/smoke-registry-behavior.sh target/debug/pocker
 
 smoke-docker:
   cargo build
