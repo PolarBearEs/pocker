@@ -33,8 +33,14 @@ pub(crate) async fn execute(cli: Cli) -> Result<()> {
         }
         Commands::Compose(args) => match args.command {
             ComposeCommands::Config(config_args) => {
-                let resolved = resolve_compose_images(args.file).await?;
-                let resolved = compose::select_services(&resolved, &config_args.services)?;
+                let resolved = resolve_compose_images(
+                    args.file,
+                    compose::ComposeOptions {
+                        profiles: args.profile,
+                        services: config_args.services.clone(),
+                    },
+                )
+                .await?;
                 print_compose_config(
                     &resolved,
                     config_args.images,
@@ -44,8 +50,14 @@ pub(crate) async fn execute(cli: Cli) -> Result<()> {
                 )?;
             }
             ComposeCommands::Pull(pull_args) => {
-                let resolved = resolve_compose_images(args.file).await?;
-                let resolved = compose::select_services(&resolved, &pull_args.services)?;
+                let resolved = resolve_compose_images(
+                    args.file,
+                    compose::ComposeOptions {
+                        profiles: args.profile,
+                        services: pull_args.services.clone(),
+                    },
+                )
+                .await?;
                 if !(resolved.skipped_build_only.is_empty()
                     || cli.global.quiet
                     || pull_args.common.output.quiet)
@@ -259,9 +271,12 @@ fn write_compose_pull_plan(
     Ok(())
 }
 
-async fn resolve_compose_images(files: Vec<std::path::PathBuf>) -> Result<compose::ComposeImages> {
+async fn resolve_compose_images(
+    files: Vec<std::path::PathBuf>,
+    options: compose::ComposeOptions,
+) -> Result<compose::ComposeImages> {
     let working_dir = std::env::current_dir()?;
-    tokio::task::spawn_blocking(move || compose::resolve_images(&files, &working_dir))
+    tokio::task::spawn_blocking(move || compose::resolve_images(&files, &working_dir, &options))
         .await
         .map_err(|error| {
             DockerPullError::InvalidInput(format!("compose resolver task panicked: {error}"))

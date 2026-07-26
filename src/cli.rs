@@ -62,6 +62,12 @@ pub struct ComposeArgs {
         help = "Compose configuration file; can be used multiple times"
     )]
     pub file: Vec<PathBuf>,
+    #[arg(
+        long,
+        value_name = "PROFILE",
+        help = "Specify a profile to enable; can be used multiple times"
+    )]
+    pub profile: Vec<String>,
     #[command(subcommand)]
     pub command: ComposeCommands,
 }
@@ -881,6 +887,24 @@ mod tests {
 
         assert_eq!(args.file.len(), 2);
         assert_eq!(pull.services, vec!["app"]);
+    }
+
+    #[test]
+    fn compose_accepts_repeated_profiles() {
+        let cli = Cli::parse_from([
+            "pocker",
+            "compose",
+            "--profile",
+            "frontend",
+            "--profile",
+            "debug",
+            "pull",
+        ]);
+        let Commands::Compose(args) = cli.command else {
+            panic!("expected compose command");
+        };
+
+        assert_eq!(args.profile, vec!["frontend", "debug"]);
     }
 
     #[test]
