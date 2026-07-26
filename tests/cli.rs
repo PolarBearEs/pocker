@@ -165,6 +165,39 @@ fn compose_config_profiles_match_docker_compose_behavior() {
 }
 
 #[test]
+fn compose_profiles_process_env_overrides_dotenv_and_supports_wildcard() {
+    let dir = tempfile::tempdir().expect("tempdir should create");
+    fs::write(dir.path().join(".env"), "COMPOSE_PROFILES=missing\n").expect("env should write");
+    let compose_path = dir.path().join("docker-compose.yml");
+    fs::write(
+        &compose_path,
+        concat!(
+            "services:\n",
+            "  default:\n",
+            "    image: example/default:latest\n",
+            "  tools:\n",
+            "    profiles: [tools]\n",
+            "    image: example/tools:latest\n",
+            "  debug:\n",
+            "    profiles: [debug]\n",
+            "    image: example/debug:latest\n",
+        ),
+    )
+    .expect("compose file should write");
+
+    pocker()
+        .env("COMPOSE_PROFILES", "*")
+        .arg("compose")
+        .arg("-f")
+        .arg(&compose_path)
+        .arg("config")
+        .arg("--images")
+        .assert()
+        .success()
+        .stdout("example/default:latest\nexample/tools:latest\nexample/debug:latest\n");
+}
+
+#[test]
 fn compose_config_does_not_interpolate_mapping_keys() {
     let dir = tempfile::tempdir().expect("tempdir should create");
     let compose_path = dir.path().join("docker-compose.yml");

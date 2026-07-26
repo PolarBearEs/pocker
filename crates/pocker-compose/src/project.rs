@@ -10,7 +10,9 @@ use crate::yaml::{
     Service, collect_extends_files, collect_includes, collect_services, mapping_get,
     mapping_get_string, mapping_has_key, merge_values, value_mapping,
 };
-use crate::{ComposeError, ComposeImages, ComposeServiceImage, Result};
+use crate::{
+    ComposeError, ComposeImages, ComposeOptions, ComposeServiceImage, Result, select_services,
+};
 
 const DEFAULT_COMPOSE_FILES: [&str; 4] = [
     "compose.yaml",
@@ -50,8 +52,7 @@ struct ServiceKey {
 pub fn resolve_images(
     files: &[PathBuf],
     working_dir: &Path,
-    profiles: &[String],
-    services: &[String],
+    options: &ComposeOptions,
 ) -> Result<ComposeImages> {
     let entry_files = if files.is_empty() {
         find_default_compose_files(working_dir)?
@@ -67,8 +68,12 @@ pub fn resolve_images(
         .and_then(|file| file.parent())
         .unwrap_or(working_dir);
     let env = load_compose_env(project_dir)?;
-    let profiles = active_profiles(profiles, &env);
-    let selected_services = services.iter().map(String::as_str).collect::<HashSet<_>>();
+    let profiles = active_profiles(&options.profiles, &env);
+    let selected_services = options
+        .services
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
     let mut project = ComposeProject {
         env,
         documents: HashMap::new(),
@@ -128,10 +133,11 @@ pub fn resolve_images(
         };
         let resolved = project.resolve_service(&key, &mut Vec::new())?;
         if !service_is_active(
+            &service.name,
             &resolved,
             &profiles,
             selected_services.contains(service.name.as_str()),
-        ) {
+        )? {
             continue;
         }
         let labels = service_labels(&resolved);
@@ -154,11 +160,16 @@ pub fn resolve_images(
         }
     }
 
-    Ok(ComposeImages {
+    let resolved = ComposeImages {
         images,
         skipped_build_only,
         services: service_images,
-    })
+    };
+    if options.services.is_empty() {
+        Ok(resolved)
+    } else {
+        select_services(&resolved, &options.services)
+    }
 }
 
 fn active_profiles(explicit: &[String], env: &HashMap<String, String>) -> Vec<String> {
@@ -175,22 +186,43 @@ fn active_profiles(explicit: &[String], env: &HashMap<String, String>) -> Vec<St
         .collect()
 }
 
-fn service_is_active(service: &Value, active_profiles: &[String], selected: bool) -> bool {
+fn service_is_active(
+    service_name: &str,
+    service: &Value,
+    active_profiles: &[String],
+    selected: bool,
+) -> Result<bool> {
+    let Some(profiles) = mapping_get(value_mapping(service), "profiles") else {
+        return Ok(true);
+    };
+    let Value::Sequence(profiles) = profiles else {
+        return Err(ComposeError::InvalidInput(format!(
+            "compose service `{service_name}` profiles must be a list"
+        )));
+    };
+    let profiles = profiles
+        .iter()
+        .enumerate()
+        .map(|(index, profile)| {
+            profile.as_str().ok_or_else(|| {
+                ComposeError::InvalidInput(format!(
+                    "compose service `{service_name}` profile at index {index} must be a string"
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    // Compose activates a targeted service's profiles before narrowing the project.
+    // Pocker has no dependency expansion, so only the target can survive narrowing;
+    // directly enabling it produces the same config and pull output today.
     if selected {
-        return true;
+        return Ok(true);
     }
 
-    let profiles = mapping_get(value_mapping(service), "profiles")
-        .and_then(Value::as_sequence)
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .collect::<Vec<_>>();
-
-    profiles.is_empty()
+    Ok(profiles.is_empty()
         || active_profiles
             .iter()
-            .any(|active| active == "*" || profiles.iter().any(|profile| profile == active))
+            .any(|active| active == "*" || profiles.iter().any(|profile| profile == active)))
 }
 
 impl ComposeProject {
