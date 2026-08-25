@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
@@ -86,13 +86,21 @@ struct ChosenImageLayers {
 
 pub struct MaterializedDaemonLayers {
     _tempdir: TempDir,
-    paths: HashMap<String, PathBuf>,
+    layers: HashMap<String, MaterializedDaemonLayer>,
 }
 
 impl MaterializedDaemonLayers {
-    pub(crate) fn paths(&self) -> &HashMap<String, PathBuf> {
-        &self.paths
+    pub(crate) fn layers(&self) -> &HashMap<String, MaterializedDaemonLayer> {
+        &self.layers
     }
+}
+
+#[derive(Debug)]
+pub(crate) struct MaterializedDaemonLayer {
+    pub(crate) path: PathBuf,
+    pub(crate) digest: String,
+    pub(crate) size: i64,
+    pub(crate) gzip_compressed: bool,
 }
 
 async fn list_daemon_images(daemon: &DockerDaemon) -> Result<Vec<DaemonImage>> {
@@ -175,7 +183,7 @@ pub async fn materialize_daemon_layers(
     if wanted.is_empty() {
         return Ok(MaterializedDaemonLayers {
             _tempdir: tempfile::tempdir_in(store.root())?,
-            paths: HashMap::new(),
+            layers: HashMap::new(),
         });
     }
 
@@ -202,7 +210,7 @@ pub async fn materialize_daemon_layers(
 
     Ok(MaterializedDaemonLayers {
         _tempdir: tempdir,
-        paths,
+        layers: paths,
     })
 }
 
@@ -251,7 +259,7 @@ async fn materialize_layers_from_saved_image(
     daemon: &DockerDaemon,
     chosen: &ChosenImageLayers,
     output_root: &Path,
-    paths: &mut HashMap<String, PathBuf>,
+    paths: &mut HashMap<String, MaterializedDaemonLayer>,
 ) -> Result<()> {
     let temp = NamedTempFile::new_in(store.root())?;
     if daemon
@@ -281,7 +289,7 @@ fn materialize_layers_from_saved_archive(
     archive_path: &Path,
     chosen: &ChosenImageLayers,
     output_root: &Path,
-) -> Result<HashMap<String, PathBuf>> {
+) -> Result<HashMap<String, MaterializedDaemonLayer>> {
     let entries = save_manifest_entries(archive_path)?;
     let Some(entry) = entries.into_iter().next() else {
         return Ok(HashMap::new());
@@ -316,9 +324,38 @@ fn materialize_layers_from_saved_archive(
         if paths.contains_key(diff_id) {
             continue;
         }
+        let entry_offset = entry.raw_file_position();
+        let entry_size = entry.size();
         let destination = extracted_layer_path(output_root, diff_id)?;
-        copy_archive_entry_with_digest(&mut entry, &destination, diff_id)?;
-        paths.insert(diff_id.clone(), destination);
+        let actual_digest = copy_archive_entry_with_digest(&mut entry, &destination, diff_id)?;
+        let gzip_compressed = if actual_digest == *diff_id {
+            false
+        } else if archive_entry_has_gzip_header(archive_path, entry_offset, entry_size)? {
+            // Containerd-backed Docker saves preserve compressed OCI blobs.
+            // Keep that representation and its actual content digest; the OCI
+            // archive writer will describe it as gzip instead of expanding it
+            // into another layer-sized temporary file.
+            true
+        } else {
+            return Err(DockerPullError::DigestMismatch {
+                expected: diff_id.clone(),
+                actual: actual_digest,
+            });
+        };
+        let size = i64::try_from(entry_size).map_err(|_| {
+            DockerPullError::InvalidInput(format!(
+                "saved Docker layer `{path}` is too large for an OCI descriptor"
+            ))
+        })?;
+        paths.insert(
+            diff_id.clone(),
+            MaterializedDaemonLayer {
+                path: destination,
+                digest: actual_digest,
+                size,
+                gzip_compressed,
+            },
+        );
     }
 
     Ok(paths)
@@ -349,17 +386,186 @@ fn extracted_layer_path(root: &Path, diff_id: &str) -> Result<PathBuf> {
 fn copy_archive_entry_with_digest<R: Read>(
     reader: &mut R,
     path: &Path,
-    expected_digest: &str,
-) -> Result<()> {
+    digest_template: &str,
+) -> Result<String> {
     let mut file = File::create(path)?;
-    let actual_digest = copy_reader_with_digest(expected_digest, reader, &mut file)?;
+    let actual_digest = copy_reader_with_digest(digest_template, reader, &mut file)?;
     file.flush()?;
     file.sync_data()?;
-    if actual_digest != expected_digest {
-        return Err(DockerPullError::DigestMismatch {
-            expected: expected_digest.to_string(),
-            actual: actual_digest,
-        });
+    Ok(actual_digest)
+}
+
+fn archive_entry_has_gzip_header(
+    archive_path: &Path,
+    entry_offset: u64,
+    entry_size: u64,
+) -> Result<bool> {
+    let mut archive = File::open(archive_path)?;
+    archive.seek(SeekFrom::Start(entry_offset))?;
+    let entry = archive.take(entry_size);
+    let decoder = flate2::read::GzDecoder::new(entry);
+    Ok(decoder.header().is_some())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::io::{Cursor, Write};
+
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+    use tar::{Builder, Header};
+    use tempfile::tempdir;
+
+    use super::{
+        ChosenImageLayers, copy_archive_entry_with_digest, materialize_layers_from_saved_archive,
+    };
+    use crate::digest::canonical_digest_bytes;
+    use crate::docker::daemon::DaemonImage;
+
+    #[test]
+    fn daemon_layer_materialization_preserves_uncompressed_entries() {
+        let dir = tempdir().expect("tempdir should create");
+        let destination = dir.path().join("layer.tar");
+        let layer = b"uncompressed layer tar bytes";
+        let digest = canonical_digest_bytes(layer);
+
+        let actual = copy_archive_entry_with_digest(&mut Cursor::new(layer), &destination, &digest)
+            .expect("uncompressed layer should materialize");
+
+        assert_eq!(actual, digest);
+        assert_eq!(
+            fs::read(destination).expect("materialized layer should read"),
+            layer
+        );
     }
-    Ok(())
+
+    #[test]
+    fn daemon_layer_materialization_prefers_a_matching_raw_digest_over_gzip_decoding() {
+        let dir = tempdir().expect("tempdir should create");
+        let destination = dir.path().join("layer.tar");
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder
+            .write_all(b"decompressed bytes must not be selected")
+            .expect("layer should gzip successfully");
+        let layer = encoder.finish().expect("gzip stream should finish");
+        let digest = canonical_digest_bytes(&layer);
+
+        let actual =
+            copy_archive_entry_with_digest(&mut Cursor::new(&layer), &destination, &digest)
+                .expect("matching raw bytes should materialize without decoding");
+
+        assert_eq!(actual, digest);
+        assert_eq!(
+            fs::read(destination).expect("materialized layer should read"),
+            layer
+        );
+    }
+
+    #[test]
+    fn daemon_layer_materialization_hashes_gzip_bytes_without_expanding_them() {
+        let dir = tempdir().expect("tempdir should create");
+        let destination = dir.path().join("layer.tar");
+        // An empty tar stream reproduces the well-known Docker diff_id
+        // sha256:5f70bf18..., whose gzip-compressed blob has a different
+        // registry digest.
+        let layer = vec![0_u8; 1024];
+        let digest = canonical_digest_bytes(&layer);
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder
+            .write_all(&layer)
+            .expect("layer should gzip successfully");
+        let compressed = encoder.finish().expect("gzip stream should finish");
+
+        let actual = copy_archive_entry_with_digest(
+            &mut Cursor::new(compressed.clone()),
+            &destination,
+            &digest,
+        )
+        .expect("gzip bytes should be copied without decoding");
+
+        assert_eq!(actual, canonical_digest_bytes(&compressed));
+        assert_ne!(actual, digest);
+        assert_eq!(
+            fs::read(destination).expect("materialized layer should read"),
+            compressed
+        );
+    }
+
+    #[test]
+    fn containerd_style_docker_save_archive_materializes_compressed_blob_by_diff_id() {
+        let dir = tempdir().expect("tempdir should create");
+        let archive_path = dir.path().join("image.tar");
+        let output_root = dir.path().join("materialized");
+        fs::create_dir(&output_root).expect("output directory should create");
+
+        let layer = vec![0_u8; 1024];
+        let diff_id = canonical_digest_bytes(&layer);
+        assert_eq!(
+            diff_id,
+            "sha256:5f70bf18a086007016e948b04aed3b82103a36bea41755b6cddfaf10ace3c6ef"
+        );
+
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder
+            .write_all(&layer)
+            .expect("layer should gzip successfully");
+        let compressed = encoder.finish().expect("gzip stream should finish");
+        assert_ne!(canonical_digest_bytes(&compressed), diff_id);
+
+        let blob_digest = canonical_digest_bytes(&compressed);
+        let blob_path = format!(
+            "blobs/sha256/{}",
+            blob_digest
+                .strip_prefix("sha256:")
+                .expect("test blob should use sha256")
+        );
+        let manifest = serde_json::to_vec(&serde_json::json!([{
+            "Config": "blobs/sha256/config",
+            "RepoTags": ["example.test/image:latest"],
+            "Layers": [&blob_path]
+        }]))
+        .expect("manifest should serialize");
+
+        let archive_file = fs::File::create(&archive_path).expect("archive should create");
+        let mut archive = Builder::new(archive_file);
+        append_archive_bytes(&mut archive, "manifest.json", &manifest);
+        append_archive_bytes(&mut archive, &blob_path, &compressed);
+        archive.finish().expect("archive should finish");
+        drop(archive);
+
+        let image: DaemonImage = serde_json::from_value(serde_json::json!({
+            "Id": "sha256:test-image",
+            "RepoTags": ["example.test/image:latest"],
+            "RootFS": { "Layers": [&diff_id] }
+        }))
+        .expect("daemon image should deserialize");
+        let chosen = ChosenImageLayers {
+            image,
+            diff_ids: vec![diff_id.clone()],
+        };
+
+        let paths = materialize_layers_from_saved_archive(&archive_path, &chosen, &output_root)
+            .expect("containerd-style archive should materialize");
+        let materialized = paths
+            .get(&diff_id)
+            .expect("materialized diff_id should be present");
+        assert_eq!(
+            fs::read(&materialized.path).expect("materialized layer should read"),
+            compressed
+        );
+        assert_eq!(materialized.digest, blob_digest);
+        assert_eq!(materialized.size, compressed.len() as i64);
+        assert!(materialized.gzip_compressed);
+    }
+
+    fn append_archive_bytes(archive: &mut Builder<fs::File>, path: &str, bytes: &[u8]) {
+        let mut header = Header::new_gnu();
+        header.set_size(bytes.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        archive
+            .append_data(&mut header, path, bytes)
+            .expect("archive entry should append");
+    }
 }
