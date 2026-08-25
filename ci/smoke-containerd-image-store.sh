@@ -68,6 +68,7 @@ if [[ "$(docker image inspect "${REF}" --format '{{.Id}}')" != "${old_id}" ]]; t
 fi
 
 echo "containerd smoke: import a new config using existing filesystem layers"
+set +e
 first_output="$(
   "${BIN}" \
     --cache-dir "${WORKDIR}/cache" \
@@ -76,7 +77,13 @@ first_output="$(
     --no-animations \
     "${REF}" 2>&1
 )"
+first_status=$?
+set -e
 printf '%s\n' "${first_output}"
+if [[ "${first_status}" -ne 0 ]]; then
+  echo "pocker failed while importing the config-only update (exit ${first_status})" >&2
+  exit "${first_status}"
+fi
 
 if [[ "$(docker image inspect "${REF}" --format '{{.Id}}')" != "${new_id}" ]]; then
   echo "pocker did not replace the old image config with the registry config" >&2
@@ -88,6 +95,7 @@ if [[ "${first_output}" != *"Already exists in Docker daemon"* ]]; then
 fi
 
 echo "containerd smoke: skip an image whose config is already loaded"
+set +e
 second_output="$(
   "${BIN}" \
     --cache-dir "${WORKDIR}/cache" \
@@ -96,7 +104,13 @@ second_output="$(
     --no-animations \
     "${REF}" 2>&1
 )"
+second_status=$?
+set -e
 printf '%s\n' "${second_output}"
+if [[ "${second_status}" -ne 0 ]]; then
+  echo "pocker failed while checking the already-loaded config (exit ${second_status})" >&2
+  exit "${second_status}"
+fi
 
 if [[ "${second_output}" != *"image ${REF}: Already exists"* ]]; then
   echo "pocker reloaded an image whose config ID already matched" >&2
