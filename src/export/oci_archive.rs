@@ -11,7 +11,10 @@ use crate::docker;
 use crate::error::{DockerPullError, Result};
 use crate::image::parse_diff_ids;
 use crate::reference::{ImageReference, ReferenceTarget};
-use crate::registry::{Descriptor, OCI_IMAGE_LAYER_MEDIA_TYPE, OCI_IMAGE_MANIFEST_MEDIA_TYPE};
+use crate::registry::{
+    Descriptor, OCI_IMAGE_LAYER_GZIP_MEDIA_TYPE, OCI_IMAGE_LAYER_MEDIA_TYPE,
+    OCI_IMAGE_MANIFEST_MEDIA_TYPE,
+};
 use crate::store::Store;
 use crate::store::StoredReference;
 
@@ -99,7 +102,7 @@ pub(crate) fn write_prepared_oci_archive_to_writer<W: Write>(
         prepared
             .daemon_layers
             .as_ref()
-            .map(docker::MaterializedDaemonLayers::paths),
+            .map(docker::MaterializedDaemonLayers::layers),
     )
 }
 
@@ -108,7 +111,7 @@ fn write_oci_archive_to_writer_with_fallbacks<W: Write>(
     store: &Store,
     reference: &StoredReference,
     inputs: &ArchiveInputs,
-    fallback_paths: Option<&HashMap<String, PathBuf>>,
+    fallback_layers: Option<&HashMap<String, docker::layers::MaterializedDaemonLayer>>,
 ) -> Result<()> {
     let mut builder = Builder::new(writer);
     append_json(
@@ -129,7 +132,7 @@ fn write_oci_archive_to_writer_with_fallbacks<W: Write>(
         .collect::<Vec<_>>();
     let layer_sources = layer_descriptors
         .iter()
-        .map(|(layer, diff_id)| layer_archive_source(store, fallback_paths, layer, diff_id))
+        .map(|(layer, diff_id)| layer_archive_source(store, fallback_layers, layer, diff_id))
         .collect::<Result<Vec<_>>>()?;
     let archive_manifest = archive_manifest(&inputs.manifest, &layer_sources, &reference.manifest);
     let archive_manifest_bytes = serde_json::to_vec(&archive_manifest)?;
@@ -259,7 +262,7 @@ fn append_blob_bytes<W: Write>(builder: &mut Builder<W>, digest: &str, bytes: &[
 
 fn layer_archive_source(
     store: &Store,
-    fallback_paths: Option<&HashMap<String, PathBuf>>,
+    fallback_layers: Option<&HashMap<String, docker::layers::MaterializedDaemonLayer>>,
     descriptor: &Descriptor,
     diff_id: &str,
 ) -> Result<LayerArchiveSource> {
@@ -272,17 +275,30 @@ fn layer_archive_source(
         });
     }
 
-    if let Some(local_path) = fallback_paths.and_then(|paths| paths.get(diff_id)) {
-        return Ok(LayerArchiveSource {
-            descriptor: Descriptor {
+    if let Some(materialized) = fallback_layers.and_then(|layers| layers.get(diff_id)) {
+        let descriptor = if materialized.gzip_compressed {
+            let mut descriptor = descriptor.clone();
+            descriptor.digest = materialized.digest.clone();
+            descriptor.size = materialized.size;
+            if !descriptor.media_type.ends_with("+gzip")
+                && !descriptor.media_type.ends_with(".gzip")
+            {
+                descriptor.media_type = OCI_IMAGE_LAYER_GZIP_MEDIA_TYPE.into();
+            }
+            descriptor
+        } else {
+            Descriptor {
                 media_type: OCI_IMAGE_LAYER_MEDIA_TYPE.into(),
-                digest: diff_id.to_string(),
-                size: std::fs::metadata(local_path)?.len() as i64,
+                digest: materialized.digest.clone(),
+                size: materialized.size,
                 platform: None,
                 annotations: None,
-            },
-            source_path: local_path.clone(),
-            archive_path: blob_tar_path(diff_id)?,
+            }
+        };
+        return Ok(LayerArchiveSource {
+            archive_path: blob_tar_path(&descriptor.digest)?,
+            descriptor,
+            source_path: materialized.path.clone(),
         });
     }
 
@@ -371,10 +387,11 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        OCI_IMAGE_MANIFEST_MEDIA_TYPE, blob_tar_path, load_archive_inputs, oci_ref_name,
-        write_oci_archive_to_writer, write_oci_archive_to_writer_with_fallbacks,
+        OCI_IMAGE_MANIFEST_MEDIA_TYPE, blob_tar_path, layer_archive_source, load_archive_inputs,
+        oci_ref_name, write_oci_archive_to_writer, write_oci_archive_to_writer_with_fallbacks,
     };
     use crate::digest::canonical_digest_bytes;
+    use crate::docker::layers::MaterializedDaemonLayer;
     use crate::platform::Platform;
     use crate::reference::ImageReference;
     use crate::registry::Descriptor;
@@ -386,6 +403,47 @@ mod tests {
             ImageReference::parse("ghcr.io/acme/app:1.2.3").expect("reference should parse");
         let ref_name = oci_ref_name(&reference);
         assert_eq!(ref_name.as_deref(), Some("1.2.3"));
+    }
+
+    #[tokio::test]
+    async fn compressed_daemon_fallback_keeps_compressed_descriptor() {
+        let dir = tempdir().expect("tempdir should create");
+        let store = Store::open(dir.path().to_path_buf())
+            .await
+            .expect("store should open");
+        let bytes = b"saved gzip blob bytes";
+        let saved_digest = canonical_digest_bytes(bytes);
+        let diff_id = canonical_digest_bytes(b"uncompressed layer bytes");
+        let path = dir.path().join("saved-layer");
+        std::fs::write(&path, bytes).expect("saved layer should write");
+        let original = Descriptor {
+            media_type: "application/vnd.oci.image.layer.v1.tar+gzip".into(),
+            digest: canonical_digest_bytes(b"registry compression may differ"),
+            size: 99,
+            platform: None,
+            annotations: None,
+        };
+        let fallbacks = HashMap::from([(
+            diff_id.clone(),
+            MaterializedDaemonLayer {
+                path: path.clone(),
+                digest: saved_digest.clone(),
+                size: bytes.len() as i64,
+                gzip_compressed: true,
+            },
+        )]);
+
+        let source = layer_archive_source(&store, Some(&fallbacks), &original, &diff_id)
+            .expect("compressed daemon layer should be usable directly");
+
+        assert_eq!(source.source_path, path);
+        assert_eq!(source.descriptor.digest, saved_digest);
+        assert_eq!(source.descriptor.size, bytes.len() as i64);
+        assert_eq!(source.descriptor.media_type, original.media_type);
+        assert_eq!(
+            source.archive_path,
+            blob_tar_path(&source.descriptor.digest).expect("blob path should build")
+        );
     }
 
     #[test]
@@ -533,7 +591,15 @@ mod tests {
         let fallback_path = dir.path().join("materialized-layer.tar");
         std::fs::write(&fallback_path, materialized_layer_bytes)
             .expect("materialized layer should be written");
-        let fallback_paths = HashMap::from([(diff_id.clone(), fallback_path)]);
+        let fallback_paths = HashMap::from([(
+            diff_id.clone(),
+            MaterializedDaemonLayer {
+                path: fallback_path,
+                digest: diff_id.clone(),
+                size: materialized_layer_bytes.len() as i64,
+                gzip_compressed: false,
+            },
+        )]);
         let stored_reference = StoredReference {
             reference: "ghcr.io/acme/app:1.2.3".to_string(),
             manifest,

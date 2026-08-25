@@ -9,6 +9,8 @@ pub(crate) const OCI_IMAGE_MANIFEST_MEDIA_TYPE: &str = "application/vnd.oci.imag
 pub(crate) const DOCKER_IMAGE_MANIFEST_MEDIA_TYPE: &str =
     "application/vnd.docker.distribution.manifest.v2+json";
 pub(crate) const OCI_IMAGE_LAYER_MEDIA_TYPE: &str = "application/vnd.oci.image.layer.v1.tar";
+pub(crate) const OCI_IMAGE_LAYER_GZIP_MEDIA_TYPE: &str =
+    "application/vnd.oci.image.layer.v1.tar+gzip";
 pub(crate) const OCTET_STREAM_MEDIA_TYPE: &str = "application/octet-stream";
 
 pub(crate) const MANIFEST_ACCEPT: &str = concat!(
