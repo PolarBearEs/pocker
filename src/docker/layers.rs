@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
@@ -18,6 +18,7 @@ use crate::store::Store;
 use super::daemon::{DaemonImage, DaemonImageSummary, DockerDaemon};
 
 const DAEMON_INSPECT_CONCURRENCY: usize = 8;
+const GZIP_MAGIC: &[u8] = &[0x1f, 0x8b];
 
 #[derive(Debug, Default)]
 pub struct DaemonLayerCache {
@@ -352,7 +353,18 @@ fn copy_archive_entry_with_digest<R: Read>(
     expected_digest: &str,
 ) -> Result<()> {
     let mut file = File::create(path)?;
-    let actual_digest = copy_reader_with_digest(expected_digest, reader, &mut file)?;
+    let mut buffered = BufReader::new(reader);
+    let actual_digest = if buffered.fill_buf()?.starts_with(GZIP_MAGIC) {
+        // Docker's classic image-save format stores uncompressed layer.tar
+        // entries, but containerd-backed daemons may point manifest.json at
+        // compressed OCI blobs. A Docker diff_id always hashes the
+        // uncompressed tar stream, so normalize gzip entries before checking
+        // the digest and using them as OCI archive fallbacks.
+        let mut decoder = flate2::read::GzDecoder::new(buffered);
+        copy_reader_with_digest(expected_digest, &mut decoder, &mut file)?
+    } else {
+        copy_reader_with_digest(expected_digest, &mut buffered, &mut file)?
+    };
     file.flush()?;
     file.sync_data()?;
     if actual_digest != expected_digest {
@@ -362,4 +374,135 @@ fn copy_archive_entry_with_digest<R: Read>(
         });
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::io::{Cursor, Write};
+
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+    use tar::{Builder, Header};
+    use tempfile::tempdir;
+
+    use super::{
+        ChosenImageLayers, copy_archive_entry_with_digest, materialize_layers_from_saved_archive,
+    };
+    use crate::digest::canonical_digest_bytes;
+    use crate::docker::daemon::DaemonImage;
+
+    #[test]
+    fn daemon_layer_materialization_preserves_uncompressed_entries() {
+        let dir = tempdir().expect("tempdir should create");
+        let destination = dir.path().join("layer.tar");
+        let layer = b"uncompressed layer tar bytes";
+        let digest = canonical_digest_bytes(layer);
+
+        copy_archive_entry_with_digest(&mut Cursor::new(layer), &destination, &digest)
+            .expect("uncompressed layer should materialize");
+
+        assert_eq!(
+            fs::read(destination).expect("materialized layer should read"),
+            layer
+        );
+    }
+
+    #[test]
+    fn daemon_layer_materialization_decompresses_gzip_entries_before_diff_id_check() {
+        let dir = tempdir().expect("tempdir should create");
+        let destination = dir.path().join("layer.tar");
+        // An empty tar stream reproduces the well-known Docker diff_id
+        // sha256:5f70bf18..., whose gzip-compressed blob has a different
+        // registry digest.
+        let layer = vec![0_u8; 1024];
+        let digest = canonical_digest_bytes(&layer);
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder
+            .write_all(&layer)
+            .expect("layer should gzip successfully");
+        let compressed = encoder.finish().expect("gzip stream should finish");
+
+        copy_archive_entry_with_digest(&mut Cursor::new(compressed), &destination, &digest)
+            .expect("gzip layer should materialize");
+
+        assert_eq!(
+            fs::read(destination).expect("materialized layer should read"),
+            layer
+        );
+    }
+
+    #[test]
+    fn containerd_style_docker_save_archive_materializes_compressed_blob_by_diff_id() {
+        let dir = tempdir().expect("tempdir should create");
+        let archive_path = dir.path().join("image.tar");
+        let output_root = dir.path().join("materialized");
+        fs::create_dir(&output_root).expect("output directory should create");
+
+        let layer = vec![0_u8; 1024];
+        let diff_id = canonical_digest_bytes(&layer);
+        assert_eq!(
+            diff_id,
+            "sha256:5f70bf18a086007016e948b04aed3b82103a36bea41755b6cddfaf10ace3c6ef"
+        );
+
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder
+            .write_all(&layer)
+            .expect("layer should gzip successfully");
+        let compressed = encoder.finish().expect("gzip stream should finish");
+        assert_ne!(canonical_digest_bytes(&compressed), diff_id);
+
+        let blob_digest = canonical_digest_bytes(&compressed);
+        let blob_path = format!(
+            "blobs/sha256/{}",
+            blob_digest
+                .strip_prefix("sha256:")
+                .expect("test blob should use sha256")
+        );
+        let manifest = serde_json::to_vec(&serde_json::json!([{
+            "Config": "blobs/sha256/config",
+            "RepoTags": ["example.test/image:latest"],
+            "Layers": [&blob_path]
+        }]))
+        .expect("manifest should serialize");
+
+        let archive_file = fs::File::create(&archive_path).expect("archive should create");
+        let mut archive = Builder::new(archive_file);
+        append_archive_bytes(&mut archive, "manifest.json", &manifest);
+        append_archive_bytes(&mut archive, &blob_path, &compressed);
+        archive.finish().expect("archive should finish");
+        drop(archive);
+
+        let image: DaemonImage = serde_json::from_value(serde_json::json!({
+            "Id": "sha256:test-image",
+            "RepoTags": ["example.test/image:latest"],
+            "RootFS": { "Layers": [&diff_id] }
+        }))
+        .expect("daemon image should deserialize");
+        let chosen = ChosenImageLayers {
+            image,
+            diff_ids: vec![diff_id.clone()],
+        };
+
+        let paths = materialize_layers_from_saved_archive(&archive_path, &chosen, &output_root)
+            .expect("containerd-style archive should materialize");
+        let materialized = paths
+            .get(&diff_id)
+            .expect("materialized diff_id should be present");
+        assert_eq!(
+            fs::read(materialized).expect("materialized layer should read"),
+            layer
+        );
+    }
+
+    fn append_archive_bytes(archive: &mut Builder<fs::File>, path: &str, bytes: &[u8]) {
+        let mut header = Header::new_gnu();
+        header.set_size(bytes.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        archive
+            .append_data(&mut header, path, bytes)
+            .expect("archive entry should append");
+    }
 }
