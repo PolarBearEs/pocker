@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
@@ -18,7 +18,6 @@ use crate::store::Store;
 use super::daemon::{DaemonImage, DaemonImageSummary, DockerDaemon};
 
 const DAEMON_INSPECT_CONCURRENCY: usize = 8;
-const GZIP_MAGIC: &[u8] = &[0x1f, 0x8b];
 
 #[derive(Debug, Default)]
 pub struct DaemonLayerCache {
@@ -317,8 +316,23 @@ fn materialize_layers_from_saved_archive(
         if paths.contains_key(diff_id) {
             continue;
         }
+        let entry_offset = entry.raw_file_position();
+        let entry_size = entry.size();
         let destination = extracted_layer_path(output_root, diff_id)?;
-        copy_archive_entry_with_digest(&mut entry, &destination, diff_id)?;
+        match copy_archive_entry_with_digest(&mut entry, &destination, diff_id) {
+            Ok(()) => {}
+            Err(raw_mismatch @ DockerPullError::DigestMismatch { .. }) => {
+                retry_archive_entry_as_gzip(
+                    archive_path,
+                    entry_offset,
+                    entry_size,
+                    &destination,
+                    diff_id,
+                    raw_mismatch,
+                )?;
+            }
+            Err(error) => return Err(error),
+        }
         paths.insert(diff_id.clone(), destination);
     }
 
@@ -353,27 +367,38 @@ fn copy_archive_entry_with_digest<R: Read>(
     expected_digest: &str,
 ) -> Result<()> {
     let mut file = File::create(path)?;
-    let mut buffered = BufReader::new(reader);
-    let actual_digest = if buffered.fill_buf()?.starts_with(GZIP_MAGIC) {
-        // Docker's classic image-save format stores uncompressed layer.tar
-        // entries, but containerd-backed daemons may point manifest.json at
-        // compressed OCI blobs. A Docker diff_id always hashes the
-        // uncompressed tar stream, so normalize gzip entries before checking
-        // the digest and using them as OCI archive fallbacks.
-        let mut decoder = flate2::read::GzDecoder::new(buffered);
-        copy_reader_with_digest(expected_digest, &mut decoder, &mut file)?
-    } else {
-        copy_reader_with_digest(expected_digest, &mut buffered, &mut file)?
-    };
-    file.flush()?;
-    file.sync_data()?;
+    let actual_digest = copy_reader_with_digest(expected_digest, reader, &mut file)?;
     if actual_digest != expected_digest {
         return Err(DockerPullError::DigestMismatch {
             expected: expected_digest.to_string(),
             actual: actual_digest,
         });
     }
+    file.flush()?;
+    file.sync_data()?;
     Ok(())
+}
+
+fn retry_archive_entry_as_gzip(
+    archive_path: &Path,
+    entry_offset: u64,
+    entry_size: u64,
+    destination: &Path,
+    expected_digest: &str,
+    raw_mismatch: DockerPullError,
+) -> Result<()> {
+    let mut archive = File::open(archive_path)?;
+    archive.seek(SeekFrom::Start(entry_offset))?;
+    let entry = archive.take(entry_size);
+    let mut decoder = flate2::read::MultiGzDecoder::new(entry);
+
+    // MultiGzDecoder parses the complete gzip header during construction.
+    // If there is no valid header, preserve the more useful raw diff_id error.
+    if decoder.header().is_none() {
+        return Err(raw_mismatch);
+    }
+
+    copy_archive_entry_with_digest(&mut decoder, destination, expected_digest)
 }
 
 #[cfg(test)]
@@ -409,7 +434,27 @@ mod tests {
     }
 
     #[test]
-    fn daemon_layer_materialization_decompresses_gzip_entries_before_diff_id_check() {
+    fn daemon_layer_materialization_prefers_a_matching_raw_digest_over_gzip_decoding() {
+        let dir = tempdir().expect("tempdir should create");
+        let destination = dir.path().join("layer.tar");
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder
+            .write_all(b"decompressed bytes must not be selected")
+            .expect("layer should gzip successfully");
+        let layer = encoder.finish().expect("gzip stream should finish");
+        let digest = canonical_digest_bytes(&layer);
+
+        copy_archive_entry_with_digest(&mut Cursor::new(&layer), &destination, &digest)
+            .expect("matching raw bytes should materialize without decoding");
+
+        assert_eq!(
+            fs::read(destination).expect("materialized layer should read"),
+            layer
+        );
+    }
+
+    #[test]
+    fn daemon_layer_materialization_rejects_gzip_bytes_against_uncompressed_diff_id() {
         let dir = tempdir().expect("tempdir should create");
         let destination = dir.path().join("layer.tar");
         // An empty tar stream reproduces the well-known Docker diff_id
@@ -423,12 +468,20 @@ mod tests {
             .expect("layer should gzip successfully");
         let compressed = encoder.finish().expect("gzip stream should finish");
 
-        copy_archive_entry_with_digest(&mut Cursor::new(compressed), &destination, &digest)
-            .expect("gzip layer should materialize");
+        let error = copy_archive_entry_with_digest(
+            &mut Cursor::new(compressed.clone()),
+            &destination,
+            &digest,
+        )
+        .expect_err("raw gzip bytes must not match an uncompressed diff_id");
 
+        assert!(matches!(
+            error,
+            crate::error::DockerPullError::DigestMismatch { .. }
+        ));
         assert_eq!(
             fs::read(destination).expect("materialized layer should read"),
-            layer
+            compressed
         );
     }
 
