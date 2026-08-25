@@ -85,8 +85,9 @@ if [[ "${first_status}" -ne 0 ]]; then
   exit "${first_status}"
 fi
 
-if [[ "$(docker image inspect "${REF}" --format '{{.Id}}')" != "${new_id}" ]]; then
-  echo "pocker did not replace the old image config with the registry config" >&2
+loaded_id="$(docker image inspect "${REF}" --format '{{.Id}}')"
+if [[ "${loaded_id}" != "${new_id}" ]]; then
+  echo "pocker did not replace the old image config with the registry config: expected ${new_id}, got ${loaded_id}" >&2
   exit 1
 fi
 if [[ "${first_output}" != *"Already exists in Docker daemon"* ]]; then
