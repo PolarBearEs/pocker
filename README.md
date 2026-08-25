@@ -27,8 +27,8 @@ curl -fsSL https://github.com/PolarBearEs/pocker/releases/latest/download/instal
 Install a specific release or install somewhere else:
 
 ```bash
-curl -fsSL https://github.com/PolarBearEs/pocker/releases/download/v0.2.2/install.sh | \
-  POCKER_VERSION=v0.2.2 POCKER_INSTALL_DIR=/usr/local/bin sh
+curl -fsSL https://github.com/PolarBearEs/pocker/releases/download/v0.2.3/install.sh | \
+  POCKER_VERSION=v0.2.3 POCKER_INSTALL_DIR=/usr/local/bin sh
 ```
 
 Build from source:
