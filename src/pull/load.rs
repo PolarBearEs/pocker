@@ -173,8 +173,20 @@ async fn load_reference_through_cache_registry(
         tag_result
     }
     .await;
+    let used_tls = registry.saw_tls_handshake();
     let shutdown_result = registry.shutdown().await;
-    load_result?;
+    if let Err(error) = load_result {
+        if !used_tls {
+            return Err(error);
+        }
+        // Docker daemons backed by the containerd image store try HTTPS first
+        // for registries they do not know are insecure, loopback included, so
+        // the temporary plaintext registry is unreachable for them.
+        context.ui.warn(&format!(
+            "docker tried to reach the temporary cache registry over HTTPS ({error}); falling back to stream load"
+        ));
+        docker::load_reference_archive_stream(&context.store, stored_reference).await?;
+    }
     shutdown_result?;
     Ok(())
 }
@@ -185,6 +197,7 @@ struct TemporaryCacheRegistry {
     tag: String,
     task: Option<JoinHandle<Result<()>>>,
     shutdown: Option<oneshot::Sender<()>>,
+    tls_handshake_seen: Arc<AtomicBool>,
 }
 
 impl TemporaryCacheRegistry {
@@ -205,6 +218,8 @@ impl TemporaryCacheRegistry {
         let address = listener.local_addr()?.to_string();
         let repository = cache_repository(&reference.registry, &reference.repository);
         let (shutdown, shutdown_rx) = oneshot::channel();
+        let tls_handshake_seen = Arc::new(AtomicBool::new(false));
+        let tls_handshake_seen_for_task = Arc::clone(&tls_handshake_seen);
         let task = tokio::spawn(async move {
             serve_registry::serve_listener(
                 listener,
@@ -216,6 +231,7 @@ impl TemporaryCacheRegistry {
                     blob_idle_timeout: None,
                     concurrency: 1,
                     quiet: true,
+                    tls_handshake_seen: Some(tls_handshake_seen_for_task),
                 },
                 Some(shutdown_rx),
             )
@@ -228,7 +244,12 @@ impl TemporaryCacheRegistry {
             tag,
             task: Some(task),
             shutdown: Some(shutdown),
+            tls_handshake_seen,
         })
+    }
+
+    fn saw_tls_handshake(&self) -> bool {
+        self.tls_handshake_seen.load(Ordering::SeqCst)
     }
 
     fn synthetic_reference(&self) -> String {
