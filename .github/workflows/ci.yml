@@ -64,15 +64,6 @@ jobs:
       - name: Build binary
         run: cargo build --workspace --locked
 
-      - name: Upload Linux x86_64 pocker binary
-        if: matrix.name == 'Linux x86_64'
-        uses: actions/upload-artifact@v4
-        with:
-          name: pocker-linux-x86_64-debug
-          path: target/debug/pocker
-          if-no-files-found: error
-          retention-days: 1
-
       - name: Run Docker smoke test
         run: ./ci/smoke-docker.sh target/debug/pocker
 
@@ -129,7 +120,7 @@ jobs:
   verify-containerd-image-store:
     name: Verify containerd image store
     runs-on: ubuntu-latest
-    needs: verify-linux
+    needs: fmt
 
     steps:
       - name: Check out repository
@@ -146,14 +137,17 @@ jobs:
               }
             }
 
-      - name: Download Linux x86_64 pocker binary
-        uses: actions/download-artifact@v4
-        with:
-          name: pocker-linux-x86_64-debug
-          path: target/debug
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
 
-      - name: Restore executable permission
-        run: chmod +x target/debug/pocker
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: true
+          shared-key: linux-containerd-image-store
+
+      - name: Build binary
+        run: cargo build --workspace --locked
 
       - name: Run containerd image store smoke test
         run: ./ci/smoke-containerd-image-store.sh target/debug/pocker
