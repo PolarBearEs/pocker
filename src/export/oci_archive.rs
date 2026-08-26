@@ -149,6 +149,10 @@ fn write_oci_archive_to_writer_with_fallbacks<W: Write>(
             "io.containerd.image.name".to_string(),
             parsed_reference.display_name(),
         );
+        annotations.insert(
+            docker::POCKER_CONFIG_DIGEST_ANNOTATION.to_string(),
+            reference.config_digest.clone(),
+        );
         annotations.insert("org.opencontainers.image.ref.name".to_string(), ref_name);
         manifest_descriptor.annotations = Some(annotations);
     }
@@ -395,6 +399,7 @@ mod tests {
         oci_ref_name, write_oci_archive_to_writer, write_oci_archive_to_writer_with_fallbacks,
     };
     use crate::digest::canonical_digest_bytes;
+    use crate::docker;
     use crate::docker::layers::MaterializedDaemonLayer;
     use crate::platform::Platform;
     use crate::reference::ImageReference;
@@ -476,6 +481,10 @@ mod tests {
             "ghcr.io/acme/app:1.2.3"
         );
         assert_eq!(
+            index["manifests"][0]["annotations"][docker::POCKER_CONFIG_DIGEST_ANNOTATION],
+            archive.config_digest
+        );
+        assert_eq!(
             index["manifests"][0]["annotations"]["org.opencontainers.image.ref.name"],
             "1.2.3"
         );
@@ -526,6 +535,9 @@ mod tests {
             index["manifests"][0]["annotations"]["org.opencontainers.image.ref.name"].is_null()
         );
         assert!(index["manifests"][0]["annotations"]["io.containerd.image.name"].is_null());
+        assert!(
+            index["manifests"][0]["annotations"][docker::POCKER_CONFIG_DIGEST_ANNOTATION].is_null()
+        );
 
         let manifest: Value = serde_json::from_slice(
             archive
