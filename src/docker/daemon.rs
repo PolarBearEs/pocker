@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::Path;
 
 use reqwest::StatusCode;
@@ -178,6 +179,14 @@ pub(super) struct DaemonImage {
     repo_tags: Option<Vec<String>>,
     #[serde(default, rename = "RootFS")]
     rootfs: Option<RootFs>,
+    #[serde(default, rename = "Descriptor")]
+    descriptor: Option<DaemonDescriptor>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct DaemonDescriptor {
+    #[serde(default)]
+    annotations: Option<HashMap<String, String>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -187,6 +196,15 @@ struct RootFs {
 }
 
 impl DaemonImage {
+    pub(super) fn config_digest_annotation(&self) -> Option<&str> {
+        self.descriptor
+            .as_ref()?
+            .annotations
+            .as_ref()?
+            .get(super::POCKER_CONFIG_DIGEST_ANNOTATION)
+            .map(String::as_str)
+    }
+
     pub(super) fn rootfs_layers(&self) -> &[String] {
         self.rootfs
             .as_ref()

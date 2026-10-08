@@ -43,6 +43,7 @@ const PATH_SEGMENT_ENCODE_SET: &AsciiSet = &CONTROLS
     .add(b'}');
 const QUERY_VALUE_ENCODE_SET: &AsciiSet = &PATH_SEGMENT_ENCODE_SET.add(b'&').add(b'=').add(b'+');
 const LOAD_ARCHIVE_STREAM_BUFFER_BYTES: usize = 1024 * 1024;
+pub(crate) const POCKER_CONFIG_DIGEST_ANNOTATION: &str = "io.pocker.image.config.digest";
 
 #[derive(Debug, Clone)]
 pub struct ImageSummary {
@@ -103,7 +104,14 @@ pub async fn daemon_has_reference(reference: &ImageReference, config_digest: &st
         return Ok(false);
     };
 
-    Ok(normalize_image_id(&image.id) == normalize_image_id(config_digest))
+    Ok(image_matches_config(&image, config_digest))
+}
+
+fn image_matches_config(image: &daemon::DaemonImage, config_digest: &str) -> bool {
+    normalize_image_id(&image.id) == normalize_image_id(config_digest)
+        || image
+            .config_digest_annotation()
+            .is_some_and(|digest| normalize_image_id(digest) == normalize_image_id(config_digest))
 }
 
 fn daemon_inspect_target(reference: &ImageReference, config_digest: &str) -> String {
@@ -235,7 +243,8 @@ mod tests {
     use super::transport::windows::{decode_chunked_body, header_value, parse_response_head};
     use super::transport::{DEFAULT_DOCKER_HOST, DockerEndpoint, docker_endpoint_from_host};
     use super::{
-        daemon_inspect_target, encode_path_segment, encode_query_value, split_tagged_reference,
+        POCKER_CONFIG_DIGEST_ANNOTATION, daemon_inspect_target, encode_path_segment,
+        encode_query_value, image_matches_config, split_tagged_reference,
     };
     use crate::reference::ImageReference;
 
@@ -258,6 +267,27 @@ mod tests {
             daemon_inspect_target(&reference, "sha256:deadbeef"),
             "sha256:deadbeef"
         );
+    }
+
+    #[test]
+    fn image_config_matches_classic_image_id_or_pocker_annotation() {
+        let classic: super::daemon::DaemonImage = serde_json::from_value(serde_json::json!({
+            "Id": "sha256:config"
+        }))
+        .expect("classic image should parse");
+        assert!(image_matches_config(&classic, "sha256:config"));
+
+        let containerd: super::daemon::DaemonImage = serde_json::from_value(serde_json::json!({
+            "Id": "sha256:manifest",
+            "Descriptor": {
+                "annotations": {
+                    (POCKER_CONFIG_DIGEST_ANNOTATION): "sha256:config"
+                }
+            }
+        }))
+        .expect("containerd image should parse");
+        assert!(image_matches_config(&containerd, "sha256:config"));
+        assert!(!image_matches_config(&containerd, "sha256:other"));
     }
 
     #[test]
