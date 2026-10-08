@@ -13,13 +13,21 @@ const MAX_REQUEST_HEAD_BYTES: usize = 64 * 1024;
 const REQUEST_HEAD_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Debug)]
+pub(super) enum RequestHead {
+    Http(Request),
+    // The client sent bytes that do not form an HTTP request head. The caller
+    // still answers it so the client sees an HTTP response, not a closed socket.
+    Malformed(String),
+}
+
+#[derive(Debug)]
 pub(super) struct Request {
     pub(super) method: String,
     pub(super) path: String,
     pub(super) range: Option<String>,
 }
 
-pub(super) async fn read_request(stream: &mut TcpStream) -> Result<Request> {
+pub(super) async fn read_request(stream: &mut TcpStream) -> Result<RequestHead> {
     let mut bytes = Vec::new();
     let mut buffer = [0_u8; 4096];
     loop {
@@ -34,11 +42,13 @@ pub(super) async fn read_request(stream: &mut TcpStream) -> Result<Request> {
             ));
         }
         bytes.extend_from_slice(&buffer[..read]);
-        if let Some(request) = parse_request_head(&bytes)? {
-            return Ok(request);
+        match parse_request_head(&bytes) {
+            Ok(Some(request)) => return Ok(RequestHead::Http(request)),
+            Ok(None) => {}
+            Err(error) => return Ok(RequestHead::Malformed(error.to_string())),
         }
         if bytes.len() > MAX_REQUEST_HEAD_BYTES {
-            return Err(DockerPullError::InvalidInput(
+            return Ok(RequestHead::Malformed(
                 "cache registry request headers are too large".into(),
             ));
         }

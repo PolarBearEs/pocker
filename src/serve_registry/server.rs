@@ -23,7 +23,7 @@ use crate::registry::{
 use crate::store::{Store, StoredReference};
 use crate::ui::Ui;
 
-use super::request::{Request, read_request};
+use super::request::{Request, RequestHead, read_request};
 use super::response::{RegistryResponse, write_response};
 
 const MAX_CONNECTIONS: usize = 1024;
@@ -141,8 +141,14 @@ struct ServeState {
 }
 
 async fn handle_connection(mut stream: TcpStream, state: Arc<ServeState>) -> Result<()> {
-    let request = read_request(&mut stream).await?;
-    let response = route_request(&request, state).await;
+    let response = match read_request(&mut stream).await? {
+        RequestHead::Http(request) => route_request(&request, state).await,
+        // Answer instead of closing the connection. Docker daemons try HTTPS
+        // first against loopback registries on non-default ports, then retry
+        // over plain HTTP only when the TLS handshake gets an HTTP response back.
+        // A closed connection surfaces as a bare EOF and fails the pull.
+        RequestHead::Malformed(reason) => RegistryResponse::text(400, "Bad Request", reason),
+    };
     write_response(&mut stream, response).await
 }
 
@@ -884,6 +890,36 @@ mod tests {
                 .await
                 .expect("reference lookup should succeed")
                 .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn tls_client_hello_gets_plain_http_response() {
+        let dir = tempdir().expect("tempdir should create");
+        let store = Arc::new(
+            Store::open(dir.path().to_path_buf())
+                .await
+                .expect("store should open"),
+        );
+        let address = spawn_server(store, false).await;
+
+        let mut stream = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("client should connect");
+        stream
+            .write_all(&[0x16, 0x03, 0x01, 0x00, 0x2c, 0x01])
+            .await
+            .expect("client hello should send");
+        let mut response = Vec::new();
+        stream
+            .read_to_end(&mut response)
+            .await
+            .expect("response should read");
+
+        assert!(
+            response.starts_with(b"HTTP/1.1 400 "),
+            "response should start with a plain HTTP status line: {:?}",
+            String::from_utf8_lossy(&response)
         );
     }
 
