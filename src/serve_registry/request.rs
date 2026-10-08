@@ -15,10 +15,9 @@ const REQUEST_HEAD_TIMEOUT: Duration = Duration::from_secs(120);
 #[derive(Debug)]
 pub(super) enum RequestHead {
     Http(Request),
-    // A client that opened a TLS connection to this plaintext registry. Docker
-    // daemons backed by the containerd image store try HTTPS first for hosts
-    // that are not listed as insecure registries, including loopback ones.
-    TlsHandshake,
+    // The client sent bytes that do not form an HTTP request head. The caller
+    // still answers it so the client sees an HTTP response, not a closed socket.
+    Malformed(String),
 }
 
 #[derive(Debug)]
@@ -43,24 +42,17 @@ pub(super) async fn read_request(stream: &mut TcpStream) -> Result<RequestHead> 
             ));
         }
         bytes.extend_from_slice(&buffer[..read]);
-        if looks_like_tls_handshake(&bytes) {
-            return Ok(RequestHead::TlsHandshake);
-        }
-        if let Some(request) = parse_request_head(&bytes)? {
-            return Ok(RequestHead::Http(request));
+        match parse_request_head(&bytes) {
+            Ok(Some(request)) => return Ok(RequestHead::Http(request)),
+            Ok(None) => {}
+            Err(error) => return Ok(RequestHead::Malformed(error.to_string())),
         }
         if bytes.len() > MAX_REQUEST_HEAD_BYTES {
-            return Err(DockerPullError::InvalidInput(
+            return Ok(RequestHead::Malformed(
                 "cache registry request headers are too large".into(),
             ));
         }
     }
-}
-
-// A TLS record starts with a handshake content type followed by the legacy
-// record version, which is always 0x03 0x0X for every TLS version in use.
-fn looks_like_tls_handshake(bytes: &[u8]) -> bool {
-    matches!(bytes, [0x16, 0x03, ..])
 }
 
 fn parse_request_head(bytes: &[u8]) -> Result<Option<Request>> {
@@ -100,7 +92,7 @@ fn parse_request_head(bytes: &[u8]) -> Result<Option<Request>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{looks_like_tls_handshake, parse_request_head};
+    use super::parse_request_head;
 
     #[test]
     fn request_head_parses_method_path_and_range() {
@@ -130,14 +122,5 @@ mod tests {
             .expect("partial request should not fail");
 
         assert!(request.is_none());
-    }
-
-    #[test]
-    fn tls_client_hello_is_detected() {
-        assert!(looks_like_tls_handshake(&[
-            0x16, 0x03, 0x01, 0x02, 0x00, 0x01, 0x00, 0x01
-        ]));
-        assert!(!looks_like_tls_handshake(b"GET /v2/ HTTP/1.1\r\n"));
-        assert!(!looks_like_tls_handshake(&[0x16]));
     }
 }

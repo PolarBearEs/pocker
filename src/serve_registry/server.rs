@@ -2,7 +2,6 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use tokio::fs as tokio_fs;
@@ -53,7 +52,6 @@ pub async fn serve(config: ServeConfig) -> Result<()> {
             blob_idle_timeout: config.blob_idle_timeout,
             concurrency: config.concurrency,
             quiet: config.quiet,
-            tls_handshake_seen: None,
         },
         config.shutdown,
     )
@@ -68,9 +66,6 @@ pub(crate) struct ServeListenerConfig {
     pub blob_idle_timeout: Option<Duration>,
     pub concurrency: usize,
     pub quiet: bool,
-    // Set when a client speaks TLS to this plaintext registry, so callers can
-    // explain why the daemon could not pull from it.
-    pub tls_handshake_seen: Option<Arc<AtomicBool>>,
 }
 
 pub(crate) async fn serve_listener(
@@ -82,7 +77,6 @@ pub(crate) async fn serve_listener(
         store: Arc::clone(&config.store),
         registry: Arc::clone(&config.registry),
         pull_missing: config.pull_missing,
-        tls_handshake_seen: config.tls_handshake_seen,
         downloads: Arc::new(Semaphore::new(config.concurrency)),
         pull_context: Arc::new(PullContext {
             store: config.store,
@@ -142,7 +136,6 @@ struct ServeState {
     store: Arc<Store>,
     registry: Arc<RegistryClient>,
     pull_missing: bool,
-    tls_handshake_seen: Option<Arc<AtomicBool>>,
     downloads: Arc<Semaphore>,
     pull_context: Arc<PullContext>,
 }
@@ -150,19 +143,11 @@ struct ServeState {
 async fn handle_connection(mut stream: TcpStream, state: Arc<ServeState>) -> Result<()> {
     let response = match read_request(&mut stream).await? {
         RequestHead::Http(request) => route_request(&request, state).await,
-        RequestHead::TlsHandshake => {
-            if let Some(seen) = &state.tls_handshake_seen {
-                seen.store(true, Ordering::SeqCst);
-            }
-            // Answer in plaintext instead of dropping the connection: a reply
-            // starting with "HTTP/" is what makes Go clients report a scheme
-            // mismatch and retry over HTTP, rather than reporting a bare EOF.
-            RegistryResponse::text(
-                400,
-                "Bad Request",
-                "cache registry speaks plain HTTP only".to_string(),
-            )
-        }
+        // Answer instead of closing the connection. Docker daemons try HTTPS
+        // first against loopback registries on non-default ports, then retry
+        // over plain HTTP only when the TLS handshake gets an HTTP response back.
+        // A closed connection surfaces as a bare EOF and fails the pull.
+        RequestHead::Malformed(reason) => RegistryResponse::text(400, "Bad Request", reason),
     };
     write_response(&mut stream, response).await
 }
@@ -497,7 +482,6 @@ fn manifest_summary(bytes: &[u8]) -> ManifestSummary {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
 
     use reqwest::StatusCode;
     use tempfile::tempdir;
@@ -909,61 +893,15 @@ mod tests {
         );
     }
 
-    async fn spawn_server(store: Arc<Store>, pull_missing: bool) -> std::net::SocketAddr {
-        spawn_server_with_tls_flag(store, pull_missing).await.0
-    }
-
-    async fn spawn_server_with_tls_flag(
-        store: Arc<Store>,
-        pull_missing: bool,
-    ) -> (std::net::SocketAddr, Arc<AtomicBool>) {
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("listener should bind");
-        let address = listener.local_addr().expect("listener address");
-        let registry = Arc::new(RegistryClient::new(
-            reqwest::Client::builder()
-                .https_only(false)
-                .build()
-                .expect("client should build"),
-            Arc::new(AuthResolver::new(None).expect("auth resolver should build")),
-            true,
-            Some(0),
-        ));
-        let tls_handshake_seen = Arc::new(AtomicBool::new(false));
-        let state = Arc::new(ServeState {
-            store: Arc::clone(&store),
-            registry: Arc::clone(&registry),
-            pull_missing,
-            tls_handshake_seen: Some(Arc::clone(&tls_handshake_seen)),
-            downloads: Arc::new(Semaphore::new(1)),
-            pull_context: Arc::new(PullContext {
-                store,
-                registry,
-                stop: CancellationToken::new(),
-                ui: Arc::new(Ui::new(true, false)),
-                blob_retry_limit: Some(1),
-                blob_idle_timeout: None,
-                blob_locks: Arc::new(BlobDownloadLocks::default()),
-                layer_usage: Arc::new(CurrentPullLayers::default()),
-                daemon_layer_cache: None,
-            }),
-        });
-        tokio::spawn(async move {
-            let _ = run_server(listener, state, None).await;
-        });
-        (address, tls_handshake_seen)
-    }
-
     #[tokio::test]
-    async fn tls_client_gets_plain_http_response() {
+    async fn tls_client_hello_gets_plain_http_response() {
         let dir = tempdir().expect("tempdir should create");
         let store = Arc::new(
             Store::open(dir.path().to_path_buf())
                 .await
                 .expect("store should open"),
         );
-        let (address, tls_handshake_seen) = spawn_server_with_tls_flag(store, false).await;
+        let address = spawn_server(store, false).await;
 
         let mut stream = tokio::net::TcpStream::connect(address)
             .await
@@ -983,7 +921,43 @@ mod tests {
             "response should start with a plain HTTP status line: {:?}",
             String::from_utf8_lossy(&response)
         );
-        assert!(tls_handshake_seen.load(Ordering::SeqCst));
+    }
+
+    async fn spawn_server(store: Arc<Store>, pull_missing: bool) -> std::net::SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let address = listener.local_addr().expect("listener address");
+        let registry = Arc::new(RegistryClient::new(
+            reqwest::Client::builder()
+                .https_only(false)
+                .build()
+                .expect("client should build"),
+            Arc::new(AuthResolver::new(None).expect("auth resolver should build")),
+            true,
+            Some(0),
+        ));
+        let state = Arc::new(ServeState {
+            store: Arc::clone(&store),
+            registry: Arc::clone(&registry),
+            pull_missing,
+            downloads: Arc::new(Semaphore::new(1)),
+            pull_context: Arc::new(PullContext {
+                store,
+                registry,
+                stop: CancellationToken::new(),
+                ui: Arc::new(Ui::new(true, false)),
+                blob_retry_limit: Some(1),
+                blob_idle_timeout: None,
+                blob_locks: Arc::new(BlobDownloadLocks::default()),
+                layer_usage: Arc::new(CurrentPullLayers::default()),
+                daemon_layer_cache: None,
+            }),
+        });
+        tokio::spawn(async move {
+            let _ = run_server(listener, state, None).await;
+        });
+        address
     }
 
     async fn spawn_upstream_manifest(body: &'static [u8]) -> std::net::SocketAddr {
