@@ -54,13 +54,22 @@ remove_daemon_content() {
     echo "ctr is required to remove containerd content; set POCKER_SMOKE_CTR" >&2
     return 1
   fi
-  local socket
+  # setup-docker-action puts its exec root beside the Docker socket under
+  # the runner's home directory, outside the usual system socket locations.
+  local -a socket_roots=(/run /var/run /tmp "${RUNNER_TEMP:-/tmp}")
+  if [[ "${DOCKER_HOST:-}" == unix://* ]]; then
+    socket_roots+=("$(dirname "${DOCKER_HOST#unix://}")")
+  fi
+  local socket content
   while IFS= read -r socket; do
-    if sudo "${ctr}" -a "${socket}" -n moby content info "${digest}" >/dev/null 2>&1; then
+    # ctr has no `content info` command; list digests without fetching the
+    # layer so this probe cannot restore the content we intend to remove.
+    content="$(sudo "${ctr}" -a "${socket}" -n moby content ls -q 2>/dev/null)" || continue
+    if grep -Fxq -- "${digest}" <<<"${content}"; then
       sudo "${ctr}" -a "${socket}" -n moby content rm "${digest}" >/dev/null
       return
     fi
-  done < <(sudo find /run /var/run /tmp "${RUNNER_TEMP:-/tmp}" -name containerd.sock -type s 2>/dev/null | sort -u)
+  done < <(sudo find "${socket_roots[@]}" -name containerd.sock -type s 2>/dev/null | sort -u)
   echo "could not find the containerd socket holding ${digest}" >&2
   return 1
 }

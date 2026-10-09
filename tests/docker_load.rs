@@ -27,7 +27,8 @@ async fn pull_reuses_layer_exported_from_docker_daemon() {
     assert_eq!(
         registry.layer_get_count(),
         0,
-        "layer exported from Docker must not be downloaded"
+        "layer exported from Docker must not be downloaded: {}",
+        describe(&output, &daemon)
     );
     assert_single_load_contains_layer(&daemon, &fixture);
 }
@@ -88,7 +89,12 @@ async fn pull_tries_next_daemon_image_when_first_export_lacks_layer() {
     let output = run_pull(&registry, &daemon).await;
 
     assert_pull_succeeded(&output, &daemon);
-    assert_eq!(registry.layer_get_count(), 0);
+    assert_eq!(
+        registry.layer_get_count(),
+        0,
+        "{}",
+        describe(&output, &daemon)
+    );
     assert_eq!(
         daemon.saves(),
         vec![DONOR_ID.to_string(), SECOND_DONOR_ID.to_string()]

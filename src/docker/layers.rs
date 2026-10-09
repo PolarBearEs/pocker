@@ -292,10 +292,12 @@ async fn materialize_layers_from_saved_image(
     chosen: &ChosenImageLayers,
     output_root: &Path,
 ) -> Result<HashMap<String, MaterializedDaemonLayer>> {
-    let temp = NamedTempFile::new_in(store.root())?;
-    daemon.save_image(&chosen.image.id, temp.path()).await?;
+    // Close the placeholder handle before the transport atomically replaces
+    // it: Windows cannot replace a destination file that is still open.
+    let temp = NamedTempFile::new_in(store.root())?.into_temp_path();
+    daemon.save_image(&chosen.image.id, &temp).await?;
 
-    let archive_path = temp.path().to_path_buf();
+    let archive_path = temp.to_path_buf();
     let output_root = output_root.to_path_buf();
     let chosen = chosen.clone();
     task::spawn_blocking(move || {
