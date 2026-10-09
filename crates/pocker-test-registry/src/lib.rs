@@ -13,6 +13,10 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
+mod docker;
+
+pub use docker::{FakeDaemonImage, FakeDockerDaemon};
+
 const REQUEST_HEAD_LIMIT: usize = 8 * 1024;
 const FIXTURE_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_LAYER_PAYLOAD: &[u8] = b"fake layer payload";
@@ -91,6 +95,21 @@ impl TestImage {
     /// Returns the bare config digest hex used as its cache path component.
     pub fn config_digest(&self) -> &str {
         &self.config_digest
+    }
+
+    /// Returns the uncompressed layer bytes served for the layer blob.
+    pub fn layer_bytes(&self) -> &[u8] {
+        &self.layer_bytes
+    }
+
+    /// Returns the full layer descriptor digest, e.g. `sha256:<hex>`.
+    pub fn layer_descriptor_digest(&self) -> &str {
+        &self.layer_descriptor_digest
+    }
+
+    /// Returns the layer diff_id recorded in the image config.
+    pub fn layer_diff_id(&self) -> String {
+        format!("sha256:{}", sha256_hex(&self.layer_bytes))
     }
 
     /// Returns the bare layer digest hex used as its cache path component.
