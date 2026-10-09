@@ -194,7 +194,10 @@ echo "containerd smoke: download layers Docker can no longer export"
 # it in RootFS, but `docker save` silently leaves the blob out of the archive,
 # so pocker must fall back to the registry for it.
 docker image tag "${DOCKER_PULLED_REF}" "${BASE_REF}"
-docker push "${BASE_REF}" >/dev/null
+# Publish only the locally unpacked platform. A containerd-backed image ID
+# may otherwise name an index whose registry response has no layer list.
+base_platform="$(docker image inspect "${DOCKER_PULLED_REF}" --format '{{.Os}}/{{.Architecture}}{{if .Variant}}/{{.Variant}}{{end}}')"
+docker push --platform "${base_platform}" "${BASE_REF}" >/dev/null
 printf 'FROM %s\nLABEL io.pocker.test.child="true"\n' "${BASE_REF}" >"${WORKDIR}/Dockerfile.child"
 docker build -q -f "${WORKDIR}/Dockerfile.child" -t "${CHILD_REF}" "${WORKDIR}" >/dev/null
 docker push "${CHILD_REF}" >/dev/null
