@@ -53,12 +53,19 @@ pub struct ImageSummary {
     pub size: Option<u64>,
 }
 
-pub async fn load_reference_archive_stream(
+pub(crate) async fn prepare_reference_archive(
     store: &Store,
     reference: &StoredReference,
+) -> Result<PreparedOciArchive> {
+    prepare_oci_archive(store, reference).await
+}
+
+pub(crate) async fn load_prepared_reference_archive_stream(
+    store: &Store,
+    reference: &StoredReference,
+    prepared: PreparedOciArchive,
 ) -> Result<()> {
     let daemon = DockerDaemon::shared().await?;
-    let prepared = prepare_oci_archive(store, reference).await?;
     let (reader, writer) = tokio::io::duplex(LOAD_ARCHIVE_STREAM_BUFFER_BYTES);
     let writer = SyncIoBridge::new(writer);
     let store = store.clone();
@@ -97,21 +104,42 @@ fn write_archive_to_stream(
     Ok(())
 }
 
-pub async fn daemon_has_reference(reference: &ImageReference, config_digest: &str) -> Result<bool> {
-    let inspect_target = daemon_inspect_target(reference, config_digest);
+pub async fn daemon_has_reference(
+    reference: &ImageReference,
+    stored_reference: &StoredReference,
+) -> Result<bool> {
+    let inspect_target = daemon_inspect_target(reference, &stored_reference.config_digest);
     let daemon = DockerDaemon::shared().await?;
-    let Some(image) = daemon.inspect_daemon_image(&inspect_target).await? else {
+    let Some(image) = daemon
+        .inspect_daemon_image_with_manifests(&inspect_target)
+        .await?
+    else {
         return Ok(false);
     };
 
-    Ok(image_matches_config(&image, config_digest))
+    Ok(image_matches_reference(&image, stored_reference))
 }
 
-fn image_matches_config(image: &daemon::DaemonImage, config_digest: &str) -> bool {
-    normalize_image_id(&image.id) == normalize_image_id(config_digest)
+/// Classic Docker image IDs are config digests. Docker's containerd image
+/// store instead reports the index or manifest digest, so also accept the
+/// manifest pocker resolved, either as the image itself or as a usable
+/// platform entry of its index. Manifests are content-addressed and pin the
+/// config, so a manifest match implies a config match.
+fn image_matches_reference(
+    image: &daemon::DaemonImage,
+    stored_reference: &StoredReference,
+) -> bool {
+    let config_digest = normalize_image_id(&stored_reference.config_digest);
+    let manifest_digest = normalize_image_id(&stored_reference.manifest.digest);
+    normalize_image_id(&image.id) == config_digest
         || image
             .config_digest_annotation()
-            .is_some_and(|digest| normalize_image_id(digest) == normalize_image_id(config_digest))
+            .is_some_and(|digest| normalize_image_id(digest) == config_digest)
+        || normalize_image_id(&image.id) == manifest_digest
+        || image
+            .descriptor_digest()
+            .is_some_and(|digest| normalize_image_id(digest) == manifest_digest)
+        || image.has_usable_platform_manifest(&stored_reference.manifest.digest)
 }
 
 fn daemon_inspect_target(reference: &ImageReference, config_digest: &str) -> String {
@@ -244,9 +272,11 @@ mod tests {
     use super::transport::{DEFAULT_DOCKER_HOST, DockerEndpoint, docker_endpoint_from_host};
     use super::{
         POCKER_CONFIG_DIGEST_ANNOTATION, daemon_inspect_target, encode_path_segment,
-        encode_query_value, image_matches_config, split_tagged_reference,
+        encode_query_value, image_matches_reference, split_tagged_reference,
     };
     use crate::reference::ImageReference;
+    use crate::registry::Descriptor;
+    use crate::store::StoredReference;
 
     #[test]
     fn inspect_target_uses_display_name_for_tagged_references() {
@@ -269,25 +299,84 @@ mod tests {
         );
     }
 
-    #[test]
-    fn image_config_matches_classic_image_id_or_pocker_annotation() {
-        let classic: super::daemon::DaemonImage = serde_json::from_value(serde_json::json!({
-            "Id": "sha256:config"
-        }))
-        .expect("classic image should parse");
-        assert!(image_matches_config(&classic, "sha256:config"));
+    fn stored_reference(manifest_digest: &str, config_digest: &str) -> StoredReference {
+        StoredReference {
+            reference: "ghcr.io/acme/app:1".into(),
+            manifest: Descriptor {
+                media_type: String::new(),
+                digest: manifest_digest.into(),
+                size: 0,
+                platform: None,
+                annotations: None,
+            },
+            config_digest: config_digest.into(),
+        }
+    }
 
-        let containerd: super::daemon::DaemonImage = serde_json::from_value(serde_json::json!({
-            "Id": "sha256:manifest",
+    fn daemon_image(value: serde_json::Value) -> super::daemon::DaemonImage {
+        serde_json::from_value(value).expect("daemon image should parse")
+    }
+
+    #[test]
+    fn image_matches_classic_image_id_or_pocker_annotation() {
+        let stored = stored_reference("sha256:manifest", "sha256:config");
+        let classic = daemon_image(serde_json::json!({ "Id": "sha256:config" }));
+        assert!(image_matches_reference(&classic, &stored));
+
+        let containerd = daemon_image(serde_json::json!({
+            "Id": "sha256:index",
             "Descriptor": {
                 "annotations": {
                     (POCKER_CONFIG_DIGEST_ANNOTATION): "sha256:config"
                 }
             }
-        }))
-        .expect("containerd image should parse");
-        assert!(image_matches_config(&containerd, "sha256:config"));
-        assert!(!image_matches_config(&containerd, "sha256:other"));
+        }));
+        assert!(image_matches_reference(&containerd, &stored));
+        assert!(!image_matches_reference(
+            &containerd,
+            &stored_reference("sha256:manifest", "sha256:other")
+        ));
+    }
+
+    #[test]
+    fn image_matches_containerd_manifest_digest() {
+        let stored = stored_reference("sha256:manifest", "sha256:config");
+        let single = daemon_image(serde_json::json!({
+            "Id": "sha256:manifest",
+            "Descriptor": { "digest": "sha256:manifest" }
+        }));
+        assert!(image_matches_reference(&single, &stored));
+        assert!(!image_matches_reference(
+            &single,
+            &stored_reference("sha256:newer", "sha256:config2")
+        ));
+    }
+
+    #[test]
+    fn image_matches_unpacked_platform_manifest_of_containerd_index() {
+        let stored = stored_reference("sha256:arm64", "sha256:config");
+        // Docker pulled a multi-platform index; the compressed content was
+        // discarded after unpacking, so only the snapshot size remains.
+        let index = daemon_image(serde_json::json!({
+            "Id": "sha256:index",
+            "Descriptor": { "digest": "sha256:index" },
+            "Manifests": [
+                {
+                    "Descriptor": { "digest": "sha256:amd64" },
+                    "Available": false
+                },
+                {
+                    "Descriptor": { "digest": "sha256:arm64" },
+                    "Available": false,
+                    "ImageData": { "Size": { "Unpacked": 1024 } }
+                }
+            ]
+        }));
+        assert!(image_matches_reference(&index, &stored));
+        assert!(!image_matches_reference(
+            &index,
+            &stored_reference("sha256:amd64", "sha256:config")
+        ));
     }
 
     #[test]

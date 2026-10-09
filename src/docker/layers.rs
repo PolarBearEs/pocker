@@ -87,11 +87,18 @@ struct ChosenImageLayers {
 pub struct MaterializedDaemonLayers {
     _tempdir: TempDir,
     layers: HashMap<String, MaterializedDaemonLayer>,
+    unresolved: Vec<String>,
 }
 
 impl MaterializedDaemonLayers {
     pub(crate) fn layers(&self) -> &HashMap<String, MaterializedDaemonLayer> {
         &self.layers
+    }
+
+    /// Requested diff_ids that no daemon image could export. Callers must
+    /// obtain these layers elsewhere, typically from the registry.
+    pub(crate) fn unresolved(&self) -> &[String] {
+        &self.unresolved
     }
 }
 
@@ -175,51 +182,85 @@ pub(super) fn ordered_unique_image_ids(summaries: Vec<DaemonImageSummary>) -> Ve
     ids
 }
 
+/// Export the requested layers from images already in the Docker daemon.
+///
+/// Listing a diff_id in `RootFS.Layers` does not guarantee Docker can export
+/// it: with the containerd image store, `docker save` may succeed while
+/// omitting blobs whose compressed content was discarded after unpacking.
+/// Every daemon image providing a still-missing layer is tried in turn, and
+/// whatever no image can export is reported through
+/// [`MaterializedDaemonLayers::unresolved`] instead of failing the caller.
 pub async fn materialize_daemon_layers(
     store: &Store,
     diff_ids: &[String],
 ) -> Result<MaterializedDaemonLayers> {
-    let wanted = diff_ids.iter().cloned().collect::<HashSet<_>>();
-    if wanted.is_empty() {
-        return Ok(MaterializedDaemonLayers {
-            _tempdir: tempfile::tempdir_in(store.root())?,
-            layers: HashMap::new(),
-        });
-    }
-
-    let daemon = DockerDaemon::shared().await?;
-    let chosen = choose_daemon_images(daemon, &wanted).await?;
     let tempdir = tempfile::tempdir_in(store.root())?;
+    let mut unresolved = diff_ids.iter().cloned().collect::<HashSet<_>>();
     let mut paths = HashMap::new();
-    for chosen in &chosen {
-        materialize_layers_from_saved_image(store, daemon, chosen, tempdir.path(), &mut paths)
-            .await?;
-    }
-
-    let unresolved = diff_ids
-        .iter()
-        .filter(|diff_id| !paths.contains_key(diff_id.as_str()))
-        .cloned()
-        .collect::<Vec<_>>();
     if !unresolved.is_empty() {
-        return Err(DockerPullError::BadResponse(format!(
-            "docker daemon is missing required layer(s): {}",
-            unresolved.join(", ")
-        )));
+        let daemon = DockerDaemon::shared().await?;
+        for image in list_daemon_images(daemon).await? {
+            let Some(chosen) = choose_image_layers(image, &unresolved) else {
+                continue;
+            };
+            let extracted =
+                match materialize_layers_from_saved_image(store, daemon, &chosen, tempdir.path())
+                    .await
+                {
+                    Ok(extracted) => extracted,
+                    Err(error) => {
+                        warn!(
+                            "could not export {} layer(s) from Docker image {}: {error}",
+                            chosen.diff_ids.len(),
+                            chosen.image.label()
+                        );
+                        continue;
+                    }
+                };
+            let missing = chosen
+                .diff_ids
+                .iter()
+                .filter(|diff_id| !extracted.contains_key(diff_id.as_str()))
+                .count();
+            if missing > 0 {
+                warn!(
+                    "docker save of {} omitted {missing} of {} expected layer(s)",
+                    chosen.image.label(),
+                    chosen.diff_ids.len()
+                );
+            }
+            for diff_id in extracted.keys() {
+                unresolved.remove(diff_id);
+            }
+            paths.extend(extracted);
+            if unresolved.is_empty() {
+                break;
+            }
+        }
     }
 
     Ok(MaterializedDaemonLayers {
         _tempdir: tempdir,
         layers: paths,
+        unresolved: diff_ids
+            .iter()
+            .filter(|diff_id| unresolved.contains(diff_id.as_str()))
+            .cloned()
+            .collect(),
     })
 }
 
-async fn choose_daemon_images(
-    daemon: &DockerDaemon,
-    wanted: &HashSet<String>,
-) -> Result<Vec<ChosenImageLayers>> {
-    let images = list_daemon_images(daemon).await?;
-    Ok(choose_from_daemon_images(images, wanted))
+fn choose_image_layers(image: DaemonImage, wanted: &HashSet<String>) -> Option<ChosenImageLayers> {
+    let provided = image
+        .rootfs_layers()
+        .iter()
+        .filter(|diff_id| wanted.contains(*diff_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    (!provided.is_empty()).then_some(ChosenImageLayers {
+        image,
+        diff_ids: provided,
+    })
 }
 
 fn choose_from_daemon_images(
@@ -230,22 +271,13 @@ fn choose_from_daemon_images(
     let mut unresolved = wanted.clone();
 
     for image in images {
-        let provided = image
-            .rootfs_layers()
-            .iter()
-            .filter(|diff_id| unresolved.contains(*diff_id))
-            .cloned()
-            .collect::<Vec<_>>();
-        if provided.is_empty() {
+        let Some(image_layers) = choose_image_layers(image, &unresolved) else {
             continue;
-        }
-        for diff_id in &provided {
+        };
+        for diff_id in &image_layers.diff_ids {
             unresolved.remove(diff_id);
         }
-        chosen.push(ChosenImageLayers {
-            image,
-            diff_ids: provided,
-        });
+        chosen.push(image_layers);
         if unresolved.is_empty() {
             break;
         }
@@ -259,30 +291,20 @@ async fn materialize_layers_from_saved_image(
     daemon: &DockerDaemon,
     chosen: &ChosenImageLayers,
     output_root: &Path,
-    paths: &mut HashMap<String, MaterializedDaemonLayer>,
-) -> Result<()> {
+) -> Result<HashMap<String, MaterializedDaemonLayer>> {
     let temp = NamedTempFile::new_in(store.root())?;
-    if daemon
-        .save_image(&chosen.image.id, temp.path())
-        .await
-        .is_err()
-    {
-        return Ok(());
-    }
+    daemon.save_image(&chosen.image.id, temp.path()).await?;
 
     let archive_path = temp.path().to_path_buf();
     let output_root = output_root.to_path_buf();
     let chosen = chosen.clone();
-    let extracted = task::spawn_blocking(move || {
+    task::spawn_blocking(move || {
         materialize_layers_from_saved_archive(&archive_path, &chosen, &output_root)
     })
     .await
     .map_err(|error| {
         DockerPullError::CommandFailed(format!("docker layer materialization task failed: {error}"))
-    })??;
-
-    paths.extend(extracted);
-    Ok(())
+    })?
 }
 
 fn materialize_layers_from_saved_archive(
@@ -292,10 +314,16 @@ fn materialize_layers_from_saved_archive(
 ) -> Result<HashMap<String, MaterializedDaemonLayer>> {
     let entries = save_manifest_entries(archive_path)?;
     let Some(entry) = entries.into_iter().next() else {
-        return Ok(HashMap::new());
+        return Err(DockerPullError::BadResponse(
+            "docker save manifest.json lists no images".into(),
+        ));
     };
     if entry.layers.len() != chosen.image.rootfs_layers().len() {
-        return Ok(HashMap::new());
+        return Err(DockerPullError::BadResponse(format!(
+            "docker save manifest.json lists {} layer(s) but image inspect reports {}",
+            entry.layers.len(),
+            chosen.image.rootfs_layers().len()
+        )));
     }
 
     let targets = chosen
@@ -557,6 +585,69 @@ mod tests {
         assert_eq!(materialized.digest, blob_digest);
         assert_eq!(materialized.size, compressed.len() as i64);
         assert!(materialized.gzip_compressed);
+    }
+
+    #[test]
+    fn docker_save_archive_missing_layer_blobs_leaves_layers_unresolved() {
+        // Docker 29 on the containerd image store can exit successfully while
+        // writing a manifest.json whose layer blobs are absent from the tar.
+        let dir = tempdir().expect("tempdir should create");
+        let archive_path = dir.path().join("image.tar");
+        let output_root = dir.path().join("materialized");
+        fs::create_dir(&output_root).expect("output directory should create");
+
+        let diff_id = canonical_digest_bytes(b"layer");
+        let manifest = serde_json::to_vec(&serde_json::json!([{
+            "Config": "blobs/sha256/config",
+            "RepoTags": null,
+            "Layers": ["blobs/sha256/missing"]
+        }]))
+        .expect("manifest should serialize");
+        let archive_file = fs::File::create(&archive_path).expect("archive should create");
+        let mut archive = Builder::new(archive_file);
+        append_archive_bytes(&mut archive, "manifest.json", &manifest);
+        archive.finish().expect("archive should finish");
+        drop(archive);
+
+        let chosen = chosen_layers(&diff_id, &[&diff_id]);
+        let paths = materialize_layers_from_saved_archive(&archive_path, &chosen, &output_root)
+            .expect("archive without blobs should still parse");
+        assert!(paths.is_empty());
+    }
+
+    #[test]
+    fn docker_save_layer_count_mismatch_is_reported() {
+        let dir = tempdir().expect("tempdir should create");
+        let archive_path = dir.path().join("image.tar");
+        let manifest = serde_json::to_vec(&serde_json::json!([{
+            "Config": "blobs/sha256/config",
+            "Layers": ["blobs/sha256/one"]
+        }]))
+        .expect("manifest should serialize");
+        let archive_file = fs::File::create(&archive_path).expect("archive should create");
+        let mut archive = Builder::new(archive_file);
+        append_archive_bytes(&mut archive, "manifest.json", &manifest);
+        archive.finish().expect("archive should finish");
+        drop(archive);
+
+        let first = canonical_digest_bytes(b"first");
+        let second = canonical_digest_bytes(b"second");
+        let chosen = chosen_layers(&first, &[&first, &second]);
+        let error = materialize_layers_from_saved_archive(&archive_path, &chosen, dir.path())
+            .expect_err("layer count mismatch should be an error");
+        assert!(error.to_string().contains("lists 1 layer(s)"));
+    }
+
+    fn chosen_layers(wanted: &str, rootfs: &[&str]) -> ChosenImageLayers {
+        let image: DaemonImage = serde_json::from_value(serde_json::json!({
+            "Id": "sha256:test-image",
+            "RootFS": { "Layers": rootfs }
+        }))
+        .expect("daemon image should deserialize");
+        ChosenImageLayers {
+            image,
+            diff_ids: vec![wanted.to_string()],
+        }
     }
 
     fn append_archive_bytes(archive: &mut Builder<fs::File>, path: &str, bytes: &[u8]) {

@@ -54,6 +54,22 @@ impl DockerDaemon {
             .transpose()
     }
 
+    /// Inspect including the per-platform manifest list that Docker's
+    /// containerd image store reports with `manifests=1` (API 1.48+). Older
+    /// daemons ignore the query parameter and omit the list.
+    pub(super) async fn inspect_daemon_image_with_manifests(
+        &self,
+        image: &str,
+    ) -> Result<Option<DaemonImage>> {
+        self.inspect_image_bytes_at(&format!(
+            "/images/{}/json?manifests=1",
+            encode_path_segment(image)
+        ))
+        .await?
+        .map(|bytes| serde_json::from_slice(&bytes).map_err(Into::into))
+        .transpose()
+    }
+
     pub(super) async fn inspect_image_json(&self, image: &str) -> Result<Option<Value>> {
         self.inspect_image_bytes(image)
             .await?
@@ -62,14 +78,12 @@ impl DockerDaemon {
     }
 
     async fn inspect_image_bytes(&self, image: &str) -> Result<Option<Vec<u8>>> {
-        let response = self
-            .transport
-            .request_bytes(
-                "GET",
-                &format!("/images/{}/json", encode_path_segment(image)),
-                None,
-            )
-            .await?;
+        self.inspect_image_bytes_at(&format!("/images/{}/json", encode_path_segment(image)))
+            .await
+    }
+
+    async fn inspect_image_bytes_at(&self, path: &str) -> Result<Option<Vec<u8>>> {
+        let response = self.transport.request_bytes("GET", path, None).await?;
         if response.status == StatusCode::NOT_FOUND {
             return Ok(None);
         }
@@ -181,12 +195,38 @@ pub(super) struct DaemonImage {
     rootfs: Option<RootFs>,
     #[serde(default, rename = "Descriptor")]
     descriptor: Option<DaemonDescriptor>,
+    #[serde(default, rename = "Manifests")]
+    manifests: Option<Vec<DaemonManifestSummary>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 struct DaemonDescriptor {
     #[serde(default)]
+    digest: Option<String>,
+    #[serde(default)]
     annotations: Option<HashMap<String, String>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct DaemonManifestSummary {
+    #[serde(rename = "Descriptor")]
+    descriptor: DaemonDescriptor,
+    #[serde(default, rename = "Available")]
+    available: bool,
+    #[serde(default, rename = "ImageData")]
+    image_data: Option<DaemonManifestImageData>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct DaemonManifestImageData {
+    #[serde(default, rename = "Size")]
+    size: Option<DaemonManifestImageSize>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct DaemonManifestImageSize {
+    #[serde(default, rename = "Unpacked")]
+    unpacked: i64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -203,6 +243,26 @@ impl DaemonImage {
             .as_ref()?
             .get(super::POCKER_CONFIG_DIGEST_ANNOTATION)
             .map(String::as_str)
+    }
+
+    pub(super) fn descriptor_digest(&self) -> Option<&str> {
+        self.descriptor.as_ref()?.digest.as_deref()
+    }
+
+    /// Whether the image's index lists `digest` as a platform manifest that
+    /// the daemon can run. Containerd may have discarded the compressed
+    /// content after unpacking (`Available` is false), but an unpacked
+    /// snapshot still makes the image usable.
+    pub(super) fn has_usable_platform_manifest(&self, digest: &str) -> bool {
+        self.manifests.iter().flatten().any(|manifest| {
+            manifest.descriptor.digest.as_deref() == Some(digest)
+                && (manifest.available
+                    || manifest
+                        .image_data
+                        .as_ref()
+                        .and_then(|data| data.size.as_ref())
+                        .is_some_and(|size| size.unpacked > 0))
+        })
     }
 
     pub(super) fn rootfs_layers(&self) -> &[String] {
