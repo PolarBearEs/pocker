@@ -37,6 +37,8 @@ pub struct ActiveStore {
 #[derive(Debug, Clone)]
 pub struct MaintenanceStore {
     store: Store,
+    // Files deleted while making room for the cache lock file on a full disk.
+    freed_for_lock: Vec<ClearedCacheFile>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -524,24 +526,35 @@ impl Deref for ActiveStore {
 
 impl MaintenanceStore {
     // Cache clean is what users run when the disk is full, so opening must not
-    // need free space: the store layout is not created here, and the lock file
-    // is only created when it does not exist yet.
+    // need free space: the store layout is not created here, and a missing
+    // lock file is made room for instead of failing.
     pub async fn open(root: PathBuf) -> Result<Self> {
         ensure_directory_blocking(root.clone()).await?;
-        let lock = try_acquire_maintenance_cache_lock(root.clone(), "cache clean").await?;
+        let (lock, freed_for_lock) =
+            try_acquire_maintenance_cache_lock(root.clone(), "cache clean").await?;
         Ok(Self {
             store: Store {
                 root,
-                cache_lock: lock.map(std::sync::Arc::new),
+                cache_lock: Some(std::sync::Arc::new(lock)),
             },
+            freed_for_lock,
         })
     }
 
     pub async fn clear(&self) -> Result<ClearedCache> {
-        self.store
+        let mut report = self
+            .store
             .clear_with_report(true)
-            .await
-            .map(|report| report.expect("clear_with_report(true) must return Some"))
+            .await?
+            .expect("clear_with_report(true) must return Some");
+        for file in &self.freed_for_lock {
+            report.reclaimed_bytes = report.reclaimed_bytes.saturating_add(file.size);
+        }
+        report.files.extend(self.freed_for_lock.iter().cloned());
+        report
+            .files
+            .sort_by(|left, right| left.path.cmp(&right.path));
+        Ok(report)
     }
 
     pub async fn clear_quiet(&self) -> Result<()> {
@@ -587,7 +600,7 @@ fn cleanup_layer_claim_entries(entries: Vec<LayerClaimEntry>) {
 async fn try_acquire_maintenance_cache_lock(
     root: PathBuf,
     operation: &'static str,
-) -> Result<Option<File>> {
+) -> Result<(File, Vec<ClearedCacheFile>)> {
     tokio::task::spawn_blocking(move || {
         try_acquire_maintenance_cache_lock_blocking(&root, operation)
     })
@@ -598,33 +611,46 @@ async fn try_acquire_maintenance_cache_lock(
 fn try_acquire_maintenance_cache_lock_blocking(
     root: &Path,
     operation: &'static str,
-) -> Result<Option<File>> {
+) -> Result<(File, Vec<ClearedCacheFile>)> {
     let path = cache_lock_path(root);
-    let lock = match OpenOptions::new().read(true).write(true).open(&path) {
-        Ok(lock) => lock,
-        Err(error) if error.kind() == ErrorKind::NotFound => {
-            match OpenOptions::new()
-                .create(true)
-                .read(true)
-                .truncate(false)
-                .write(true)
-                .open(&path)
-            {
-                Ok(lock) => lock,
-                // No process can hold a lock on a file that does not exist, and
-                // any new one has to create it on this same full filesystem
-                // first, so clearing without the lock is safe and is the only
-                // way to recover the space.
-                Err(error) if is_out_of_space(&error) => return Ok(None),
-                Err(error) => return Err(error.into()),
+    let mut freed = Vec::new();
+    let lock = loop {
+        match open_lock_file(root) {
+            Ok(lock) => break lock,
+            Err(DockerPullError::Io(error)) if is_out_of_space(&error) => {
+                // Opening an existing lock file needs no space, so the file is
+                // missing and nobody can hold the cache lock. Free one file at
+                // a time until the lock file fits, so a pull that starts once
+                // space appears is never left racing an unlocked bulk delete.
+                if path.exists() {
+                    continue;
+                }
+                match free_largest_cache_file(root)? {
+                    Some(file) => freed.push(file),
+                    None => return Err(error.into()),
+                }
             }
+            Err(error) => return Err(error),
         }
-        Err(error) => return Err(error.into()),
     };
     match lock.try_lock() {
-        Ok(()) => Ok(Some(lock)),
+        Ok(()) => Ok((lock, freed)),
         Err(TryLockError::WouldBlock) => Err(DockerPullError::CacheLocked { operation, path }),
         Err(TryLockError::Error(error)) => Err(error.into()),
+    }
+}
+
+fn free_largest_cache_file(root: &Path) -> Result<Option<ClearedCacheFile>> {
+    let Some(file) = collect_cache_files(root)?
+        .into_iter()
+        .max_by_key(|file| file.size)
+    else {
+        return Ok(None);
+    };
+    match std::fs::remove_file(root.join(&file.path)) {
+        Ok(()) => Ok(Some(file)),
+        Err(error) if error.kind() == ErrorKind::NotFound => free_largest_cache_file(root),
+        Err(error) => Err(error.into()),
     }
 }
 
