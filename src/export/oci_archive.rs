@@ -62,6 +62,25 @@ pub(crate) struct PreparedOciArchive {
     daemon_layers: Option<docker::MaterializedDaemonLayers>,
 }
 
+impl PreparedOciArchive {
+    /// Layers missing from the cache that the Docker daemon could not export
+    /// either. They must be placed in the store before the archive is written.
+    pub(crate) fn unresolved_layers(&self) -> Vec<Descriptor> {
+        let Some(daemon_layers) = &self.daemon_layers else {
+            return Vec::new();
+        };
+        let unresolved = daemon_layers.unresolved();
+        self.inputs
+            .manifest
+            .layers
+            .iter()
+            .zip(&self.inputs.diff_ids)
+            .filter(|(_, diff_id)| unresolved.contains(diff_id))
+            .map(|(layer, _)| layer.clone())
+            .collect()
+    }
+}
+
 #[cfg(test)]
 pub async fn write_oci_archive_to_writer<W: Write>(
     writer: W,

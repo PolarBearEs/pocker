@@ -1,5 +1,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+
+use futures_util::stream::{self, StreamExt, TryStreamExt};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -22,7 +24,7 @@ pub(super) async fn finalize_existing_reference(
     cache_layer_claim: &CacheLayerClaimGuard,
 ) -> Result<bool> {
     let normalized = &stored_reference.reference;
-    let already_loaded = docker::daemon_has_reference(reference, &stored_reference.config_digest)
+    let already_loaded = docker::daemon_has_reference(reference, stored_reference)
         .await
         .unwrap_or(false);
     if !already_loaded {
@@ -77,7 +79,7 @@ pub(super) async fn load_reference(
         )
         .await?;
 
-    if docker::daemon_has_reference(reference, &stored_reference.config_digest)
+    if docker::daemon_has_reference(reference, stored_reference)
         .await
         .unwrap_or(false)
     {
@@ -104,10 +106,11 @@ pub(super) async fn load_reference(
     context.ui.begin_load(normalized);
     match options.load_mode {
         LoadMode::Stream => {
-            docker::load_reference_archive_stream(&context.store, stored_reference).await?;
+            stream_load_reference(context, reference, stored_reference, options).await?;
         }
         LoadMode::Registry => {
-            load_reference_through_cache_registry(context, reference, stored_reference).await?;
+            load_reference_through_cache_registry(context, reference, stored_reference, options)
+                .await?;
         }
     }
     prune_after_load_if_needed(
@@ -149,17 +152,55 @@ async fn prune_after_load_if_needed(
     Ok(())
 }
 
+/// Stream-load an image, reusing layers exported from the Docker daemon.
+///
+/// The pull skipped downloading layers the daemon reported in an image's
+/// `RootFS`, but the daemon cannot always export them (containerd may keep
+/// only the unpacked snapshot). Any layer it fails to export is downloaded
+/// from the registry here rather than failing the whole load.
+async fn stream_load_reference(
+    context: &PullContext,
+    reference: &ImageReference,
+    stored_reference: &StoredReference,
+    options: &PullOptions,
+) -> Result<()> {
+    let normalized = &stored_reference.reference;
+    let prepared = docker::prepare_reference_archive(&context.store, stored_reference).await?;
+    let unresolved = prepared.unresolved_layers();
+    if !unresolved.is_empty() {
+        context.ui.warn(&format!(
+            "Docker could not export {} reused layer(s) for {normalized}; downloading them from the registry",
+            unresolved.len()
+        ));
+        context
+            .ui
+            .set_image_status(normalized, "Downloading layers");
+        let digests = unresolved
+            .iter()
+            .map(|descriptor| descriptor.digest.clone())
+            .collect::<Vec<_>>();
+        context.ui.prepare_layers(&digests);
+        stream::iter(unresolved)
+            .map(|descriptor| super::download::download_blob(context, reference, descriptor))
+            .buffer_unordered(options.concurrency.max(1))
+            .try_collect::<()>()
+            .await?;
+        context.ui.begin_load(normalized);
+    }
+    docker::load_prepared_reference_archive_stream(&context.store, stored_reference, prepared).await
+}
+
 async fn load_reference_through_cache_registry(
     context: &PullContext,
     reference: &ImageReference,
     stored_reference: &StoredReference,
+    options: &PullOptions,
 ) -> Result<()> {
     if matches!(reference.target, ReferenceTarget::Digest(_)) {
         context.ui.warn(
             "registry load mode does not support digest references yet; falling back to stream load",
         );
-        docker::load_reference_archive_stream(&context.store, stored_reference).await?;
-        return Ok(());
+        return stream_load_reference(context, reference, stored_reference, options).await;
     }
 
     let registry =
