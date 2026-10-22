@@ -96,11 +96,8 @@ struct DownloadCheckpoint {
 }
 
 impl Store {
+    #[cfg(test)]
     pub async fn open(root: PathBuf) -> Result<Self> {
-        Self::open_without_lock(root).await
-    }
-
-    async fn open_without_lock(root: PathBuf) -> Result<Self> {
         ensure_directory_blocking(root.clone()).await?;
         ensure_store_layout_blocking(root.clone()).await?;
         Ok(Self {
@@ -494,7 +491,9 @@ impl Store {
 
         remove_cache_contents(&self.root).await?;
 
-        Self::open(self.root.clone()).await?;
+        // Every store open recreates the layout, so failing here must not turn
+        // a successful clean into an error.
+        let _ = ensure_store_layout_blocking(self.root.clone()).await;
         Ok(report)
     }
 
@@ -524,16 +523,16 @@ impl Deref for ActiveStore {
 }
 
 impl MaintenanceStore {
+    // Cache clean is what users run when the disk is full, so opening must not
+    // need free space: the store layout is not created here, and the lock file
+    // is only created when it does not exist yet.
     pub async fn open(root: PathBuf) -> Result<Self> {
         ensure_directory_blocking(root.clone()).await?;
-        let lock = Some(std::sync::Arc::new(
-            try_acquire_exclusive_cache_lock(root.clone(), "cache clean").await?,
-        ));
-        ensure_store_layout_blocking(root.clone()).await?;
+        let lock = try_acquire_maintenance_cache_lock(root.clone(), "cache clean").await?;
         Ok(Self {
             store: Store {
                 root,
-                cache_lock: lock,
+                cache_lock: lock.map(std::sync::Arc::new),
             },
         })
     }
@@ -585,10 +584,55 @@ fn cleanup_layer_claim_entries(entries: Vec<LayerClaimEntry>) {
     }
 }
 
-async fn try_acquire_exclusive_cache_lock(root: PathBuf, operation: &'static str) -> Result<File> {
-    tokio::task::spawn_blocking(move || try_acquire_exclusive_cache_lock_blocking(&root, operation))
-        .await
-        .map_err(|e| DockerPullError::InvalidInput(format!("cache lock task panicked: {e}")))?
+async fn try_acquire_maintenance_cache_lock(
+    root: PathBuf,
+    operation: &'static str,
+) -> Result<Option<File>> {
+    tokio::task::spawn_blocking(move || {
+        try_acquire_maintenance_cache_lock_blocking(&root, operation)
+    })
+    .await
+    .map_err(|e| DockerPullError::InvalidInput(format!("cache lock task panicked: {e}")))?
+}
+
+fn try_acquire_maintenance_cache_lock_blocking(
+    root: &Path,
+    operation: &'static str,
+) -> Result<Option<File>> {
+    let path = cache_lock_path(root);
+    let lock = match OpenOptions::new().read(true).write(true).open(&path) {
+        Ok(lock) => lock,
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            match OpenOptions::new()
+                .create(true)
+                .read(true)
+                .truncate(false)
+                .write(true)
+                .open(&path)
+            {
+                Ok(lock) => lock,
+                // No process can hold a lock on a file that does not exist, and
+                // any new one has to create it on this same full filesystem
+                // first, so clearing without the lock is safe and is the only
+                // way to recover the space.
+                Err(error) if is_out_of_space(&error) => return Ok(None),
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Err(error) => return Err(error.into()),
+    };
+    match lock.try_lock() {
+        Ok(()) => Ok(Some(lock)),
+        Err(TryLockError::WouldBlock) => Err(DockerPullError::CacheLocked { operation, path }),
+        Err(TryLockError::Error(error)) => Err(error.into()),
+    }
+}
+
+fn is_out_of_space(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        ErrorKind::StorageFull | ErrorKind::QuotaExceeded
+    )
 }
 
 async fn acquire_shared_cache_lock(root: PathBuf, operation: &'static str) -> Result<File> {
@@ -603,16 +647,6 @@ async fn acquire_shared_cache_lock(root: PathBuf, operation: &'static str) -> Re
     })
     .await
     .map_err(|e| DockerPullError::InvalidInput(format!("cache lock task panicked: {e}")))?
-}
-
-fn try_acquire_exclusive_cache_lock_blocking(root: &Path, operation: &'static str) -> Result<File> {
-    let lock = open_lock_file(root)?;
-    let path = cache_lock_path(root);
-    match lock.try_lock() {
-        Ok(()) => Ok(lock),
-        Err(TryLockError::WouldBlock) => Err(DockerPullError::CacheLocked { operation, path }),
-        Err(TryLockError::Error(error)) => Err(error.into()),
-    }
 }
 
 async fn acquire_file_lock(path: PathBuf) -> Result<File> {
@@ -1582,6 +1616,24 @@ mod tests {
             .expect("leftover lock file must not block maintenance store open");
 
         assert!(store.root().join(".lock").exists());
+    }
+
+    #[tokio::test]
+    async fn maintenance_store_open_does_not_create_layout() {
+        // Cache clean must work on a full disk, so opening may not create
+        // anything beyond a missing lock file before space is reclaimed.
+        let dir = tempdir().expect("tempdir should create");
+        std::fs::write(dir.path().join(".lock"), b"").expect("lock file should be created");
+
+        MaintenanceStore::open(dir.path().to_path_buf())
+            .await
+            .expect("maintenance store should open");
+
+        let entries = std::fs::read_dir(dir.path())
+            .expect("cache root should be readable")
+            .map(|entry| entry.expect("entry should read").file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(entries, vec![std::ffi::OsString::from(".lock")]);
     }
 
     #[tokio::test]
