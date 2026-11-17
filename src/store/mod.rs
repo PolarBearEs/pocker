@@ -626,6 +626,7 @@ fn try_acquire_maintenance_cache_lock_with(
     let recovery_guard = try_acquire_cache_open_guard(root, operation, true)?;
     let path = cache_lock_path(root);
     let mut freed = Vec::new();
+    let mut retried_existing_lock = false;
     let lock = loop {
         match open_lock(root) {
             Ok(lock) => break lock,
@@ -636,8 +637,14 @@ fn try_acquire_maintenance_cache_lock_with(
                     return Err(error.into());
                 }
                 // Another opener may have created .lock before our guard was
-                // acquired. Never delete files until its absence is confirmed.
+                // acquired. Retry once to open it, but do not spin indefinitely:
+                // opening an existing file can still need space (e.g. copy-up).
+                // Never delete files until the lock's absence is confirmed.
                 if path.try_exists()? {
+                    if retried_existing_lock {
+                        return Err(error.into());
+                    }
+                    retried_existing_lock = true;
                     continue;
                 }
                 match free_largest_cache_file(root)? {
@@ -1796,6 +1803,38 @@ mod tests {
             .expect_err("cleaner must retry the existing lock instead of deleting");
         assert!(matches!(error, DockerPullError::CacheLocked { .. }));
         assert!(blob.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn existing_lock_storage_errors_stop_recovery_without_deleting() {
+        for kind in [
+            std::io::ErrorKind::StorageFull,
+            std::io::ErrorKind::QuotaExceeded,
+        ] {
+            let dir = tempdir().expect("tempdir should create");
+            let blob = dir.path().join("blob");
+            std::fs::write(&blob, b"cached data").expect("blob should be written");
+            std::fs::write(dir.path().join(".lock"), b"").expect("lock should exist");
+            let mut attempts = 0;
+            let error =
+                super::try_acquire_maintenance_cache_lock_with(dir.path(), "cache clean", |_| {
+                    attempts += 1;
+                    assert!(attempts <= 2, "existing lock must only be retried once");
+                    Err(std::io::Error::from(kind).into())
+                })
+                .expect_err("persistent storage error must stop recovery");
+            assert!(matches!(error, DockerPullError::Io(error) if error.kind() == kind));
+            assert_eq!(attempts, 2);
+            assert_eq!(
+                std::fs::read(&blob).expect("blob should remain"),
+                b"cached data"
+            );
+            assert!(dir.path().join(".lock").exists());
+            ActiveStore::open(dir.path().to_path_buf(), "pull")
+                .await
+                .expect("failed recovery must release its directory guard");
+        }
     }
 
     #[tokio::test]
