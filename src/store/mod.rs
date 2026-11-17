@@ -618,12 +618,21 @@ fn try_acquire_maintenance_cache_lock_blocking(
 fn try_acquire_maintenance_cache_lock_with(
     root: &Path,
     operation: &'static str,
+    open_lock: impl FnMut(&Path) -> Result<File>,
+) -> Result<(File, Vec<ClearedCacheFile>)> {
+    let recovery_guard = try_acquire_cache_open_guard(root, operation, true)?;
+    try_acquire_maintenance_cache_lock_with_guard(root, operation, recovery_guard, open_lock)
+}
+
+fn try_acquire_maintenance_cache_lock_with_guard(
+    root: &Path,
+    operation: &'static str,
+    recovery_guard: Option<File>,
     mut open_lock: impl FnMut(&Path) -> Result<File>,
 ) -> Result<(File, Vec<ClearedCacheFile>)> {
     // Serialize all lock-file opens with recovery. The directory already exists,
     // so this coordination needs no allocation even when the disk has no space.
     // Keep it through scanning, deletion, and acquiring the stable .lock handle.
-    let recovery_guard = try_acquire_cache_open_guard(root, operation, true)?;
     let path = cache_lock_path(root);
     let mut freed = Vec::new();
     let mut retried_existing_lock = false;
@@ -631,7 +640,7 @@ fn try_acquire_maintenance_cache_lock_with(
         match open_lock(root) {
             Ok(lock) => break lock,
             Err(DockerPullError::Io(error)) if is_out_of_space(&error) => {
-                // Platforms without directory locks must fail without deleting
+                // Filesystems without directory locks must fail without deleting
                 // anything: the missing .lock cannot coordinate recovery safely.
                 if recovery_guard.is_none() {
                     return Err(error.into());
@@ -698,27 +707,48 @@ async fn acquire_shared_cache_lock(root: PathBuf, operation: &'static str) -> Re
     .map_err(|e| DockerPullError::InvalidInput(format!("cache lock task panicked: {e}")))?
 }
 
-// Unix advisory locks work on an existing directory descriptor. Windows
-// file-range locks do not support directories, so full-disk recovery is disabled
-// there; normal .lock-based cache access still works.
+// Use directory locks when supported. Windows and some Unix filesystems (e.g.
+// NFS emulating flock with writable byte-range locks) reject directory locking.
+// Those retain normal .lock coordination, with pre-lock recovery disabled.
 #[cfg(unix)]
 fn try_acquire_cache_open_guard(
     root: &Path,
     operation: &'static str,
     exclusive: bool,
 ) -> Result<Option<File>> {
+    try_acquire_cache_open_guard_with(root, operation, |directory| {
+        if exclusive {
+            directory.try_lock()
+        } else {
+            directory.try_lock_shared()
+        }
+    })
+}
+
+#[cfg(unix)]
+fn try_acquire_cache_open_guard_with(
+    root: &Path,
+    operation: &'static str,
+    lock_directory: impl FnOnce(&File) -> std::result::Result<(), TryLockError>,
+) -> Result<Option<File>> {
     let directory = File::open(root)?;
-    let result = if exclusive {
-        directory.try_lock()
-    } else {
-        directory.try_lock_shared()
-    };
-    match result {
+    match lock_directory(&directory) {
         Ok(()) => Ok(Some(directory)),
         Err(TryLockError::WouldBlock) => Err(DockerPullError::CacheLocked {
             operation,
             path: root.to_path_buf(),
         }),
+        Err(TryLockError::Error(error))
+            if error.kind() == ErrorKind::Unsupported
+                || matches!(
+                    error.raw_os_error(),
+                    Some(
+                        libc::EBADF | libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP | libc::EISDIR
+                    )
+                ) =>
+        {
+            Ok(None)
+        }
         Err(TryLockError::Error(error)) => Err(error.into()),
     }
 }
@@ -1835,6 +1865,71 @@ mod tests {
                 .await
                 .expect("failed recovery must release its directory guard");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unsupported_directory_lock_preserves_normal_cache_coordination() {
+        let dir = tempdir().expect("tempdir should create");
+        let blob = dir.path().join("blob");
+        std::fs::write(&blob, b"cached data").expect("blob should be written");
+        let guard = super::try_acquire_cache_open_guard_with(dir.path(), "cache clean", |_| {
+            Err(std::fs::TryLockError::Error(
+                std::io::Error::from_raw_os_error(libc::EBADF),
+            ))
+        })
+        .expect("unsupported directory locking should allow ordinary cache access");
+        assert!(guard.is_none());
+        let (lock, freed) = super::try_acquire_maintenance_cache_lock_with_guard(
+            dir.path(),
+            "cache clean",
+            guard,
+            super::open_lock_file,
+        )
+        .expect("ordinary maintenance lock should still work");
+        assert!(freed.is_empty());
+        let error = super::try_acquire_maintenance_cache_lock_with_guard(
+            dir.path(),
+            "cache clean",
+            None,
+            super::open_lock_file,
+        )
+        .expect_err("fallback must respect the stable cache lock");
+        assert!(matches!(error, DockerPullError::CacheLocked { .. }));
+        drop(lock);
+        // Even a missing .lock must not enable unlocked deletion on a full disk.
+        std::fs::remove_file(dir.path().join(".lock")).expect("test lock should be removed");
+        let error = super::try_acquire_maintenance_cache_lock_with_guard(
+            dir.path(),
+            "cache clean",
+            None,
+            |_| Err(std::io::Error::from(std::io::ErrorKind::StorageFull).into()),
+        )
+        .expect_err("recovery must fail without directory coordination");
+        assert!(
+            matches!(error, DockerPullError::Io(error) if error.kind() == std::io::ErrorKind::StorageFull)
+        );
+        assert!(blob.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_lock_contention_and_unexpected_errors_do_not_fall_back() {
+        let dir = tempdir().expect("tempdir should create");
+        let error = super::try_acquire_cache_open_guard_with(dir.path(), "cache clean", |_| {
+            Err(std::fs::TryLockError::WouldBlock)
+        })
+        .expect_err("contention must not bypass the directory lock");
+        assert!(matches!(error, DockerPullError::CacheLocked { .. }));
+        let error = super::try_acquire_cache_open_guard_with(dir.path(), "pull", |_| {
+            Err(std::fs::TryLockError::Error(
+                std::io::Error::from_raw_os_error(libc::ENOLCK),
+            ))
+        })
+        .expect_err("transient lock failure must not bypass recovery coordination");
+        assert!(
+            matches!(error, DockerPullError::Io(error) if error.raw_os_error() == Some(libc::ENOLCK))
+        );
     }
 
     #[tokio::test]
