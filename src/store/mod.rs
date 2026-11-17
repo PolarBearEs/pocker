@@ -612,17 +612,32 @@ fn try_acquire_maintenance_cache_lock_blocking(
     root: &Path,
     operation: &'static str,
 ) -> Result<(File, Vec<ClearedCacheFile>)> {
+    try_acquire_maintenance_cache_lock_with(root, operation, open_lock_file)
+}
+
+fn try_acquire_maintenance_cache_lock_with(
+    root: &Path,
+    operation: &'static str,
+    mut open_lock: impl FnMut(&Path) -> Result<File>,
+) -> Result<(File, Vec<ClearedCacheFile>)> {
+    // Serialize all lock-file opens with recovery. The directory already exists,
+    // so this coordination needs no allocation even when the disk has no space.
+    // Keep it through scanning, deletion, and acquiring the stable .lock handle.
+    let recovery_guard = try_acquire_cache_open_guard(root, operation, true)?;
     let path = cache_lock_path(root);
     let mut freed = Vec::new();
     let lock = loop {
-        match open_lock_file(root) {
+        match open_lock(root) {
             Ok(lock) => break lock,
             Err(DockerPullError::Io(error)) if is_out_of_space(&error) => {
-                // Opening an existing lock file needs no space, so the file is
-                // missing and nobody can hold the cache lock. Free one file at
-                // a time until the lock file fits, so a pull that starts once
-                // space appears is never left racing an unlocked bulk delete.
-                if path.exists() {
+                // Platforms without directory locks must fail without deleting
+                // anything: the missing .lock cannot coordinate recovery safely.
+                if recovery_guard.is_none() {
+                    return Err(error.into());
+                }
+                // Another opener may have created .lock before our guard was
+                // acquired. Never delete files until its absence is confirmed.
+                if path.try_exists()? {
                     continue;
                 }
                 match free_largest_cache_file(root)? {
@@ -663,6 +678,7 @@ fn is_out_of_space(error: &std::io::Error) -> bool {
 
 async fn acquire_shared_cache_lock(root: PathBuf, operation: &'static str) -> Result<File> {
     tokio::task::spawn_blocking(move || {
+        let _open_guard = try_acquire_cache_open_guard(&root, operation, false)?;
         let lock = open_lock_file(&root)?;
         let path = cache_lock_path(&root);
         match lock.try_lock_shared() {
@@ -673,6 +689,40 @@ async fn acquire_shared_cache_lock(root: PathBuf, operation: &'static str) -> Re
     })
     .await
     .map_err(|e| DockerPullError::InvalidInput(format!("cache lock task panicked: {e}")))?
+}
+
+// Unix advisory locks work on an existing directory descriptor. Windows
+// file-range locks do not support directories, so full-disk recovery is disabled
+// there; normal .lock-based cache access still works.
+#[cfg(unix)]
+fn try_acquire_cache_open_guard(
+    root: &Path,
+    operation: &'static str,
+    exclusive: bool,
+) -> Result<Option<File>> {
+    let directory = File::open(root)?;
+    let result = if exclusive {
+        directory.try_lock()
+    } else {
+        directory.try_lock_shared()
+    };
+    match result {
+        Ok(()) => Ok(Some(directory)),
+        Err(TryLockError::WouldBlock) => Err(DockerPullError::CacheLocked {
+            operation,
+            path: root.to_path_buf(),
+        }),
+        Err(TryLockError::Error(error)) => Err(error.into()),
+    }
+}
+
+#[cfg(not(unix))]
+fn try_acquire_cache_open_guard(
+    _root: &Path,
+    _operation: &'static str,
+    _exclusive: bool,
+) -> Result<Option<File>> {
+    Ok(None)
 }
 
 async fn acquire_file_lock(path: PathBuf) -> Result<File> {
@@ -1660,6 +1710,92 @@ mod tests {
             .map(|entry| entry.expect("entry should read").file_name())
             .collect::<Vec<_>>();
         assert_eq!(entries, vec![std::ffi::OsString::from(".lock")]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn full_disk_recovery_excludes_other_cleaners_and_pulls() {
+        let dir = tempdir().expect("tempdir should create");
+        let blob = dir.path().join("blob");
+        std::fs::write(&blob, b"cached data").expect("blob should be written");
+        let root = dir.path().to_path_buf();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let recovering = tokio::task::spawn_blocking(move || {
+            let mut ready_tx = Some(ready_tx);
+            super::try_acquire_maintenance_cache_lock_with(&root, "cache clean", |root| {
+                if let Some(ready_tx) = ready_tx.take() {
+                    ready_tx.send(()).expect("test should wait for recovery");
+                    resume_rx.recv().expect("test should resume recovery");
+                    return Err(std::io::Error::from(std::io::ErrorKind::StorageFull).into());
+                }
+                super::open_lock_file(root)
+            })
+        });
+        ready_rx.await.expect("recovery should start");
+
+        let cleaner_error = MaintenanceStore::open(dir.path().to_path_buf())
+            .await
+            .expect_err("second cleaner must not enter recovery");
+        assert!(matches!(cleaner_error, DockerPullError::CacheLocked { .. }));
+        let pull_error = ActiveStore::open(dir.path().to_path_buf(), "pull")
+            .await
+            .expect_err("pull must not create .lock during recovery");
+        assert!(matches!(pull_error, DockerPullError::CacheLocked { .. }));
+        assert!(blob.exists());
+        assert!(!dir.path().join(".lock").exists());
+
+        resume_tx
+            .send(())
+            .expect("recovery should still be waiting");
+        let (lock, freed) = recovering
+            .await
+            .expect("recovery task should finish")
+            .expect("recovery should acquire the cache lock");
+        assert!(!blob.exists());
+        assert_eq!(
+            freed,
+            vec![ClearedCacheFile {
+                path: "blob".into(),
+                size: 11
+            }]
+        );
+        // The directory guard is released only after the stable lock is held.
+        let pull_error = ActiveStore::open(dir.path().to_path_buf(), "pull")
+            .await
+            .expect_err("cache lock must protect the handoff from recovery");
+        assert!(matches!(pull_error, DockerPullError::CacheLocked { .. }));
+        drop(lock);
+        let active = ActiveStore::open(dir.path().to_path_buf(), "pull")
+            .await
+            .expect("pull should open after maintenance releases its lock");
+        let error = MaintenanceStore::open(dir.path().to_path_buf())
+            .await
+            .expect_err("later cleaner must respect the active pull");
+        assert!(matches!(error, DockerPullError::CacheLocked { .. }));
+        drop(active);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn full_disk_recovery_rechecks_lock_before_deleting() {
+        let dir = tempdir().expect("tempdir should create");
+        let blob = dir.path().join("blob");
+        std::fs::write(&blob, b"cached data").expect("blob should be written");
+        let mut active_lock = None;
+        let error =
+            super::try_acquire_maintenance_cache_lock_with(dir.path(), "cache clean", |root| {
+                if active_lock.is_none() {
+                    let lock = super::open_lock_file(root)?;
+                    lock.try_lock_shared().expect("pull should lock");
+                    active_lock = Some(lock);
+                    return Err(std::io::Error::from(std::io::ErrorKind::StorageFull).into());
+                }
+                super::open_lock_file(root)
+            })
+            .expect_err("cleaner must retry the existing lock instead of deleting");
+        assert!(matches!(error, DockerPullError::CacheLocked { .. }));
+        assert!(blob.exists());
     }
 
     #[tokio::test]
